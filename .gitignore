@@ -1,1 +1,3 @@
 /target
+# Native test build of ffmpeg (tools/build-ffmpeg.sh native); the Windows one is committed.
+/vendor/ffmpeg

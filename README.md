@@ -51,8 +51,9 @@ exposed. Over a slow connection, use the *Fast* or *SD* stream.
 | SD (ffmpeg) | `stream2`, H.264/H.265 | ffmpeg | Use this if a camera has no MJPEG stream. |
 | HD (ffmpeg) | `stream1`, H.264/H.265, full resolution | ffmpeg | Default for the single-camera view when ffmpeg is available. |
 
-For SD/HD, download an ffmpeg build for Windows (for example from gyan.dev or the BtbN GitHub
-releases) and put `ffmpeg.exe` next to `TapoViewer.exe`, or set its path in *Settings*.
+SD/HD use a minimal ffmpeg that is **built into `TapoViewer.exe`**, so there is nothing else to
+install. It is unpacked to `%LOCALAPPDATA%\TapoViewer` on first start. To use your own ffmpeg
+instead, set its path in *Settings › Video & display*.
 
 ## Rendering on Windows
 
@@ -75,8 +76,13 @@ If the app won't start, run `TapoViewer.exe --software`, or set `SLINT_BACKEND=w
 | Log | `%APPDATA%\TapoViewer\config\tapo-viewer.log` |
 | Snapshots | `Pictures\TapoViewer` |
 | Recordings | `Videos\TapoViewer` (`.ts` files; VLC or Windows Media Player play them) |
+| Built-in ffmpeg (unpacked) | `%LOCALAPPDATA%\TapoViewer\data` |
 
 ## Building
+
+The minimal ffmpeg that gets embedded lives in `vendor/ffmpeg.exe` (see `vendor/README.md`).
+`build.rs` embeds it automatically; without it, the app looks for ffmpeg next to the exe and on
+PATH instead.
 
 On Windows (MSVC toolchain):
 
@@ -102,8 +108,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 The exe is `target/x86_64-pc-windows-gnu/release/tapo-viewer.exe`.
 
-Pushes to `main` build the Windows exe on GitHub Actions; download it from the run's
-*Artifacts*. Pushing a `v*` tag also attaches a zip to the GitHub release.
+To rebuild the embedded ffmpeg (on Linux or WSL, with mingw-w64 installed):
+
+```bash
+tools/build-ffmpeg.sh windows
+```
 
 ### Testing without cameras
 

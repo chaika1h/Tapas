@@ -499,6 +499,7 @@ impl App {
         b.set_config_path(config::config_path().display().to_string().into());
         b.set_ffmpeg_found(
             match &*self.ffmpeg.borrow() {
+                Some(p) if crate::ffmpeg::is_bundled(p) => "Using the built-in ffmpeg.".to_string(),
                 Some(p) => format!("Using {}", p.display()),
                 None => "ffmpeg not found: SD/HD streams are unavailable; the built-in stream still works. \
                          Download ffmpeg (e.g. gyan.dev or BtbN builds) and put ffmpeg.exe next to TapoViewer.exe."
