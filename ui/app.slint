@@ -59,6 +59,7 @@ export global Bridge {
     in property <string> ffmpeg-found;
     in-out property <int> renderer-index;
     in property <string> config-path;
+    in property <string> account-message;
     callback save-settings();
 
     // settings: cameras
@@ -544,7 +545,17 @@ component SettingsPage inherits Rectangle {
                         LineEdit { text <=> Bridge.cloud-pass; input-type: password; horizontal-stretch: 1; }
                     }
                     HorizontalLayout {
-                        alignment: end;
+                        spacing: 12px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: Bridge.account-message;
+                                horizontal-alignment: right;
+                                color: Palette.accent-background;
+                                font-weight: 600;
+                            }
+                        }
                         Button { text: "Save account"; primary: true; clicked => { Bridge.save-settings(); } }
                     }
                 }
