@@ -534,6 +534,19 @@ impl App {
         self.load_settings_into_ui();
         self.sync_streams();
         self.status("Settings saved.");
+
+        let has_account = self.cloud_creds().is_some();
+        let no_devices = self.cfg.borrow().cameras.is_empty();
+        b.set_account_message(
+            match (has_account, no_devices) {
+                (true, true) => "✓ Saved. Searching your network for cameras…",
+                _ => "✓ Saved",
+            }
+            .into(),
+        );
+        if has_account && no_devices && !b.get_scanning() {
+            self.scan();
+        }
     }
 
     fn refresh_camera_lists(&self) {
