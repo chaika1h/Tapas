@@ -16,12 +16,16 @@ use crate::stream::{FrameSink, StreamSpec, rtsp_url};
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Finds ffmpeg: the configured path, then next to our exe, then on PATH.
+/// Finds ffmpeg: the configured path, then the copy built into this exe, then
+/// next to the exe, then on PATH.
 pub fn find(configured: &str) -> Option<PathBuf> {
     let configured = configured.trim().trim_matches('"');
     if !configured.is_empty() {
         let p = PathBuf::from(configured);
         return p.is_file().then_some(p);
+    }
+    if let Some(p) = bundled::extract() {
+        return Some(p);
     }
     let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
     let beside_exe = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|d| d.join(name)));
@@ -30,6 +34,67 @@ pub fn find(configured: &str) -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// Whether `path` is the copy unpacked from this exe.
+pub fn is_bundled(path: &Path) -> bool {
+    bundled::extract().is_some_and(|p| p == path)
+}
+
+/// The minimal ffmpeg embedded at build time (see `build.rs`), unpacked on
+/// first use to `%LOCALAPPDATA%\TapoViewer`.
+#[cfg(bundled_ffmpeg)]
+mod bundled {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ffmpeg.bin"));
+
+    pub fn extract() -> Option<PathBuf> {
+        static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+        PATH.get_or_init(|| match unpack() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                log::error!("could not unpack the built-in ffmpeg: {e:#}");
+                None
+            }
+        })
+        .clone()
+    }
+
+    fn unpack() -> anyhow::Result<PathBuf> {
+        let dir = crate::config::data_dir();
+        let name = format!("ffmpeg-{}{}", env!("BUNDLED_FFMPEG_ID"), std::env::consts::EXE_SUFFIX);
+        let path = dir.join(&name);
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() == BINARY.len() as u64) {
+            return Ok(path);
+        }
+        std::fs::create_dir_all(&dir)?;
+        // Remove copies left by older versions of the app.
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            let old = entry.file_name().to_string_lossy().into_owned();
+            if old.starts_with("ffmpeg-") && old != name {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, BINARY)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        log::info!("unpacked built-in ffmpeg to {}", path.display());
+        Ok(path)
+    }
+}
+
+#[cfg(not(bundled_ffmpeg))]
+mod bundled {
+    pub fn extract() -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {

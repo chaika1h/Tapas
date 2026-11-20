@@ -176,6 +176,13 @@ pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `%LOCALAPPDATA%\TapoViewer\data` (the unpacked built-in ffmpeg).
+pub fn data_dir() -> PathBuf {
+    dirs()
+        .map(|d| d.data_local_dir().to_path_buf())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// `Pictures\TapoViewer` (snapshots).
 pub fn snapshot_dir() -> PathBuf {
     user_subdir(|u| u.picture_dir().map(Into::into))
