@@ -85,9 +85,12 @@ Cameras that send encrypted video through the cloud aren't supported yet; their 
 Playback asks the cloud for a relay to the hub naming the camera, as the Tapo app does, and then
 has the conversation the hub has on its local media port (request, acknowledgements every 25
 parts, heartbeats, stop), ported from the MIT-licensed
-[`tapo`](https://github.com/mihai-dinculescu/tapo) crate (see `src/clip.rs`). It has been tested
-against `tools/fake_cloud.py`, not yet against a real H500; the log has the details of every
-step if it doesn't work.
+[`tapo`](https://github.com/mihai-dinculescu/tapo) crate (see `src/clip.rs`). The Tapo app has
+several kinds of relay for recordings, and an H500 accepts its "cover" download but sends nothing,
+so Tapo Viewer tries the "video" download, then the real-time playback stream, then "cover", and
+uses the one that brought video first from then on. Every session is ended (stop, connection
+closed) however the playback ends, as a hub serves only a few at a time. The log has the details
+of every step.
 
 ## Rendering on Windows
 
@@ -169,7 +172,9 @@ Sign in with any email and the password `secret`. "Back yard" is reported offlin
 has pan/tilt and "Garage" hasn't. The H500 "HomeBase" has recordings of "Front door" (today,
 yesterday and three days ago) and "Garage" (today). Like a real hub it serves only two downloads
 at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
-open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output.
+open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output. Like an H500
+it sends nothing for the "cover" download; `--clip-path video|playback|none` picks which other way
+works.
 
 ## Troubleshooting
 

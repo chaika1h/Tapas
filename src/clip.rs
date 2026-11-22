@@ -16,7 +16,13 @@
 //!    the hub stops sending.
 //! 3. The client sends a heartbeat every 15 seconds. The hub ends the clip with
 //!    a `stream_status` notification of `finished`, and the client says `stop`.
+//!
+//! Which relay sub-type brings video differs (an H500 accepts "cover", the
+//! Tapo app's download type, and then sends nothing), so the kinds the app
+//! uses are tried in turn, ending with its real-time playback; whichever
+//! works is used first after that.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,16 +31,20 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-use crate::cloud::{Clip, CloudCamera, CloudClient, HubCamera};
+use crate::cloud::{Clip, ClipStream, CloudCamera, CloudClient, CloudError, HubCamera};
 use crate::relay::{self, IdleTimeout, Part};
 
 /// The Tapo app's window on the download request.
 const DATA_WINDOW_SIZE: &str = "50";
+/// Topo's window on a playback request.
+const PLAYBACK_WINDOW_SIZE: &str = "40";
 /// The Tapo app acknowledges every 25th media part.
 const ACK_EVERY: u64 = 25;
 const HEARTBEAT: Duration = Duration::from_secs(15);
 /// How long the hub may stay quiet before the download is given up.
 const IDLE: Duration = Duration::from_secs(30);
+/// Quiet this long once nearly all of the clip has come means it's over.
+const END_QUIET: Duration = Duration::from_secs(3);
 
 /// Which recording to fetch.
 #[derive(Clone)]
@@ -54,28 +64,86 @@ pub struct Progress {
     pub seconds: f64,
 }
 
-/// Downloads the clip, handing each piece of MPEG-TS to `media` as it
-/// arrives, and `progress` after each piece.
+/// The ways of fetching a recording, in the order tried until one has been
+/// seen to work.
+const METHODS: [ClipStream; 3] = [ClipStream::Download("video"), ClipStream::Playback, ClipStream::Download("cover")];
+
+/// The index in [`METHODS`] that last brought video, tried first next time.
+static WORKING: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// The hub (or the cloud) gave no video this way; another may work.
+#[derive(Debug)]
+struct NoVideo(String);
+
+impl std::fmt::Display for NoVideo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoVideo {}
+
+/// Fetches the clip, handing each piece of MPEG-TS to `media` as it arrives,
+/// and `progress` after each piece.
 pub async fn download(
     client: &CloudClient,
     request: &ClipRequest,
     media: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Progress> {
-    // The app's download is sub-type "cover"; its download of a playback clip
-    // is "video". Try the other if the cloud refuses the first.
-    let info = match client.request_clip_relay(&request.hub, &request.camera, &request.player_id, "cover").await {
-        Err(e) if e.is_refused() => {
-            log::warn!("clip relay (cover) refused: {e}; trying the playback download");
-            client.request_clip_relay(&request.hub, &request.camera, &request.player_id, "video").await?
+    let known = WORKING.load(Ordering::Relaxed);
+    let mut order: Vec<usize> = (0..METHODS.len()).collect();
+    if known < METHODS.len() {
+        order.retain(|&i| i != known);
+        order.insert(0, known);
+    }
+    for i in order {
+        let method = METHODS[i];
+        log::info!("clip: trying {method:?}");
+        match attempt(client, request, method, media, progress).await {
+            Ok(got) => {
+                if WORKING.swap(i, Ordering::Relaxed) != i {
+                    log::info!("clip: {method:?} works; using it first from now on");
+                }
+                return Ok(got);
+            }
+            Err(e) if e.is::<NoVideo>() || e.downcast_ref::<CloudError>().is_some_and(CloudError::is_refused) => {
+                log::warn!("clip: {method:?} brought no video: {e:#}");
+            }
+            Err(e) => return Err(e),
         }
-        result => result?,
+    }
+    bail!("The hub sent no video for this recording. The log has what it said to each kind of request")
+}
+
+/// One way of fetching the clip. Fails with [`NoVideo`] if it ends before
+/// any video arrives.
+async fn attempt(
+    client: &CloudClient,
+    request: &ClipRequest,
+    method: ClipStream,
+    media: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    progress: &mut (dyn FnMut(Progress) + Send),
+) -> Result<Progress> {
+    let (first_request, window) = match method {
+        ClipStream::Download(_) => (download_request(1, request), DATA_WINDOW_SIZE),
+        ClipStream::Playback => {
+            let client_id = match client.hub_user_id(&request.hub).await {
+                Ok(id) => id,
+                Err(e) => {
+                    log::info!("clip: no user id from the hub ({e}); using 1");
+                    1
+                }
+            };
+            (playback_request(1, request, client_id), PLAYBACK_WINDOW_SIZE)
+        }
     };
+    let info = client.request_clip_relay(&request.hub, &request.camera, &request.player_id, method).await?;
     let mut stream = relay::connect(client.tls(), &info).await?;
     let mut first = relay::recording_head(&info).into_bytes();
     first.extend(relay::client_part(
-        &[("Content-Type", "application/json"), ("X-Data-Window-Size", DATA_WINDOW_SIZE)],
-        download_request(1, request).to_string().as_bytes(),
+        &[("Content-Type", "application/json"), ("X-Data-Window-Size", window)],
+        first_request.to_string().as_bytes(),
     ));
     stream.write_all(&first).await.context("Could not talk to the video relay")?;
     stream.flush().await?;
@@ -113,12 +181,20 @@ pub async fn download(
             if Instant::now() > deadline {
                 bail!("The recording took too long to arrive");
             }
-            let part = match relay::read_part(&mut reader, IDLE).await {
+            // Near the end, a short silence is the end: playback sends no
+            // end message on some firmware, and may run on into what follows.
+            let near_end = state.got.bytes > 0 && state.got.seconds + 1.0 >= expected;
+            if state.got.seconds >= expected + 1.0 {
+                return Ok(());
+            }
+            let part = match relay::read_part(&mut reader, if near_end { END_QUIET } else { IDLE }).await {
                 Ok(part) => part,
-                Err(e) if e.is::<IdleTimeout>() && state.got.bytes > 0 && state.got.seconds + 2.0 >= expected => {
-                    // Some firmware sends no end message.
+                Err(e) if e.is::<IdleTimeout>() && near_end => {
                     log::info!("clip: the hub went quiet after {:.1}s of video; taking that as the end", state.got.seconds);
                     return Ok(());
+                }
+                Err(e) if e.is::<IdleTimeout>() && state.got.bytes == 0 => {
+                    return Err(NoVideo(format!("nothing for {}s", IDLE.as_secs())).into());
                 }
                 Err(e) if e.is::<IdleTimeout>() => bail!("The hub stopped sending the recording"),
                 Err(e) => return Err(e),
@@ -131,17 +207,39 @@ pub async fn download(
     }
     .await;
 
-    // Release the hub's download slot either way.
+    // Release the hub's session either way.
     let got = state.got;
     drop(state);
     drop(guard);
     let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
     result?;
     if got.bytes == 0 {
-        bail!("The hub finished without sending any video");
+        return Err(NoVideo("the hub finished without sending any video".into()).into());
     }
     log::info!("clip: {} bytes, {:.1}s of video (clip is {expected}s)", got.bytes, got.seconds);
     Ok(got)
+}
+
+/// The Tapo app's playback request (`GetVodParams`), as Topo sends it to
+/// cameras, with the hub's camera named by its MAC address as the app does.
+fn playback_request(seq: u32, request: &ClipRequest, client_id: i64) -> Value {
+    json!({
+        "type": "request",
+        "seq": seq,
+        "params": {
+            "method": "get",
+            "playback": {
+                "client_id": client_id,
+                "channels": [0],
+                "scale": "1/1",
+                "start_time": request.clip.start.to_string(),
+                "end_time": request.clip.end.to_string(),
+                "player_id": request.player_id,
+                "camera_mac": request.camera.mac,
+                "streams": [],
+            }
+        }
+    })
 }
 
 /// The first client part: which clip, from which camera.
@@ -393,6 +491,17 @@ mod tests {
             json!({"type": "request", "seq": 1, "params": {"method": "get", "download": {
                 "dev_id": "CAM", "client_id": 1, "end_time": "1700000060", "media_type": 0,
                 "player_id": "PLAYER", "start_time": "1700000000", "channels": [0], "streams": []
+            }}})
+        );
+    }
+
+    #[test]
+    fn playback_request_names_the_camera_by_mac() {
+        assert_eq!(
+            playback_request(1, &request(), 7),
+            json!({"type": "request", "seq": 1, "params": {"method": "get", "playback": {
+                "client_id": 7, "channels": [0], "scale": "1/1", "start_time": "1700000000",
+                "end_time": "1700000060", "player_id": "PLAYER", "camera_mac": "A8-42", "streams": []
             }}})
         );
     }

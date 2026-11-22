@@ -260,8 +260,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def clip_relay_request(self, payload):
         problems = []
-        if payload.get("streamType") != 3:
-            problems.append(f"streamType {payload.get('streamType')}")
+        stream = (payload.get("streamType"), payload.get("subType"))
+        if stream not in ((3, "cover"), (3, "video"), (1, None)):
+            problems.append(f"streamType/subType {stream}")
         if payload.get("deviceType") != "SMART.TAPOHUB":
             problems.append(f"deviceType {payload.get('deviceType')}")
         custom = json.loads(payload.get("customParams") or "{}")
@@ -273,8 +274,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({"error_code": -40210, "msg": "bad clip request"})
         relay_token = "relay-" + uuid.uuid4().hex
         with self.state.lock:
-            self.state.relays[relay_token] = ("clip", camera, payload.get("playerId"))
-        print(f"  clip relay for {camera} (subType {payload.get('subType')}, customParams {custom})", flush=True)
+            self.state.relays[relay_token] = ("clip", camera, payload.get("playerId"), stream)
+        print(f"  clip relay for {camera} (stream {stream}, customParams {custom})", flush=True)
         host = urlsplit(self.base).netloc
         return self.reply({"error_code": 0, "result": {
             "relayUrl": f"{host}/relayservice?deviceid=FAKEHUB1&type=download&sig=Zm9v%2Bbar==",
@@ -283,7 +284,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def hub_method(self, method, params):
         result, code = {}, 0
-        if method == "getGeneralDeviceList":
+        if method == "getUserID":
+            result = {"user_id": "7"}
+        elif method == "getGeneralDeviceList":
             result = {"general_camera_manage": {"max_bound": 4, "paired_general_device_list": HUB_CAMERAS}}
         elif method == "searchDateWithVideo":
             query = params.get("playback", {}).get("search_year_utility", {})
@@ -436,21 +439,27 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(head + body + b"\r\n")
         self.wfile.flush()
 
-    def clip_relay(self, camera, player_id):
-        """A hub sending one recording, as the tapo crate saw an H200 do it."""
+    def clip_relay(self, camera, player_id, stream):
+        """A hub sending one recording. Downloads go as the tapo crate saw an
+        H200 do it; playback is sent in real time. Like an H500, the "cover"
+        download is accepted and then finished at once, without video; which
+        of the others works is chosen with --clip-path."""
         self.close_connection = True
         first = self.read_client_part()
         if not first:
             return
         headers, request = first
-        download = request.get("params", {}).get("download", {})
+        params = request.get("params", {})
+        playback = stream[0] == 1
+        download = params.get("playback" if playback else "download", {})
+        mac = next(c["mac"] for c in HUB_CAMERAS if c["device_id"] == camera)
         problems = []
-        if request.get("params", {}).get("method") != "get" or download.get("dev_id") != camera:
+        if params.get("method") != "get" or (download.get("camera_mac") != mac if playback else download.get("dev_id") != camera):
             problems.append(f"request {request}")
-        if headers.get("x-data-window-size") != "50":
-            problems.append("no X-Data-Window-Size: 50")
+        if headers.get("x-data-window-size") != ("40" if playback else "50"):
+            problems.append(f"X-Data-Window-Size {headers.get('x-data-window-size')}")
         if download.get("player_id") != player_id or player_id not in self.state.search_players:
-            problems.append("the download's player id isn't the one the clips were searched with")
+            problems.append("the player id isn't the one the clips were searched with")
         self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed;boundary=--device-stream-boundary--\r\n\r\n")
         if problems:
             print(f"  clip REFUSED: {'; '.join(problems)}", flush=True)
@@ -468,18 +477,29 @@ class Handler(BaseHTTPRequestHandler):
             self.send_part("application/json", json.dumps(reply).encode())
             return
         try:
-            self.clip_session(camera, download, request)
+            self.clip_session(camera, download, request, stream)
         finally:
             with self.state.lock:
                 self.state.clip_sessions -= 1
                 left = self.state.clip_sessions
             print(f"  clip: session closed ({left} open)", flush=True)
 
-    def clip_session(self, camera, download, request):
+    def clip_session(self, camera, download, request, stream):
         start, end = int(download["start_time"]), int(download["end_time"])
-        print(f"  clip: {camera} {end - start}s from {datetime.datetime.fromtimestamp(start)}", flush=True)
+        works = {"video": (3, "video"), "playback": (1, None)}.get(self.state.args.clip_path)
+        print(f"  clip: {camera} {end - start}s from {datetime.datetime.fromtimestamp(start)} by {stream}"
+              f"{'' if stream == works else ' (sends nothing this way)'}", flush=True)
         reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": 0, "session_id": "42"}}
         self.send_part("application/json", json.dumps(reply).encode())
+        if stream != works:
+            done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
+            self.send_part("application/json", json.dumps(done).encode())
+            while (part := self.read_client_part()) is not None:
+                if part[1].get("params", {}).get("method") == "do":
+                    print("  clip: client said stop", flush=True)
+                    break
+            return
+        playback = stream[0] == 1
         pattern = PATTERNS.get(camera, "testsrc")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
                "-f", "lavfi", "-i", f"{pattern}=size=1280x720:rate=15:duration={end - start}",
@@ -487,7 +507,7 @@ class Handler(BaseHTTPRequestHandler):
         ts = subprocess.run(cmd, capture_output=True, check=True).stdout
         chunks = [ts[i:i + 4 * 1316] for i in range(0, len(ts), 4 * 1316)]
         # --slow-clips: send in real time, like a hub on a slow uplink.
-        pace = (end - start) / len(chunks) if self.state.args.slow_clips else 0
+        pace = (end - start) / len(chunks) if self.state.args.slow_clips or playback else 0
         acked, heartbeats = 0, 0
         try:
             for seq, chunk in enumerate(chunks, 1):
@@ -511,8 +531,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_part("video/mp2t", chunk, f"X-Data-Sequence: {seq}\r\nX-If-Encrypt: 0\r\n")
                 if pace:
                     time.sleep(pace)
-            done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
-            self.send_part("application/json", json.dumps(done).encode())
+            if not playback:  # playback just goes quiet at the end
+                done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
+                self.send_part("application/json", json.dumps(done).encode())
             print(f"  clip: sent {len(chunks)} parts, {len(ts)} bytes; acknowledged up to {acked}", flush=True)
             while (part := self.read_client_part()) is not None:
                 if part[1].get("params", {}).get("method") == "do":
@@ -530,6 +551,8 @@ def main():
     ap.add_argument("--expire-after", type=float, default=0, help="session tokens stop working after N seconds")
     ap.add_argument("--control-delay", type=float, default=0, help="seconds each camera-control call takes, like the real cloud")
     ap.add_argument("--slow-clips", action="store_true", help="send recordings in real time instead of at full speed")
+    ap.add_argument("--clip-path", choices=["video", "playback", "none"], default="video",
+                    help="which way the hub sends recordings: the \"video\" download, real-time playback, or neither")
     args = ap.parse_args()
 
     certs = Path(args.certs)
