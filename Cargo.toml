@@ -12,15 +12,24 @@ chrono = "0.4.45"
 directories = "6.0.0"
 env_logger = { version = "0.11.11", default-features = false, features = ["auto-color", "humantime"] }
 futures-util = "0.3.34"
+hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 log = "0.4.35"
+md-5 = "0.11.0"
+# The TLS stack the `tapo` crate already uses; shared by the Tapo cloud client.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 retina = "0.4"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7.1"
+sha1 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 slint = { version = "1.19.0", default-features = false, features = ["std", "backend-winit", "renderer-femtovg-wgpu", "renderer-femtovg", "renderer-software", "accessibility", "compat-1-2"] }
 tapo = "0.13.0"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 url = "2.5.8"
+uuid = { version = "1.29.3", features = ["v4"] }
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

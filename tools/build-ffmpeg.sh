@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds a minimal, LGPL-only ffmpeg with just what Tapo Viewer needs:
-# RTSP input, H.264/H.265/MJPEG decoding, scaling and raw video output.
+# RTSP input, MPEG-TS input (Tapo cloud relay, read from stdin),
+# H.264/H.265/MJPEG decoding, scaling and raw video output.
 # The result is a few MB instead of ~100 MB for a full build, and LGPL means
 # it can be bundled with the app (see vendor/README.md).
 #
@@ -48,7 +49,7 @@ flags=(
   --enable-static --disable-shared --enable-small
   --enable-ffmpeg --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale
   --enable-network --enable-protocol=tcp,udp,rtp,file,pipe
-  --enable-demuxer=rtsp,rtp,sdp
+  --enable-demuxer=rtsp,rtp,sdp,mpegts
   --enable-decoder=h264,hevc,mjpeg
   --enable-parser=h264,hevc,mjpeg
   --enable-filter=scale,pad,format,null,fps
