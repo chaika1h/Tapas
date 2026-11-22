@@ -6,7 +6,7 @@ Serves over HTTPS on 127.0.0.1:
     verification code), the service lookup and the camera list;
   * the CIPC relay request;
   * the video relay itself, streaming live MPEG-TS made by ffmpeg; and
-  * camera control (pan/tilt and presets) through the IoT gateway.
+  * camera control (pan/tilt, presets and privacy mode) through the IoT gateway.
 
 Signed account calls are checked like the real cloud checks them (Content-MD5
 and the HMAC signature), so a client signing wrongly fails here too.
@@ -70,6 +70,7 @@ class State:
         self.relays = {}  # relay token -> (device id, resolution)
         self.position = {}  # device id -> [pan, tilt]
         self.presets = {}  # device id -> [(id, name, pan, tilt)]
+        self.privacy = set()  # device ids with privacy mode on
 
     def new_token(self):
         token = "tok-" + uuid.uuid4().hex
@@ -203,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({"error_code": -40401, "msg": "Device is offline"})
         if device not in PATTERNS:
             return self.reply({"error_code": -40210, "msg": "Unknown device"})
+        if device in self.state.privacy:
+            return self.reply({"error_code": -64324, "msg": "Privacy mode is on"})
         relay_token = "relay-" + uuid.uuid4().hex
         with self.state.lock:
             self.state.relays[relay_token] = (device, payload.get("resolution"))
@@ -238,6 +241,13 @@ class Handler(BaseHTTPRequestHandler):
         if method == "getAppComponentList":
             components = [{"name": "video", "version": 1}] + ([{"name": "ptz", "version": 1}] if device in PTZ else [])
             result = {"app_component": {"app_component_list": components}}
+        elif method == "getLensMaskConfig":
+            result = {"lens_mask": {"lens_mask_info": {"enabled": "on" if device in state.privacy else "off"}}}
+        elif method == "setLensMaskConfig":
+            enabled = params.get("lens_mask", {}).get("lens_mask_info", {}).get("enabled")
+            (state.privacy.add if enabled == "on" else state.privacy.discard)(device)
+        elif device in state.privacy:
+            code = -64324  # the lens is covered
         elif device not in PTZ:
             code = -40106  # method not supported
         elif method == "motorMove":
@@ -291,7 +301,7 @@ class Handler(BaseHTTPRequestHandler):
                "-c:a", "aac", "-b:a", "16k", "-f", "mpegts", "pipe:1"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         try:
-            while chunk := proc.stdout.read1(16 * 1316):
+            while (chunk := proc.stdout.read1(16 * 1316)) and device not in self.state.privacy:
                 head = (f"----device-stream-boundary--\r\nContent-Type: video/mp2t\r\n"
                         f"Content-Length: {len(chunk)}\r\nX-If-Encrypt: 0\r\n\r\n").encode()
                 self.wfile.write(head + chunk + b"\r\n")

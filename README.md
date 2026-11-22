@@ -6,12 +6,14 @@ A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, wr
 
 - **Live view from anywhere** through the Tapo cloud, like the Tapo app: no VPN, port forwarding
   or camera accounts.
-- **Live grid** of all cameras, sized to fit the window; click a camera for a full view.
+- **Home**: a card per camera with a recent picture, and the H500 with its recordings.
+- **Live view**: all cameras in a grid sized to fit the window, one click from anywhere.
+- **Camera view**: the video with Take Photo, Pan & Tilt (pad and presets; arrow keys work too),
+  Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
 - **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
-- **Pan/tilt** and **presets** from anywhere for cameras that have them (arrow keys work too);
-  the app finds out which do.
 - **H500 recordings**: browse each paired camera's clips by day, download and play them.
 - **Snapshots** to `Pictures\TapoViewer`.
+- **Light or dark**, or the same as Windows (*Settings › Video & display*).
 - **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
   sent to your phone.
 - The password (with *Remember me*) and the cloud session are encrypted with Windows DPAPI, so
@@ -36,8 +38,8 @@ Everything uses your **Tapo app login** (email and password).
    Viewer has it sent straight to the Tapo app on your phone; *Receive Code via Email* sends it by
    email instead, and *Resend Code* becomes available after a minute. The PC is remembered after
    that.
-3. The cameras on your account are added automatically and **Live view** opens. **Update camera
-   list** (*Settings › Tapo account*) picks up cameras added later. To change which account
+3. The cameras on your account are added automatically and **Home** opens. **Update camera
+   list** (⟳ on Home, or *Settings › Tapo account*) picks up cameras added later. To change which account
    camera an entry shows, edit it and pick its *Tapo camera*.
 
 With **Remember me** ticked, the password is saved (encrypted) so the app can log in again by
@@ -49,8 +51,14 @@ If the session expires and the app can't renew it, the log-in card comes back. *
 The grid uses each camera's sub-stream (SD) and the single view its main stream (HD); you can
 change either per camera.
 
-In the single-camera view, the pan/tilt panel appears for cameras that have it. Each move goes
-through the cloud, so it takes a moment; arrow presses made meanwhile are combined into one move.
+Home's cards get their pictures from one frame of each camera when Home first opens, and are
+refreshed whenever you've been watching a camera. **Live view** (in the sidebar or on Home) shows
+all cameras at once; click one for its camera view.
+
+In the camera view, **Pan & Tilt** works for cameras that have it. Each move goes through the
+cloud, so it takes a moment; arrow presses made meanwhile are combined into one move. **Privacy
+Mode** covers the camera's lens (the Tapo app's privacy mode); the video comes back by itself
+when it's turned off. **Playback & Download** opens that camera's recordings on the H500.
 
 H500 recordings are still read from the hub on the local network, because there is no known way
 to reach them through the cloud. To browse them away from the office, put the PC on the office
@@ -129,8 +137,8 @@ tools/build-ffmpeg.sh windows
 `tools/fake_cloud.py` is a fake Tapo cloud and video relay for testing cloud live view without
 an account. It checks request signatures like the real cloud, redirects to a "regional" server,
 can ask for a verification code (`--mfa`, code `123456`), can expire sessions
-(`--expire-after 60`) and simulates pan/tilt and presets, with the cloud's delay if you like
-(`--control-delay 0.4`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
+(`--expire-after 60`) and simulates pan/tilt, presets and privacy mode, with the cloud's delay if
+you like (`--control-delay 0.4`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
 pointed at it:
 
 ```bash

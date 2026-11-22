@@ -50,6 +50,33 @@ impl Quality {
     }
 }
 
+/// Light or dark look; `System` follows Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub fn index(self) -> i32 {
+        match self {
+            Theme::System => 0,
+            Theme::Light => 1,
+            Theme::Dark => 2,
+        }
+    }
+
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Theme::Light,
+            2 => Theme::Dark,
+            _ => Theme::System,
+        }
+    }
+}
+
 /// Graphics backend, picked at start-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Renderer {
@@ -112,6 +139,7 @@ pub struct AppConfig {
     /// Empty = look next to the exe, then on PATH.
     pub ffmpeg_path: String,
     pub renderer: Renderer,
+    pub theme: Theme,
     pub cloud: CloudConfig,
 }
 

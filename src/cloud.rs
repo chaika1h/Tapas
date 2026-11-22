@@ -527,6 +527,7 @@ impl CloudClient {
             0 => {}
             code @ (-40401 | -40406) => return Err(CloudError::with_code("Camera is offline", code)),
             AUTH_EXPIRED => return Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED)),
+            code @ -64324 => return Err(CloudError::with_code("Privacy mode is on", code)),
             code => {
                 return Err(CloudError::with_code(format!("The cloud relay refused the stream (code {code})"), code));
             }
@@ -598,15 +599,49 @@ impl CloudClient {
         parse_camera_answer(status, &bytes)
     }
 
-    /// Whether the camera has pan/tilt.
-    pub async fn ptz_supported(&self, camera: &CloudCamera) -> Result<bool> {
+    /// Whether the camera has pan/tilt, and whether privacy mode is on
+    /// (`None` if the camera has no privacy mode), in one round trip.
+    pub async fn camera_overview(&self, camera: &CloudCamera) -> Result<(bool, Option<bool>)> {
+        let requests = vec![
+            json!({
+                "method": "getAppComponentList",
+                "params": { "app_component": { "name": ["app_component_list"] } },
+            }),
+            json!({ "method": "getLensMaskConfig", "params": { "lens_mask": { "name": ["lens_mask_info"] } } }),
+        ];
+        let responses = self.camera_requests(camera, requests).await?;
+        let components = first_result(&responses, "getAppComponentList")?;
+        let list = components.pointer("/app_component/app_component_list").and_then(Value::as_array);
+        let ptz = list.is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz")));
+        let privacy = first_result(&responses[1..], "getLensMaskConfig").ok().and_then(|r| parse_lens_mask(&r));
+        Ok((ptz, privacy))
+    }
+
+    pub async fn privacy_mode(&self, camera: &CloudCamera) -> Result<bool> {
+        let request = json!({ "method": "getLensMaskConfig", "params": { "lens_mask": { "name": ["lens_mask_info"] } } });
+        let result = first_result(&self.camera_requests(camera, vec![request]).await?, "getLensMaskConfig")?;
+        parse_lens_mask(&result).ok_or_else(|| CloudError::new("The camera didn't say whether privacy mode is on"))
+    }
+
+    /// Turns privacy mode on or off and waits until the camera reports it.
+    pub async fn set_privacy_mode(&self, camera: &CloudCamera, on: bool) -> Result<bool> {
+        let value = if on { "on" } else { "off" };
         let request = json!({
-            "method": "getAppComponentList",
-            "params": { "app_component": { "name": ["app_component_list"] } },
+            "method": "setLensMaskConfig",
+            "params": { "lens_mask": { "lens_mask_info": { "enabled": value } } },
         });
-        let result = first_result(&self.camera_requests(camera, vec![request]).await?, "getAppComponentList")?;
-        let list = result.pointer("/app_component/app_component_list").and_then(Value::as_array);
-        Ok(list.is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz"))))
+        first_result(&self.camera_requests(camera, vec![request]).await?, "setLensMaskConfig")?;
+        // The camera applies it asynchronously.
+        let mut last_error = None;
+        for delay_ms in [0, 400, 800, 1200, 1600] {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            match self.privacy_mode(camera).await {
+                Ok(state) if state == on => return Ok(state),
+                Ok(_) => last_error = None,
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| CloudError::new("Privacy mode didn't change; try again")))
     }
 
     /// Moves the camera relative to where it is: `x > 0` pans right, `y > 0`
@@ -688,6 +723,15 @@ fn device_error(what: &str, code: i64) -> String {
         -64324 => "Privacy mode is on".into(),
         -64336 => "Movement blocked by a privacy zone".into(),
         _ => format!("{what} (code {code})"),
+    }
+}
+
+/// `lens_mask.lens_mask_info.enabled` is "on" or "off".
+fn parse_lens_mask(result: &Value) -> Option<bool> {
+    match result.pointer("/lens_mask/lens_mask_info/enabled").and_then(Value::as_str) {
+        Some("on") => Some(true),
+        Some("off") => Some(false),
+        _ => None,
     }
 }
 
@@ -905,6 +949,13 @@ mod tests {
         let e = parse_camera_answer(403, br#"{"message":"forbidden"}"#).unwrap_err().to_string();
         assert!(e.contains("HTTP 403") && e.contains("forbidden"), "{e}");
         assert!(parse_camera_answer(200, b"{}").is_err());
+    }
+
+    #[test]
+    fn lens_mask_states() {
+        assert_eq!(parse_lens_mask(&json!({"lens_mask": {"lens_mask_info": {"enabled": "on"}}})), Some(true));
+        assert_eq!(parse_lens_mask(&json!({"lens_mask": {"lens_mask_info": {"enabled": "off"}}})), Some(false));
+        assert_eq!(parse_lens_mask(&json!({})), None);
     }
 
     #[test]
