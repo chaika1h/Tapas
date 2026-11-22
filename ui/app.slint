@@ -11,7 +11,7 @@ export struct Tile {
     live: bool,
 }
 
-export struct CameraRow { id: int, name: string, host: string, detail: string }
+export struct CameraRow { id: int, name: string, detail: string }
 export struct HubRow { id: int, name: string, host: string }
 export struct FoundRow { name: string, model: string, host: string, kind: string, can-add: bool }
 export struct PresetRow { id: string, name: string }
@@ -39,7 +39,7 @@ export global Bridge {
     in property <bool> single-has-frame;
     in property <string> single-status;
     in-out property <int> single-quality;
-    in property <[string]> quality-labels: ["Fast (built-in)", "SD (ffmpeg)", "HD (ffmpeg)"];
+    in property <[string]> quality-labels: ["SD", "HD"];
     callback quality-changed(int);
     callback snapshot();
     in property <bool> single-ptz;
@@ -62,9 +62,7 @@ export global Bridge {
     in property <string> account-message;
     callback save-settings();
 
-    // settings: live view through the Tapo cloud
-    in-out property <int> live-source;
-    in property <[string]> live-source-labels: ["Local network (RTSP)", "Tapo cloud"];
+    // settings: Tapo cloud sign-in
     in property <bool> cloud-signed-in;
     in property <bool> cloud-busy;
     in property <string> cloud-status;
@@ -76,7 +74,6 @@ export global Bridge {
     in-out property <string> cloud-code;
     // First entry is "Not linked"; the rest are the cameras on the account.
     in property <[string]> cloud-camera-labels: ["Not linked"];
-    callback live-source-changed(int);
     callback cloud-sign-in();
     callback cloud-send-code(int); // 1 = Tapo app, 2 = email
     callback cloud-verify();
@@ -88,9 +85,6 @@ export global Bridge {
     in-out property <int> cam-editing: -1; // -1 closed, 0 new, otherwise camera id
     in-out property <string> cam-name;
     in-out property <string> cam-host;
-    in-out property <string> cam-port: "554";
-    in-out property <string> cam-user;
-    in-out property <string> cam-pass;
     in-out property <bool> cam-ptz;
     in-out property <int> cam-quality;
     in-out property <int> cam-cloud; // index into cloud-camera-labels
@@ -291,7 +285,7 @@ component LivePage inherits Rectangle {
         Text { text: "No cameras yet"; font-size: 22px; font-weight: 600; horizontal-alignment: center; }
         Muted {
             horizontal-alignment: center;
-            text: "Add your cameras in Settings: use “Find devices” to scan the network, enter each camera's IP address, or sign in to the Tapo cloud to add the cameras on your account.\nOn the local network, live video uses the camera account you set in the Tapo app (Camera Settings › Advanced Settings › Camera Account).";
+            text: "Sign in with your Tapo account in Settings: the cameras on the account are added, and their live video comes through TP-Link's cloud like in the Tapo app.";
         }
         HorizontalLayout {
             alignment: center;
@@ -556,7 +550,7 @@ component SettingsPage inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Your TP-Link / Tapo app login. It's used to find devices, to pan/tilt cameras, to browse H500 recordings and for live view through the Tapo cloud. Live video on the local network uses each camera's own camera account instead.";
+                        text: "Your TP-Link / Tapo app login. Live video comes through TP-Link's cloud, the way the Tapo app shows it, so this PC doesn't need to be on the cameras' network. The account is also used to find devices, to pan/tilt cameras and to browse H500 recordings. This uses TP-Link's private service and may stop working if they change it.";
                     }
                     Field {
                         label: "Email";
@@ -580,27 +574,6 @@ component SettingsPage inherits Rectangle {
                         }
                         Button { text: "Save account"; primary: true; clicked => { Bridge.save-settings(); } }
                     }
-                }
-            }
-
-            GroupBox {
-                title: "Live view through the Tapo cloud";
-                VerticalLayout {
-                    spacing: 8px;
-                    Muted {
-                        text: "Watch your cameras from anywhere, the way the Tapo app does: the video comes through TP-Link's cloud, so this PC doesn't need to be on the cameras' network, a VPN or port forwarding. It signs in with the Tapo account above. This uses TP-Link's private service and may stop working if they change it.";
-                    }
-                    Field {
-                        label: "Live view";
-                        ComboBox {
-                            width: 220px;
-                            model: Bridge.live-source-labels;
-                            current-index <=> Bridge.live-source;
-                            selected => { Bridge.live-source-changed(self.current-index); }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    Muted { text: "Applies to cameras linked to your Tapo account. Cameras without an IP address always use the cloud."; }
                     HorizontalLayout {
                         spacing: 8px;
                         VerticalLayout {
@@ -611,7 +584,6 @@ component SettingsPage inherits Rectangle {
                         Spinner { width: 22px; height: 22px; indeterminate: true; visible: Bridge.cloud-busy; }
                         if !Bridge.cloud-signed-in: Button {
                             text: "Sign in";
-                            primary: true;
                             enabled: !Bridge.cloud-busy;
                             clicked => { Bridge.cloud-sign-in(); }
                         }
@@ -673,14 +645,14 @@ component SettingsPage inherits Rectangle {
                 title: "Cameras";
                 VerticalLayout {
                     spacing: 6px;
-                    if Bridge.cameras.length == 0: Muted { text: "No cameras added yet."; }
+                    if Bridge.cameras.length == 0: Muted { text: "No cameras yet: sign in above to add the cameras on your Tapo account."; }
                     for c in Bridge.cameras: HorizontalLayout {
                         spacing: 8px;
                         VerticalLayout { alignment: center; Text { text: c.name; font-weight: 600; width: 170px; overflow: elide; } }
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
-                            Muted { text: c.host + "  ·  " + c.detail; wrap: no-wrap; overflow: elide; }
+                            Muted { text: c.detail; wrap: no-wrap; overflow: elide; }
                         }
                         Button { text: "↑"; clicked => { Bridge.move-camera(c.id, -1); } }
                         Button { text: "↓"; clicked => { Bridge.move-camera(c.id, 1); } }
@@ -700,32 +672,13 @@ component SettingsPage inherits Rectangle {
                             spacing: 8px;
                             Heading { text: Bridge.cam-editing == 0 ? "New camera" : "Edit camera"; }
                             Field {
-                                label: "Name";
-                                LineEdit { text <=> Bridge.cam-name; placeholder-text: "Front door"; horizontal-stretch: 1; }
-                            }
-                            Field {
-                                label: "IP address / port";
-                                LineEdit { text <=> Bridge.cam-host; placeholder-text: "192.168.1.50 (empty: cloud only)"; horizontal-stretch: 1; }
-                                LineEdit { text <=> Bridge.cam-port; width: 80px; }
-                            }
-                            Field {
-                                label: "Tapo cloud camera";
+                                label: "Tapo camera";
                                 ComboBox { width: 260px; model: Bridge.cloud-camera-labels; current-index <=> Bridge.cam-cloud; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
-                            Muted {
-                                text: "Link the camera to your Tapo account to watch it through the cloud. Sign in under “Live view through the Tapo cloud” to list your cameras.";
-                            }
-                            Muted {
-                                text: "Camera account (set in the Tapo app: Camera Settings › Advanced Settings › Camera Account):";
-                            }
                             Field {
-                                label: "Username";
-                                LineEdit { text <=> Bridge.cam-user; horizontal-stretch: 1; }
-                            }
-                            Field {
-                                label: "Password";
-                                LineEdit { text <=> Bridge.cam-pass; input-type: password; horizontal-stretch: 1; }
+                                label: "Name";
+                                LineEdit { text <=> Bridge.cam-name; placeholder-text: "Same as in the Tapo app"; horizontal-stretch: 1; }
                             }
                             Field {
                                 label: "Grid stream";
@@ -735,6 +688,13 @@ component SettingsPage inherits Rectangle {
                             Field {
                                 label: "";
                                 CheckBox { text: "Pan/tilt camera (C2xx, C5xx, TC40, TC70…)"; checked <=> Bridge.cam-ptz; }
+                            }
+                            Field {
+                                label: "IP address";
+                                LineEdit { text <=> Bridge.cam-host; placeholder-text: "Optional: 192.168.1.50"; horizontal-stretch: 1; }
+                            }
+                            Muted {
+                                text: "Pan/tilt still uses the camera's local API, so it only works with an IP address, when this PC is on the camera's network. “Find devices” below fills it in.";
                             }
                             if Bridge.cam-error != "": Text { text: Bridge.cam-error; color: #e5484d; }
                             HorizontalLayout {
@@ -752,7 +712,7 @@ component SettingsPage inherits Rectangle {
                 title: "Hubs (H500 / H200)";
                 VerticalLayout {
                     spacing: 6px;
-                    Muted { text: "The hub is used to browse and download recordings it has stored. Cameras paired with it are still added above with their own IP for live view."; }
+                    Muted { text: "The hub is used to browse and download the recordings it has stored, on the local network. Its cameras' live view comes from your Tapo account like the others."; }
                     for h in Bridge.hubs: HorizontalLayout {
                         spacing: 8px;
                         VerticalLayout { alignment: center; Text { text: h.name; font-weight: 600; width: 170px; overflow: elide; } }
@@ -796,7 +756,7 @@ component SettingsPage inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Scans for Tapo cameras and hubs using your Tapo account above. If nothing shows up, try your subnet's broadcast address, e.g. 192.168.1.255.";
+                        text: "Scans this network for hubs (for recordings) and for cameras' IP addresses (for pan/tilt), using your Tapo account above. If nothing shows up, try your subnet's broadcast address, e.g. 192.168.1.255.";
                     }
                     HorizontalLayout {
                         spacing: 8px;

@@ -8,31 +8,6 @@ use serde::{Deserialize, Serialize};
 use crate::cloud::CloudCamera;
 use crate::secret::Secret;
 
-/// How this PC gets live video from cameras that can do both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum LiveSource {
-    /// RTSP from each camera; the PC must be on the cameras' network.
-    #[default]
-    Local,
-    /// The Tapo cloud relay, like the Tapo app away from home.
-    Cloud,
-}
-
-impl LiveSource {
-    pub const LABELS: [&str; 2] = ["Local network (RTSP)", "Tapo cloud"];
-
-    pub fn index(self) -> i32 {
-        match self {
-            LiveSource::Local => 0,
-            LiveSource::Cloud => 1,
-        }
-    }
-
-    pub fn from_index(i: i32) -> Self {
-        if i == 1 { LiveSource::Cloud } else { LiveSource::Local }
-    }
-}
-
 /// The Tapo cloud sign-in. The password is not stored here: the session token
 /// is reused until the cloud stops accepting it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,40 +23,30 @@ pub struct CloudConfig {
     pub token: Secret,
 }
 
-/// Which camera stream to show.
+/// Which of the camera's streams to request through the cloud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Quality {
-    /// The camera's MJPEG stream (`stream8`, ~640×360), decoded in-process.
-    /// Light on CPU, no extra tools needed: ideal for the grid.
+    /// The sub-stream (~640×360): light on bandwidth and CPU, for the grid.
+    /// Settings from the RTSP version saved its built-in stream as `Mjpeg`.
     #[default]
-    Mjpeg,
-    /// The H.264/H.265 sub-stream (`stream2`), decoded by ffmpeg.
+    #[serde(alias = "Mjpeg")]
     Sd,
-    /// The H.264/H.265 main stream (`stream1`), decoded by ffmpeg.
+    /// The main stream at full resolution.
     Hd,
 }
 
 impl Quality {
-    pub const LABELS: [&str; 3] = ["Fast (built-in)", "SD (ffmpeg)", "HD (ffmpeg)"];
+    pub const LABELS: [&str; 2] = ["SD", "HD"];
 
     pub fn index(self) -> i32 {
         match self {
-            Quality::Mjpeg => 0,
-            Quality::Sd => 1,
-            Quality::Hd => 2,
+            Quality::Sd => 0,
+            Quality::Hd => 1,
         }
     }
 
     pub fn from_index(i: i32) -> Self {
-        match i {
-            1 => Quality::Sd,
-            2 => Quality::Hd,
-            _ => Quality::Mjpeg,
-        }
-    }
-
-    pub fn needs_ffmpeg(self) -> bool {
-        self != Quality::Mjpeg
+        if i == 1 { Quality::Hd } else { Quality::Sd }
     }
 }
 
@@ -118,42 +83,23 @@ impl Renderer {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraConfig {
     pub id: u32,
     pub name: String,
+    /// The camera on the Tapo account; live video comes through the cloud.
+    pub cloud: Option<CloudCamera>,
+    /// Optional local IP address, only for pan/tilt and presets, which use
+    /// the camera's local API.
     pub host: String,
-    pub rtsp_port: u16,
-    /// The camera account set in the Tapo app
-    /// (Camera Settings › Advanced Settings › Camera Account).
-    pub username: String,
-    pub password: Secret,
     pub ptz: bool,
     pub grid_quality: Quality,
-    /// The same camera on the Tapo account, for live view through the cloud.
-    pub cloud: Option<CloudCamera>,
 }
 
 impl CameraConfig {
-    pub fn has_local(&self) -> bool {
+    pub fn has_ip(&self) -> bool {
         !self.host.trim().is_empty()
-    }
-}
-
-impl Default for CameraConfig {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            name: String::new(),
-            host: String::new(),
-            rtsp_port: 554,
-            username: String::new(),
-            password: Secret::default(),
-            ptz: false,
-            grid_quality: Quality::Mjpeg,
-            cloud: None,
-        }
     }
 }
 
@@ -168,7 +114,7 @@ pub struct HubConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    /// TP-Link / Tapo app account. Used for discovery, pan/tilt and the hub.
+    /// TP-Link / Tapo app account: live view, discovery, pan/tilt and the hub.
     pub cloud_username: String,
     pub cloud_password: Secret,
     pub cameras: Vec<CameraConfig>,
@@ -176,7 +122,6 @@ pub struct AppConfig {
     /// Empty = look next to the exe, then on PATH.
     pub ffmpeg_path: String,
     pub renderer: Renderer,
-    pub live_source: LiveSource,
     pub cloud: CloudConfig,
 }
 

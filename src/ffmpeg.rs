@@ -1,6 +1,5 @@
-//! H.264/H.265 streams decoded by an ffmpeg child process that writes raw RGB
-//! frames to a pipe: RTSP from the camera (`stream1` HD, `stream2` SD), or
-//! MPEG-TS from the Tapo cloud relay.
+//! Live video from the Tapo cloud relay: its MPEG-TS (H.264/H.265) goes into
+//! an ffmpeg child process, which writes raw RGB frames to a pipe.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -16,7 +15,7 @@ use tokio::time::timeout;
 use crate::cloud::Resolution;
 use crate::config::Quality;
 use crate::relay;
-use crate::stream::{FrameSink, StreamSpec, rtsp_url};
+use crate::stream::{FrameSink, StreamSpec};
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -101,41 +100,15 @@ mod bundled {
     }
 }
 
-fn require_ffmpeg(spec: &StreamSpec) -> Result<&Path> {
-    spec.ffmpeg
-        .as_deref()
-        .context("ffmpeg not found: put ffmpeg.exe next to TapoViewer.exe or set its path in Settings")
-}
-
-pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
-    let ffmpeg = require_ffmpeg(spec)?;
-    let (path, w, h) = match spec.quality {
-        Quality::Hd => ("stream1", 1920usize, 1080usize),
-        _ => ("stream2", 640, 360),
-    };
-    let url = rtsp_url(spec, path, true)?;
-    let input = [
-        "-nostdin", "-fflags", "nobuffer", "-flags", "low_delay", "-rtsp_transport", "tcp", "-timeout", "10000000",
-        "-i", url.as_str(),
-    ];
-    let mut decoder = Decoder::spawn(ffmpeg, &input, w, h, false)?;
-    match decoder.push_frames(sink).await {
-        Stopped::NoVideo => bail!("No video for {}s", FRAME_TIMEOUT.as_secs()),
-        Stopped::Exited(line) => bail!(friendly_error(&line, spec, &url)),
-    }
-}
-
 /// Set once the cloud refuses the sub-stream, so later requests ask for HD.
 static CLOUD_VGA_REFUSED: AtomicBool = AtomicBool::new(false);
 
-/// Live view through the Tapo cloud relay: the relay's MPEG-TS goes into
-/// ffmpeg's stdin, decoded frames come out as for RTSP.
-pub async fn run_cloud(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
-    let target = spec.cloud.as_ref().context("This camera isn't linked to your Tapo account")?;
+/// Requests the camera's relay and decodes it until something stops.
+pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     let ffmpeg = spec
         .ffmpeg
         .as_deref()
-        .context("Live view through the Tapo cloud needs ffmpeg: set its path in Settings")?;
+        .context("ffmpeg not found: live view needs it. Put ffmpeg.exe next to TapoViewer.exe or set its path in Settings")?;
     let (mut resolution, w, h) = match spec.quality {
         Quality::Hd => (Resolution::Hd, 1920usize, 1080usize),
         _ => (Resolution::Vga, 640, 360),
@@ -144,16 +117,16 @@ pub async fn run_cloud(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
         resolution = Resolution::Hd;
     }
 
-    let client = &target.client;
-    let info = match client.request_relay(&target.camera, resolution).await {
+    let client = &spec.client;
+    let info = match client.request_relay(&spec.camera, resolution).await {
         Err(e) if resolution == Resolution::Vga && e.is_refused() => {
             log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
             CLOUD_VGA_REFUSED.store(true, Ordering::Relaxed);
-            client.request_relay(&target.camera, Resolution::Hd).await?
+            client.request_relay(&spec.camera, Resolution::Hd).await?
         }
         result => result?,
     };
-    let mut relay = relay::open(client.tls(), &info, &target.camera.model).await?;
+    let mut relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
     decode_relay(&mut relay, ffmpeg, w, h, sink).await
 }
 
@@ -164,10 +137,10 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     // A live pipe: bound the probing, or ffmpeg waits for more input before
-    // its first frame. Unlike RTSP, no `-fflags nobuffer`: it throws away the
-    // probed packets, so the picture only starts at the next keyframe.
+    // its first frame. No `-fflags nobuffer`: it throws away the probed
+    // packets, so the picture would only start at the next keyframe.
     let input = ["-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32768", "-f", "mpegts", "-i", "pipe:0"];
-    let mut decoder = Decoder::spawn(ffmpeg, &input, w, h, true)?;
+    let mut decoder = Decoder::spawn(ffmpeg, &input, w, h)?;
     let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
     tokio::select! {
         result = relay::copy_video(relay, &mut stdin) => result,
@@ -196,8 +169,8 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn spawn(ffmpeg: &Path, input: &[&str], width: usize, height: usize, piped_stdin: bool) -> Result<Self> {
-        let mut child = command(ffmpeg, input, width, height, piped_stdin)
+    fn spawn(ffmpeg: &Path, input: &[&str], width: usize, height: usize) -> Result<Self> {
+        let mut child = command(ffmpeg, input, width, height)
             .spawn()
             .with_context(|| format!("Could not start {}", ffmpeg.display()))?;
         let stdin = child.stdin.take();
@@ -236,7 +209,7 @@ impl Decoder {
     }
 }
 
-fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, piped_stdin: bool) -> tokio::process::Command {
+fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize) -> tokio::process::Command {
     // Letterbox into a fixed size so every frame has a known byte length.
     let vf = format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
@@ -248,7 +221,7 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, piped_stdin: bool)
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
         .args(["-an", "-sn", "-vf", &vf, "-fps_mode", "passthrough"])
         .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
-        .stdin(if piped_stdin { Stdio::piped() } else { Stdio::null() })
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -258,20 +231,6 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, piped_stdin: bool)
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
-}
-
-fn friendly_error(line: &str, spec: &StreamSpec, url: &url::Url) -> String {
-    if line.is_empty() {
-        return "ffmpeg stopped".into();
-    }
-    // ffmpeg echoes the URL, so make sure no password reaches the UI or logs.
-    let mut line = line.to_string();
-    for secret in [spec.password.as_str(), url.password().unwrap_or("")] {
-        if !secret.is_empty() {
-            line = line.replace(secret, "***");
-        }
-    }
-    crate::stream::friendly_error(&line, spec.port)
 }
 
 #[cfg(test)]

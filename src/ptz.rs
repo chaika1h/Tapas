@@ -1,7 +1,7 @@
 //! Pan/tilt and presets through the camera's local Tapo API.
 //!
-//! This uses the TP-Link *cloud account* (the Tapo app login), not the camera
-//! account used for RTSP. The login happens lazily on the first command.
+//! This uses the Tapo app login and the camera's IP address, so it works only
+//! on the camera's network. The login happens lazily on the first command.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -5,7 +5,6 @@ mod app;
 mod cloud;
 mod config;
 mod ffmpeg;
-mod mjpeg;
 mod ptz;
 mod relay;
 mod secret;
@@ -68,7 +67,7 @@ fn select_backend(renderer: Renderer) {
 /// release builds have no console.
 fn init_logging() {
     let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,retina=warn,wgpu=warn,naga=warn"));
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"));
     let log_path = config::config_path().with_file_name("tapo-viewer.log");
     if let Some(dir) = log_path.parent() {
         let _ = std::fs::create_dir_all(dir);

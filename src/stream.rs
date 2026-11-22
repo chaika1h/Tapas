@@ -12,35 +12,17 @@ use slint::{Rgb8Pixel, SharedPixelBuffer};
 
 use crate::cloud::{CloudCamera, CloudClient, CloudError};
 use crate::config::Quality;
-use crate::{ffmpeg, mjpeg};
+use crate::ffmpeg;
 
 pub type Frame = SharedPixelBuffer<Rgb8Pixel>;
 
+/// One camera's live video through the Tapo cloud relay.
 #[derive(Clone)]
 pub struct StreamSpec {
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub password: String,
     pub quality: Quality,
     pub ffmpeg: Option<PathBuf>,
-    /// Set to stream through the Tapo cloud relay instead of RTSP.
-    pub cloud: Option<CloudTarget>,
-}
-
-#[derive(Clone)]
-pub struct CloudTarget {
     pub client: Arc<CloudClient>,
     pub camera: CloudCamera,
-}
-
-impl StreamSpec {
-    fn label(&self) -> String {
-        match &self.cloud {
-            Some(t) => format!("{} (cloud)", t.camera.name),
-            None => self.host.clone(),
-        }
-    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -145,12 +127,7 @@ async fn run(spec: StreamSpec, mut sink: FrameSink) {
     loop {
         sink.set_status(Status::Connecting);
         let frames_before = sink.frames;
-        let result = match (&spec.cloud, spec.quality) {
-            (Some(_), _) => ffmpeg::run_cloud(&spec, &mut sink).await,
-            (None, Quality::Mjpeg) => mjpeg::run(&spec, &mut sink).await,
-            (None, Quality::Sd | Quality::Hd) => ffmpeg::run(&spec, &mut sink).await,
-        };
-        let reason = match result {
+        let reason = match ffmpeg::run(&spec, &mut sink).await {
             Ok(()) => "Stream ended".to_string(),
             Err(e) => {
                 if e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth) {
@@ -162,41 +139,9 @@ async fn run(spec: StreamSpec, mut sink: FrameSink) {
         if sink.frames > frames_before {
             backoff = MIN_BACKOFF; // it was working; reconnect quickly
         }
-        log::warn!("{} ({:?}): {reason}; retrying in {backoff:?}", spec.label(), spec.quality);
+        log::warn!("{} ({:?}): {reason}; retrying in {backoff:?}", spec.camera.name, spec.quality);
         sink.set_status(Status::Retrying(format!("{reason} — retrying in {}s", backoff.as_secs())));
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
-    }
-}
-
-/// Builds an `rtsp://` URL, optionally with URL-encoded credentials.
-pub fn rtsp_url(spec: &StreamSpec, path: &str, with_creds: bool) -> anyhow::Result<url::Url> {
-    let mut url = url::Url::parse(&format!("rtsp://{}:{}/{path}", spec.host.trim(), spec.port))
-        .map_err(|e| anyhow::anyhow!("invalid camera address {:?}: {e}", spec.host))?;
-    if with_creds {
-        let _ = url.set_username(&spec.username);
-        let _ = url.set_password(Some(&spec.password));
-    }
-    Ok(url)
-}
-
-/// Turns low-level RTSP/ffmpeg errors into something a user can act on.
-pub fn friendly_error(msg: &str, port: u16) -> String {
-    let lower = msg.to_ascii_lowercase();
-    if msg.contains("401") || lower.contains("unauthorized") {
-        "Camera account username/password rejected".into()
-    } else if lower.contains("connection refused") || msg.contains("10061") {
-        format!("Camera refused the connection on port {port}")
-    } else if lower.contains("no route to host")
-        || lower.contains("timed out")
-        || lower.contains("unreachable")
-        || msg.contains("10060")
-        || msg.contains("10065")
-    {
-        "Camera did not answer: check the IP address and that the PC can reach it".into()
-    } else if msg.contains("404") || lower.contains("not found") {
-        "Camera has no such stream".into()
-    } else {
-        msg.to_string()
     }
 }
