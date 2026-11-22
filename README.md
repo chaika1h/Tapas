@@ -12,8 +12,10 @@ A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, wr
   the app finds out which do.
 - **H500 recordings**: browse each paired camera's clips by day, download and play them.
 - **Snapshots** to `Pictures\TapoViewer`.
-- Passwords and the cloud session are encrypted with Windows DPAPI, so they only work for your
-  Windows user.
+- **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
+  sent to your phone.
+- The password (with *Remember me*) and the cloud session are encrypted with Windows DPAPI, so
+  they only work for your Windows user.
 
 ## How it talks to the devices
 
@@ -27,17 +29,25 @@ Everything uses your **Tapo app login** (email and password).
 
 ### Getting started
 
-1. Under *Settings › Tapo account*, enter your Tapo email and password and press **Save account**.
-   This signs in. The first time, Tapo asks for a verification code, sent to the Tapo app or by
-   email; the PC is remembered after that.
-2. The cameras on your account are added automatically. **Update camera list** picks up cameras
-   added later. To change which account camera an entry shows, edit it and pick its *Tapo camera*.
-3. Open **Live view**.
+1. When you're not signed in, the app opens on its welcome screen. Press **Log In** and enter your
+   TP-Link ID (the email and password you use in the Tapo app). TP-Link IDs are created in the
+   Tapo app; *Create a TP-Link ID* and *Forgot Password?* explain where.
+2. The first time this PC logs in, Tapo asks for a verification code. Like the Tapo app, Tapo
+   Viewer has it sent straight to the Tapo app on your phone; *Receive Code via Email* sends it by
+   email instead, and *Resend Code* becomes available after a minute. The PC is remembered after
+   that.
+3. The cameras on your account are added automatically and **Live view** opens. **Update camera
+   list** (*Settings › Tapo account*) picks up cameras added later. To change which account
+   camera an entry shows, edit it and pick its *Tapo camera*.
+
+With **Remember me** ticked, the password is saved (encrypted) so the app can log in again by
+itself when the session expires and can open the H500's recordings after a restart. Without it,
+the password is only kept until the app closes. The session token is always saved, encrypted.
+If the session expires and the app can't renew it, the log-in card comes back. **Sign out**
+(*Settings › Tapo account*) forgets the session and the password and keeps the email.
 
 The grid uses each camera's sub-stream (SD) and the single view its main stream (HD); you can
-change either per camera. The PC keeps the session token, encrypted like the password. If the
-session expires, the app signs in again by itself; if Tapo then asks for a code, sign in
-again under *Settings*.
+change either per camera.
 
 In the single-camera view, the pan/tilt panel appears for cameras that have it. Each move goes
 through the cloud, so it takes a moment; arrow presses made meanwhile are combined into one move.

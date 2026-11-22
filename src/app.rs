@@ -77,6 +77,8 @@ struct PendingMfa {
     challenge: MfaChallenge,
     user: String,
     pass: String,
+    /// "Remember me" on the log-in card.
+    remember: bool,
     /// Where the code was sent, once it has been.
     method: Option<MfaMethod>,
 }
@@ -106,6 +108,8 @@ pub struct App {
     cloud_choices: RefCell<Vec<CloudCamera>>,
     pending_mfa: RefCell<Option<PendingMfa>>,
     last_relogin: Cell<Option<Instant>>,
+    /// The Tapo password for this run, when "Remember me" was off.
+    password: RefCell<String>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -158,6 +162,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         cloud_choices: RefCell::default(),
         pending_mfa: RefCell::default(),
         last_relogin: Cell::default(),
+        password: RefCell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     if new_terminal {
@@ -184,9 +189,11 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_ptz_refresh(cb!(&app, |a| a.ptz_send(PtzCmd::Refresh)));
 
     b.on_save_settings(cb!(&app, |a| a.save_settings()));
-    b.on_cloud_sign_in(cb!(&app, |a| a.cloud_sign_in()));
-    b.on_cloud_send_code(cb!(&app, |a, m| a.cloud_send_code(m)));
-    b.on_cloud_verify(cb!(&app, |a| a.cloud_verify()));
+    b.on_login(cb!(&app, |a| a.login()));
+    b.on_mfa_send(cb!(&app, |a, m| a.mfa_send(m)));
+    b.on_mfa_code_edited(cb!(&app, |a, text| a.mfa_code_edited(text)));
+    b.on_mfa_verify(cb!(&app, |a| a.mfa_verify()));
+    b.on_mfa_back(cb!(&app, |a| a.mfa_back()));
     b.on_cloud_sign_out(cb!(&app, |a| a.cloud_sign_out()));
     b.on_cloud_refresh(cb!(&app, |a| a.cloud_refresh()));
     b.on_new_camera(cb!(&app, |a| a.new_camera(CameraConfig::default())));
@@ -218,13 +225,23 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     }
     app.sync_streams();
 
-    // First start with a saved account but no cloud session (a new install, or
-    // settings from the RTSP version): sign in, which also links the cameras.
-    // Not after "Sign out", which leaves the cameras linked.
-    let signed_in = app.cloud_client().is_some_and(|c| c.session().is_some());
-    let none_linked = app.cfg.borrow().cameras.iter().all(|c| c.cloud.is_none());
-    if !signed_in && none_linked && app.cloud_creds().is_some_and(|(_, p)| !p.is_empty()) {
-        app.cloud_sign_in();
+    // Not signed in: the sign-in screens show. With a remembered password
+    // (e.g. settings from an earlier version), log in straight away.
+    if !app.signed_in_now() {
+        let (user, pass) = {
+            let cfg = app.cfg.borrow();
+            (cfg.cloud_username.trim().to_string(), cfg.cloud_password.reveal())
+        };
+        b.set_login_email(user.as_str().into());
+        if let Err(e) = &app.cloud {
+            app.show_sign_in(0, &format!("Tapo cloud unavailable: {e}"));
+        } else if !user.is_empty() && !pass.is_empty() {
+            b.set_login_password(pass.as_str().into());
+            b.set_onboarding_step(1);
+            app.start_login(user, pass, true);
+        } else {
+            app.show_sign_in(if user.is_empty() { 0 } else { 1 }, "");
+        }
     }
 
     app.timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), cb!(&app, |a| a.pump()));
@@ -242,10 +259,15 @@ impl App {
         *self.status_until.borrow_mut() = Some(Instant::now() + Duration::from_secs(8));
     }
 
+    /// The Tapo account: the saved password, or the one typed in this run.
     fn cloud_creds(&self) -> Option<(String, String)> {
         let cfg = self.cfg.borrow();
         let user = cfg.cloud_username.trim().to_string();
-        (!user.is_empty()).then(|| (user, cfg.cloud_password.reveal()))
+        let mut pass = cfg.cloud_password.reveal();
+        if pass.is_empty() {
+            pass = self.password.borrow().clone();
+        }
+        (!user.is_empty()).then_some((user, pass))
     }
 
     fn persist(&self) {
@@ -353,6 +375,7 @@ impl App {
     fn sync_streams(&self) {
         let page = self.ui().global::<Bridge>().get_page();
         let cfg = self.cfg.borrow();
+        let page = if self.signed_in_now() { page } else { Page::Settings }; // nothing to show
         let wanted: Vec<StreamKey> = match page {
             Page::Live => cfg.cameras.iter().map(|c| (c.id, c.grid_quality)).collect(),
             Page::Single => self.single.borrow().iter().copied().collect(),
@@ -559,8 +582,6 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         let cfg = self.cfg.borrow();
-        b.set_cloud_user(cfg.cloud_username.as_str().into());
-        b.set_cloud_pass(cfg.cloud_password.reveal().into());
         b.set_ffmpeg_path(cfg.ffmpeg_path.as_str().into());
         b.set_renderer_index(cfg.renderer.index());
         b.set_config_path(config::config_path().display().to_string().into());
@@ -576,13 +597,12 @@ impl App {
         );
     }
 
+    /// "Save" under Video & display.
     fn save_settings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         {
             let mut cfg = self.cfg.borrow_mut();
-            cfg.cloud_username = b.get_cloud_user().trim().to_string();
-            cfg.cloud_password = Secret::new(&b.get_cloud_pass());
             cfg.ffmpeg_path = b.get_ffmpeg_path().trim().to_string();
             let renderer = Renderer::from_index(b.get_renderer_index());
             if renderer != cfg.renderer {
@@ -591,31 +611,12 @@ impl App {
             }
         }
         self.persist();
-        let account_changed = {
-            let cfg = self.cfg.borrow();
-            !cfg.cloud.account.is_empty() && !cfg.cloud.account.eq_ignore_ascii_case(&cfg.cloud_username)
-        };
-        if account_changed {
-            self.clear_cloud_session();
-            b.set_cloud_message("Signed out of the Tapo cloud because the account changed.".into());
-        }
         *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
-        // New credentials or ffmpeg: reconnect everything that uses them.
-        self.ptz.borrow_mut().clear();
-        *self.hub.borrow_mut() = HubSession::default();
-        b.set_hub_connected(false);
-        b.set_hub_message(SharedString::new());
+        // A different ffmpeg: reconnect the streams.
         self.streams.borrow_mut().clear();
         self.load_settings_into_ui();
         self.sync_streams();
         self.status("Settings saved.");
-        b.set_account_message("✓ Saved".into());
-
-        // Saving the account signs in, which also lists its cameras.
-        let signed_in = self.cloud_client().is_some_and(|c| c.session().is_some());
-        if self.cloud_creds().is_some() && !signed_in && !b.get_cloud_busy() && self.pending_mfa.borrow().is_none() {
-            self.cloud_sign_in();
-        }
     }
 
     fn refresh_camera_lists(&self) {
@@ -854,6 +855,10 @@ impl App {
         self.ui().global::<Bridge>().set_cloud_busy(busy);
     }
 
+    fn signed_in_now(&self) -> bool {
+        self.cloud_client().is_some_and(|c| c.session().is_some())
+    }
+
     fn refresh_cloud_ui(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
@@ -872,53 +877,90 @@ impl App {
             (Ok(_), None) => "Not signed in".to_string(),
         };
         b.set_cloud_status(status.into());
-        let pending = self.pending_mfa.borrow();
-        let methods = pending.as_ref().map(|p| p.challenge.methods.clone()).unwrap_or_default();
-        b.set_cloud_mfa(pending.is_some());
-        b.set_cloud_mfa_app(methods.contains(&MfaMethod::App));
-        b.set_cloud_mfa_email(methods.contains(&MfaMethod::Email));
-        b.set_cloud_code_sent(pending.as_ref().is_some_and(|p| p.method.is_some()));
     }
 
-    fn cloud_sign_in(&self) {
-        let Some(client) = self.cloud_client() else {
-            self.refresh_cloud_ui();
+    // --------------------------------------------------------- sign-in screens
+
+    fn login_error(&self, msg: impl Into<SharedString>) {
+        self.ui().global::<Bridge>().set_login_error(msg.into());
+    }
+
+    /// Shows the sign-in screens at `step` (0 welcome, 1 log in), with the
+    /// saved email filled in.
+    fn show_sign_in(&self, step: i32, error: &str) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_login_email().is_empty() {
+            b.set_login_email(self.cfg.borrow().cloud_username.as_str().into());
+        }
+        b.set_login_busy(false);
+        b.set_login_error(error.into());
+        b.set_onboarding_step(step);
+    }
+
+    /// "Log In" on the log-in card.
+    fn login(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let user = b.get_login_email().trim().to_string();
+        let pass = b.get_login_password().to_string();
+        if user.is_empty() || pass.is_empty() || b.get_login_busy() {
             return;
-        };
-        let Some((user, pass)) = self.cloud_creds().filter(|(_, p)| !p.is_empty()) else {
-            self.cloud_message("Enter your Tapo email and password under “Tapo account” and press Save account first.");
+        }
+        if !user.contains('@') {
+            self.login_error("Enter the email address of your TP-Link ID.");
             return;
+        }
+        self.start_login(user, pass, b.get_login_remember());
+    }
+
+    fn start_login(&self, user: String, pass: String, remember: bool) {
+        let client = match &self.cloud {
+            Ok(client) => client.clone(),
+            Err(e) => {
+                self.login_error(format!("Tapo cloud unavailable: {e}"));
+                return;
+            }
         };
         *self.pending_mfa.borrow_mut() = None;
-        self.set_cloud_busy(true);
-        self.cloud_message("Signing in…");
-        self.refresh_cloud_ui();
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_login_busy(true);
+        b.set_login_error(SharedString::new());
+        b.set_login_help(SharedString::new());
         self.rt.spawn(async move {
             let result = client.login(&user, &pass).await;
-            on_ui(move |app| app.cloud_login_done(user, pass, result));
+            on_ui(move |app| app.login_done(user, pass, remember, result));
         });
     }
 
-    fn cloud_login_done(&self, user: String, pass: String, result: cloud::Result<Login>) {
-        self.set_cloud_busy(false);
+    fn login_done(&self, user: String, pass: String, remember: bool, result: cloud::Result<Login>) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_login_busy(false);
         match result {
-            Ok(Login::Done(session)) => self.cloud_signed_in(user, session),
+            Ok(Login::Done(session)) => self.signed_in(user, pass, remember, session),
             Ok(Login::NeedsMfa(challenge)) => {
-                *self.pending_mfa.borrow_mut() = Some(PendingMfa { challenge, user, pass, method: None });
-                self.ui().global::<Bridge>().set_cloud_code(SharedString::new());
-                self.cloud_message("Choose where Tapo should send the verification code.");
-                // It may have been started automatically: show where to answer.
-                if self.ui().global::<Bridge>().get_page() != Page::Settings {
-                    self.navigate(Page::Settings);
-                    self.status("Tapo needs a verification code to sign in: see Settings › Tapo account.");
-                }
+                // Like the Tapo app: send the code to the phone straight away
+                // (or by email, if that's the only way).
+                let method = if challenge.methods.contains(&MfaMethod::App) { MfaMethod::App } else { MfaMethod::Email };
+                *self.pending_mfa.borrow_mut() = Some(PendingMfa { challenge, user, pass, remember, method: None });
+                self.set_mfa_code("");
+                b.set_mfa_resend_seconds(0);
+                b.set_mfa_sent_to(SharedString::new());
+                b.set_mfa_switch_label(SharedString::new());
+                b.set_onboarding_step(2);
+                self.mfa_send(mfa_index(method));
             }
-            Err(e) => self.cloud_message(format!("Sign-in failed: {e}")),
+            Err(e) => {
+                b.set_onboarding_step(1);
+                self.login_error(e.to_string());
+            }
         }
-        self.refresh_cloud_ui();
     }
 
-    fn cloud_send_code(&self, method: i32) {
+    /// Sends a verification code: 1 = Tapo app, 2 = email.
+    fn mfa_send(&self, method: i32) {
         let method = if method == 1 { MfaMethod::App } else { MfaMethod::Email };
         let Some(client) = self.cloud_client() else { return };
         let Some((challenge, user, pass)) =
@@ -926,58 +968,123 @@ impl App {
         else {
             return;
         };
-        self.set_cloud_busy(true);
-        self.cloud_message("Sending the code…");
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_login_busy(true);
+        b.set_login_error(SharedString::new());
+        b.set_mfa_method(mfa_index(method));
         self.rt.spawn(async move {
             let result = client.request_mfa(&challenge, &user, &pass, method).await;
-            on_ui(move |app| app.cloud_code_sent(method, result));
+            on_ui(move |app| app.mfa_sent(method, result));
         });
     }
 
-    fn cloud_code_sent(&self, method: MfaMethod, result: cloud::Result<()>) {
-        self.set_cloud_busy(false);
+    fn mfa_sent(&self, method: MfaMethod, result: cloud::Result<()>) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_login_busy(false);
+        let Some((methods, user)) = self.pending_mfa.borrow().as_ref().map(|p| (p.challenge.methods.clone(), p.user.clone()))
+        else {
+            return; // went back meanwhile
+        };
         match result {
             Ok(()) => {
                 if let Some(pending) = self.pending_mfa.borrow_mut().as_mut() {
                     pending.method = Some(method);
                 }
-                self.cloud_message(match method {
-                    MfaMethod::App => "Code sent: open the Tapo app on your phone, then enter the code here.",
-                    MfaMethod::Email => "Code sent to your email: enter it here.",
-                });
+                b.set_mfa_resend_seconds(60);
+                b.set_mfa_sent_to(
+                    match method {
+                        MfaMethod::App => {
+                            "A verification code has been sent via Tapo push notification to your trusted devices."
+                                .to_string()
+                        }
+                        MfaMethod::Email => format!("A verification code has been sent to {user}."),
+                    }
+                    .into(),
+                );
             }
-            Err(e) => self.cloud_message(format!("Could not send the code: {e}")),
+            Err(e) => self.login_error(format!("Could not send the code: {e}")),
         }
-        self.refresh_cloud_ui();
+        // Offer the other way of getting a code, if the account has one.
+        let other = match method {
+            MfaMethod::App => MfaMethod::Email,
+            MfaMethod::Email => MfaMethod::App,
+        };
+        if methods.contains(&other) {
+            b.set_mfa_switch_label(
+                match other {
+                    MfaMethod::Email => "Receive Code via Email",
+                    MfaMethod::App => "Receive Code via Tapo App",
+                }
+                .into(),
+            );
+            b.set_mfa_switch_method(mfa_index(other));
+        } else {
+            b.set_mfa_switch_label(SharedString::new());
+        }
     }
 
-    fn cloud_verify(&self) {
-        let code = self.ui().global::<Bridge>().get_cloud_code().trim().to_string();
-        if code.is_empty() {
-            self.cloud_message("Enter the verification code.");
+    /// Keeps the code field to six digits and fills the boxes.
+    fn mfa_code_edited(&self, text: SharedString) {
+        let digits: String = text.chars().filter(char::is_ascii_digit).take(6).collect();
+        self.set_mfa_code(&digits);
+        self.login_error("");
+    }
+
+    fn set_mfa_code(&self, digits: &str) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_mfa_code() != digits {
+            b.set_mfa_code(digits.into());
+        }
+        let boxes: Vec<SharedString> =
+            (0..6).map(|i| digits.chars().nth(i).map(|c| c.to_string()).unwrap_or_default().into()).collect();
+        b.set_mfa_digits(ModelRc::new(VecModel::from(boxes)));
+        b.set_mfa_filled(digits.chars().count() as i32);
+    }
+
+    fn mfa_verify(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let code = b.get_mfa_code().to_string();
+        if code.len() != 6 || b.get_login_busy() {
             return;
         }
         let Some(client) = self.cloud_client() else { return };
-        let pending = self.pending_mfa.borrow().as_ref().map(|p| (p.challenge.clone(), p.user.clone(), p.method));
-        let Some((challenge, user, Some(method))) = pending else {
-            self.cloud_message("Send a code first.");
-            return;
-        };
-        self.set_cloud_busy(true);
-        self.cloud_message("Checking the code…");
+        let pending = self
+            .pending_mfa
+            .borrow()
+            .as_ref()
+            .map(|p| (p.challenge.clone(), p.user.clone(), p.pass.clone(), p.remember, p.method));
+        let Some((challenge, user, pass, remember, method)) = pending else { return };
+        // The method the code was asked for; if sending seemed to fail, the
+        // one last tried.
+        let method = method.unwrap_or(if b.get_mfa_method() == 2 { MfaMethod::Email } else { MfaMethod::App });
+        b.set_login_busy(true);
+        b.set_login_error(SharedString::new());
         self.rt.spawn(async move {
             let result = client.verify_mfa(&challenge, &user, &code, method).await;
-            on_ui(move |app| app.cloud_verified(user, result));
+            on_ui(move |app| app.mfa_verified(user, pass, remember, result));
         });
     }
 
-    fn cloud_verified(&self, user: String, result: cloud::Result<Session>) {
-        self.set_cloud_busy(false);
+    fn mfa_verified(&self, user: String, pass: String, remember: bool, result: cloud::Result<Session>) {
+        self.ui().global::<Bridge>().set_login_busy(false);
         match result {
-            Ok(session) => self.cloud_signed_in(user, session),
-            Err(e) => self.cloud_message(format!("Verification failed: {e}")),
+            Ok(session) => self.signed_in(user, pass, remember, session),
+            Err(e) => {
+                self.set_mfa_code("");
+                self.login_error(e.to_string());
+            }
         }
-        self.refresh_cloud_ui();
+    }
+
+    /// "‹" on the verification card: back to the log-in card.
+    fn mfa_back(&self) {
+        *self.pending_mfa.borrow_mut() = None;
+        self.set_mfa_code("");
+        self.show_sign_in(1, "");
     }
 
     fn save_cloud_session(&self, user: String, session: &Session) {
@@ -990,13 +1097,33 @@ impl App {
         self.persist();
     }
 
-    fn cloud_signed_in(&self, user: String, session: Session) {
+    /// Signed in: keep the account (the password only with "Remember me")
+    /// and open the app.
+    fn signed_in(&self, user: String, pass: String, remember: bool, session: Session) {
+        {
+            let mut cfg = self.cfg.borrow_mut();
+            cfg.cloud_username = user.clone();
+            cfg.cloud_password = if remember { Secret::new(&pass) } else { Secret::default() };
+        }
+        *self.password.borrow_mut() = pass;
         self.save_cloud_session(user, &session);
         *self.pending_mfa.borrow_mut() = None;
-        self.ui().global::<Bridge>().set_cloud_code(SharedString::new());
+
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_login_password(SharedString::new());
+        b.set_login_help(SharedString::new());
+        b.set_login_error(SharedString::new());
+        b.set_onboarding_step(0);
+        self.set_mfa_code("");
+        // The account may have changed: reconnect everything that uses it.
+        *self.hub.borrow_mut() = HubSession::default();
+        b.set_hub_connected(false);
+        b.set_hub_message(SharedString::new());
+        self.ptz.borrow_mut().clear();
         self.refresh_cloud_ui();
         self.refresh_camera_lists();
-        self.ptz.borrow_mut().clear();
+        self.navigate(Page::Live);
         self.restart_streams();
         self.cloud_refresh();
     }
@@ -1014,14 +1141,22 @@ impl App {
         }
         self.persist();
         *self.pending_mfa.borrow_mut() = None;
+        self.streams.borrow_mut().clear();
+        self.ptz.borrow_mut().clear();
+        self.set_fullscreen(false);
         self.refresh_cloud_ui();
     }
 
+    /// "Sign out" in Settings: forgets the session and the password, keeps
+    /// the email, and goes back to the welcome screen.
     fn cloud_sign_out(&self) {
         self.clear_cloud_session();
-        self.cloud_message("Signed out of the Tapo cloud.");
-        self.refresh_camera_lists();
-        self.restart_streams();
+        self.cfg.borrow_mut().cloud_password = Secret::default();
+        self.password.borrow_mut().clear();
+        self.persist();
+        self.cloud_message("");
+        self.ui().global::<Bridge>().set_login_password(SharedString::new());
+        self.show_sign_in(0, "");
     }
 
     fn cloud_refresh(&self) {
@@ -1078,8 +1213,8 @@ impl App {
     }
 
     /// A stream found the session token rejected. Signs in again with the
-    /// saved account; if the cloud wants a verification code, the user has to
-    /// sign in under Settings.
+    /// saved account; if the cloud wants a verification code, the log-in
+    /// card comes back.
     pub fn cloud_auth_failed(&self) {
         if self.pending_mfa.borrow().is_some() {
             return;
@@ -1115,11 +1250,16 @@ impl App {
         }
     }
 
+    /// The session expired and couldn't be renewed without the user: back to
+    /// the log-in card, with the email (and a remembered password) filled in.
     fn cloud_session_lost(&self) {
         self.clear_cloud_session();
-        let msg = "Your Tapo cloud sign-in has expired: sign in again under Settings › Tapo account.";
-        self.cloud_message(msg);
-        self.status(msg);
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if let Some((_, pass)) = self.cloud_creds() {
+            b.set_login_password(pass.into());
+        }
+        self.show_sign_in(1, "Your Tapo session has expired. Log in again.");
     }
 
     // ------------------------------------------------------------- discovery
@@ -1435,6 +1575,13 @@ async fn discover(user: String, pass: String, target: String) -> Result<(Vec<Fou
         }
     }
     Ok((found, failed))
+}
+
+fn mfa_index(method: MfaMethod) -> i32 {
+    match method {
+        MfaMethod::App => 1,
+        MfaMethod::Email => 2,
+    }
 }
 
 /// Camera names compare loosely: settings from the RTSP version used the

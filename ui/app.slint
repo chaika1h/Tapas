@@ -1,4 +1,4 @@
-import { AboutSlint, Button, LineEdit, ComboBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView } from "std-widgets.slint";
+import { AboutSlint, Button, LineEdit, ComboBox, CheckBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView } from "std-widgets.slint";
 
 export enum Page { live, single, recordings, settings }
 
@@ -52,14 +52,33 @@ export global Bridge {
     callback ptz-save(string);
     callback ptz-refresh();
 
-    // settings: account & app
-    in-out property <string> cloud-user;
-    in-out property <string> cloud-pass;
+    // sign-in screens, shown while not signed in
+    in-out property <int> onboarding-step; // 0 welcome, 1 log in, 2 verification code
+    in-out property <string> login-email;
+    in-out property <string> login-password;
+    in-out property <bool> login-remember: true;
+    in-out property <string> login-help;
+    in property <bool> login-busy;
+    in property <string> login-error;
+    in property <string> mfa-sent-to;
+    in property <int> mfa-method; // where the last code went: 1 = Tapo app, 2 = email
+    in property <string> mfa-switch-label;
+    in property <int> mfa-switch-method;
+    in-out property <string> mfa-code;
+    in property <[string]> mfa-digits: ["", "", "", "", "", ""];
+    in property <int> mfa-filled;
+    in-out property <int> mfa-resend-seconds;
+    callback login();
+    callback mfa-send(int);
+    callback mfa-code-edited(string);
+    callback mfa-verify();
+    callback mfa-back();
+
+    // settings: app
     in-out property <string> ffmpeg-path;
     in property <string> ffmpeg-found;
     in-out property <int> renderer-index;
     in property <string> config-path;
-    in property <string> account-message;
     callback save-settings();
 
     // settings: Tapo cloud sign-in
@@ -67,16 +86,8 @@ export global Bridge {
     in property <bool> cloud-busy;
     in property <string> cloud-status;
     in property <string> cloud-message;
-    in property <bool> cloud-mfa;
-    in property <bool> cloud-mfa-app;
-    in property <bool> cloud-mfa-email;
-    in property <bool> cloud-code-sent;
-    in-out property <string> cloud-code;
     // First entry is "Not linked"; the rest are the cameras on the account.
     in property <[string]> cloud-camera-labels: ["Not linked"];
-    callback cloud-sign-in();
-    callback cloud-send-code(int); // 1 = Tapo app, 2 = email
-    callback cloud-verify();
     callback cloud-sign-out();
     callback cloud-refresh();
 
@@ -548,29 +559,7 @@ component SettingsPage inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Your TP-Link / Tapo app login. Live video and pan/tilt go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. H500 recordings are read from the hub on the local network with the same login. This uses TP-Link's private service and may stop working if they change it.";
-                    }
-                    Field {
-                        label: "Email";
-                        LineEdit { text <=> Bridge.cloud-user; placeholder-text: "you@example.com"; horizontal-stretch: 1; }
-                    }
-                    Field {
-                        label: "Password";
-                        LineEdit { text <=> Bridge.cloud-pass; input-type: password; horizontal-stretch: 1; }
-                    }
-                    HorizontalLayout {
-                        spacing: 12px;
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Text {
-                                text: Bridge.account-message;
-                                horizontal-alignment: right;
-                                color: Palette.accent-background;
-                                font-weight: 600;
-                            }
-                        }
-                        Button { text: "Save account"; primary: true; clicked => { Bridge.save-settings(); } }
+                        text: "Live video and pan/tilt go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. H500 recordings are read from the hub on the local network with the same login. This uses TP-Link's private service and may stop working if they change it.";
                     }
                     HorizontalLayout {
                         spacing: 8px;
@@ -580,59 +569,15 @@ component SettingsPage inherits Rectangle {
                             Text { text: Bridge.cloud-status; font-weight: 600; overflow: elide; }
                         }
                         Spinner { width: 22px; height: 22px; indeterminate: true; visible: Bridge.cloud-busy; }
-                        if !Bridge.cloud-signed-in: Button {
-                            text: "Sign in";
-                            enabled: !Bridge.cloud-busy;
-                            clicked => { Bridge.cloud-sign-in(); }
-                        }
-                        if Bridge.cloud-signed-in: Button {
+                        Button {
                             text: "Update camera list";
                             enabled: !Bridge.cloud-busy;
                             clicked => { Bridge.cloud-refresh(); }
                         }
-                        if Bridge.cloud-signed-in: Button {
+                        Button {
                             text: "Sign out";
                             enabled: !Bridge.cloud-busy;
                             clicked => { Bridge.cloud-sign-out(); }
-                        }
-                    }
-                    if Bridge.cloud-mfa: Rectangle {
-                        border-width: 1px;
-                        border-color: Palette.accent-background;
-                        border-radius: 6px;
-                        VerticalLayout {
-                            padding: 12px;
-                            spacing: 8px;
-                            Heading { text: "Confirm this sign-in"; }
-                            Muted { text: "Tapo asks for a verification code the first time this PC signs in."; }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                if Bridge.cloud-mfa-app: Button {
-                                    text: "Send code to the Tapo app";
-                                    enabled: !Bridge.cloud-busy;
-                                    clicked => { Bridge.cloud-send-code(1); }
-                                }
-                                if Bridge.cloud-mfa-email: Button {
-                                    text: "Send code by email";
-                                    enabled: !Bridge.cloud-busy;
-                                    clicked => { Bridge.cloud-send-code(2); }
-                                }
-                            }
-                            if Bridge.cloud-code-sent: Field {
-                                label: "Code";
-                                LineEdit {
-                                    text <=> Bridge.cloud-code;
-                                    horizontal-stretch: 1;
-                                    accepted => { Bridge.cloud-verify(); }
-                                }
-                                Button {
-                                    text: "Verify";
-                                    primary: true;
-                                    enabled: !Bridge.cloud-busy;
-                                    clicked => { Bridge.cloud-verify(); }
-                                }
-                            }
                         }
                     }
                     if Bridge.cloud-message != "": Muted { text: Bridge.cloud-message; }
@@ -813,6 +758,418 @@ component SettingsPage inherits Rectangle {
     }
 }
 
+// ------------------------------------------------------------ sign-in screens
+
+component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    in property <bool> busy;
+    callback clicked();
+    property <bool> active: root.enabled && !root.busy;
+    property <color> base: !root.enabled ? Palette.foreground.transparentize(0.82)
+        : root.primary ? Palette.accent-background : Palette.control-background;
+    height: 48px;
+    border-radius: self.height / 2;
+    border-width: root.primary || !root.enabled ? 0px : 1px;
+    border-color: Palette.border;
+    background: touch.pressed && root.active ? root.base.darker(0.15)
+        : touch.has-hover && root.active ? root.base.darker(0.07) : root.base;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if (root.active) { root.clicked(); } }
+    HorizontalLayout {
+        alignment: center;
+        spacing: 10px;
+        if root.busy: VerticalLayout {
+            alignment: center;
+            Spinner { width: 20px; height: 20px; indeterminate: true; }
+        }
+        Text {
+            text: root.text;
+            font-size: 16px;
+            font-weight: 600;
+            vertical-alignment: center;
+            color: !root.enabled ? Palette.background : root.primary ? Palette.accent-foreground : Palette.accent-background;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.active;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+component LinkText inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <TextHorizontalAlignment> align: left;
+    in property <length> size: 14px;
+    callback clicked();
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+    HorizontalLayout {
+        Text {
+            text: root.text;
+            font-size: root.size;
+            horizontal-alignment: root.align;
+            color: !root.enabled ? Palette.foreground.transparentize(0.45)
+                : touch.has-hover ? Palette.accent-background.darker(0.2) : Palette.accent-background;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+// The app's mark: a camera lens on an accent tile.
+component AppMark inherits Rectangle {
+    width: 96px;
+    height: 96px;
+    border-radius: 26px;
+    background: Palette.accent-background;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+    drop-shadow-color: Palette.accent-background.transparentize(0.6);
+    Rectangle {
+        width: 50px;
+        height: 50px;
+        border-radius: 25px;
+        background: Palette.accent-foreground;
+        Rectangle {
+            width: 28px;
+            height: 28px;
+            border-radius: 14px;
+            background: Palette.accent-background.darker(0.25);
+            Rectangle {
+                x: 6px;
+                y: 6px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Palette.accent-foreground.transparentize(0.25);
+            }
+        }
+    }
+    Rectangle {
+        x: parent.width - 26px;
+        y: 16px;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: Palette.accent-foreground.transparentize(0.3);
+    }
+}
+
+// An eye that is crossed out while the password is hidden.
+component EyeToggle inherits Rectangle {
+    in-out property <bool> show;
+    width: 40px;
+    height: 40px;
+    border-radius: 20px;
+    background: touch.has-hover ? Palette.control-background : transparent;
+    accessible-role: button;
+    accessible-label: root.show ? "Hide password" : "Show password";
+    accessible-action-default => { root.show = !root.show; }
+    Path {
+        width: 22px;
+        height: 22px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: Palette.foreground.transparentize(0.3);
+        stroke-width: 1.7px;
+        fill: transparent;
+        commands: root.show
+            ? "M 1 12 C 4 6 8 4 12 4 C 16 4 20 6 23 12 C 20 18 16 20 12 20 C 8 20 4 18 1 12 Z M 12 8.5 A 3.5 3.5 0 1 0 12.01 8.5 Z"
+            : "M 1 12 C 4 6 8 4 12 4 C 16 4 20 6 23 12 C 20 18 16 20 12 20 C 8 20 4 18 1 12 Z M 12 8.5 A 3.5 3.5 0 1 0 12.01 8.5 Z M 3 3 L 21 21";
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.show = !root.show; }
+    }
+}
+
+// Six boxes over one invisible text field, so typing and pasting both work.
+component CodeBoxes inherits Rectangle {
+    in property <[string]> digits;
+    in property <int> filled;
+    in-out property <string> text;
+    callback edited(string);
+    callback accepted();
+    height: 64px;
+    HorizontalLayout {
+        spacing: 10px;
+        for d[i] in root.digits: Rectangle {
+            property <bool> current: input.has-focus && (i == root.filled || (root.filled == 6 && i == 5));
+            border-radius: 10px;
+            border-width: self.current ? 2px : 1px;
+            border-color: self.current ? Palette.accent-background : Palette.border;
+            background: Palette.control-background;
+            Text {
+                text: d;
+                font-size: 26px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+    input := TextInput {
+        width: 100%;
+        height: 100%;
+        color: transparent;
+        selection-background-color: transparent;
+        selection-foreground-color: transparent;
+        single-line: true;
+        input-type: number;
+        accessible-label: "Verification code";
+        text <=> root.text;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(); }
+    }
+    public function focus-input() {
+        input.focus();
+    }
+}
+
+component SignInCard inherits Rectangle {
+    width: min(440px, (root.parent-width) - 32px);
+    in property <length> parent-width;
+    border-radius: 20px;
+    background: Palette.background;
+    drop-shadow-blur: 30px;
+    drop-shadow-offset-y: 8px;
+    drop-shadow-color: #00000055;
+    @children
+}
+
+component ErrorText inherits Text {
+    color: #e5484d;
+    wrap: word-wrap;
+    font-size: 13px;
+}
+
+component LogInCard inherits SignInCard {
+    property <bool> show-password;
+    init => {
+        if (Bridge.login-email == "") { email.focus(); } else { password.focus(); }
+    }
+    VerticalLayout {
+        padding: 28px;
+        padding-top: 14px;
+        spacing: 14px;
+        HorizontalLayout {
+            alignment: start;
+            LinkText {
+                text: "✕";
+                size: 20px;
+                enabled: !Bridge.login-busy;
+                clicked => {
+                    Bridge.login-help = "";
+                    Bridge.onboarding-step = 0;
+                }
+            }
+        }
+        Text { text: "Log in"; font-size: 26px; font-weight: 700; }
+        Muted { text: "Use your TP-Link ID: the email and password you use in the Tapo app."; }
+        email := LineEdit {
+            height: 44px;
+            placeholder-text: "TP-Link ID (email)";
+            text <=> Bridge.login-email;
+            enabled: !Bridge.login-busy;
+            accepted => { password.focus(); }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            password := LineEdit {
+                height: 44px;
+                horizontal-stretch: 1;
+                placeholder-text: "Password";
+                input-type: root.show-password ? InputType.text : InputType.password;
+                text <=> Bridge.login-password;
+                enabled: !Bridge.login-busy;
+                accepted => {
+                    if (Bridge.login-email != "" && Bridge.login-password != "") { Bridge.login(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                EyeToggle { show <=> root.show-password; }
+            }
+        }
+        CheckBox {
+            text: "Remember me";
+            checked <=> Bridge.login-remember;
+            enabled: !Bridge.login-busy;
+        }
+        if Bridge.login-help != "": Rectangle {
+            border-radius: 10px;
+            background: Palette.alternate-background;
+            VerticalLayout {
+                padding: 12px;
+                Muted { text: Bridge.login-help; }
+            }
+        }
+        if Bridge.login-error != "": ErrorText { text: Bridge.login-error; }
+        Rectangle { height: 6px; }
+        PillButton {
+            text: Bridge.login-busy ? "Logging in…" : "Log In";
+            primary: true;
+            enabled: Bridge.login-email != "" && Bridge.login-password != "";
+            busy: Bridge.login-busy;
+            clicked => { Bridge.login(); }
+        }
+        HorizontalLayout {
+            LinkText {
+                text: "Sign Up";
+                clicked => {
+                    Bridge.login-help = "TP-Link IDs are created in the Tapo app: open it on your phone, tap “Create a TP-Link ID” and follow the steps. Then log in here with the same email and password.";
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            LinkText {
+                text: "Forgot Password?";
+                align: right;
+                clicked => {
+                    Bridge.login-help = "Reset your password in the Tapo app: on its login screen, tap “Forgot Password?”. Then log in here with the new password.";
+                }
+            }
+        }
+    }
+}
+
+component VerificationCard inherits SignInCard {
+    init => { boxes.focus-input(); }
+    Timer {
+        interval: 1s;
+        running: Bridge.mfa-resend-seconds > 0;
+        triggered => { Bridge.mfa-resend-seconds -= 1; }
+    }
+    VerticalLayout {
+        padding: 28px;
+        padding-top: 14px;
+        spacing: 14px;
+        HorizontalLayout {
+            back := LinkText {
+                width: 32px;
+                text: "‹";
+                size: 30px;
+                enabled: !Bridge.login-busy;
+                clicked => { Bridge.mfa-back(); }
+            }
+            Text {
+                text: "Two-Step Verification";
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Rectangle { width: back.width; }
+        }
+        Muted { text: Bridge.mfa-sent-to; }
+        boxes := CodeBoxes {
+            digits: Bridge.mfa-digits;
+            filled: Bridge.mfa-filled;
+            text <=> Bridge.mfa-code;
+            edited(text) => { Bridge.mfa-code-edited(text); }
+            accepted => { if (Bridge.mfa-filled == 6) { Bridge.mfa-verify(); } }
+        }
+        LinkText {
+            text: Bridge.mfa-resend-seconds > 0 ? "Resend Code (" + Bridge.mfa-resend-seconds + "s)" : "Resend Code";
+            enabled: Bridge.mfa-resend-seconds == 0 && !Bridge.login-busy;
+            clicked => { Bridge.mfa-send(Bridge.mfa-method); }
+        }
+        if Bridge.login-error != "": ErrorText { text: Bridge.login-error; }
+        Rectangle { height: 40px; }
+        if Bridge.mfa-switch-label != "": LinkText {
+            text: Bridge.mfa-switch-label;
+            align: center;
+            enabled: !Bridge.login-busy;
+            clicked => { Bridge.mfa-send(Bridge.mfa-switch-method); }
+        }
+        PillButton {
+            text: "Verify";
+            primary: true;
+            enabled: Bridge.mfa-filled == 6;
+            busy: Bridge.login-busy;
+            clicked => { Bridge.mfa-verify(); }
+        }
+    }
+}
+
+// Shown while not signed in: welcome, then log in, then the code if Tapo asks.
+component SignInScreens inherits Rectangle {
+    background: @linear-gradient(160deg, Palette.background 0%, Palette.alternate-background 100%);
+    VerticalLayout {
+        alignment: center;
+        spacing: 0px;
+        padding: 24px;
+        HorizontalLayout {
+            alignment: center;
+            AppMark { }
+        }
+        Rectangle { height: 24px; }
+        Text {
+            text: "Tapo Viewer";
+            font-size: 44px;
+            font-weight: 700;
+            color: Palette.accent-background;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 8px; }
+        Text {
+            text: "Your Tapo cameras on your desktop, from anywhere.";
+            font-size: 18px;
+            color: Palette.foreground.transparentize(0.25);
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 96px; }
+        HorizontalLayout {
+            alignment: center;
+            VerticalLayout {
+                width: min(380px, root.width - 48px);
+                spacing: 14px;
+                PillButton {
+                    text: "Log In";
+                    primary: true;
+                    clicked => {
+                        Bridge.login-help = "";
+                        Bridge.onboarding-step = 1;
+                    }
+                }
+                PillButton {
+                    text: "Create a TP-Link ID";
+                    clicked => {
+                        Bridge.login-help = "TP-Link IDs are created in the Tapo app: open it on your phone, tap “Create a TP-Link ID” and follow the steps. Then log in here with the same email and password.";
+                        Bridge.onboarding-step = 1;
+                    }
+                }
+                if Bridge.login-error != "" && Bridge.onboarding-step == 0: ErrorText {
+                    text: Bridge.login-error;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+    if Bridge.onboarding-step > 0: Rectangle {
+        background: #00000070;
+        // Clicks on the dimmed area don't reach the welcome buttons.
+        TouchArea { }
+        VerticalLayout {
+            alignment: center;
+            HorizontalLayout {
+                alignment: center;
+                if Bridge.onboarding-step == 1: LogInCard { parent-width: root.width; }
+                if Bridge.onboarding-step == 2: VerificationCard { parent-width: root.width; }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "Tapo Viewer";
 
@@ -863,7 +1220,8 @@ export component MainWindow inherits Window {
             return reject;
         }
 
-        VerticalLayout {
+        if !Bridge.cloud-signed-in: SignInScreens { }
+        if Bridge.cloud-signed-in: VerticalLayout {
             if !Bridge.fullscreen: TopBar { }
             if Bridge.page == Page.live: LivePage { vertical-stretch: 1; }
             if Bridge.page == Page.single: SinglePage { vertical-stretch: 1; }
