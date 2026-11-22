@@ -54,20 +54,12 @@ struct Live {
     shown_status: String,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum FoundKind {
-    Camera,
-    CameraPtz,
-    Hub,
-    Other,
-}
-
+/// A hub found on the network.
 #[derive(Clone)]
 struct Found {
     name: String,
     model: String,
     host: String,
-    kind: FoundKind,
 }
 
 #[derive(Default)]
@@ -185,7 +177,10 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_snapshot(cb!(&app, |a| a.snapshot()));
     b.on_ptz_move(cb!(&app, |a, pan, tilt| a.ptz_send(PtzCmd::Move(pan, tilt))));
     b.on_ptz_goto(cb!(&app, |a, id| a.ptz_send(PtzCmd::Goto(id.into()))));
-    b.on_ptz_save(cb!(&app, |a, name| a.ptz_send(PtzCmd::Save(name.trim().into()))));
+    b.on_ptz_save(cb!(&app, |a, name| {
+        a.ptz_send(PtzCmd::Save(name.trim().into()));
+        a.ui().invoke_focus_keys(); // so the arrow keys pan again
+    }));
     b.on_ptz_refresh(cb!(&app, |a| a.ptz_send(PtzCmd::Refresh)));
 
     b.on_save_settings(cb!(&app, |a| a.save_settings()));
@@ -431,6 +426,7 @@ impl App {
             }
         }
         b.set_page(page);
+        ui.invoke_focus_keys();
         self.sync_streams();
     }
 
@@ -471,21 +467,19 @@ impl App {
         b.set_single_frame(Image::default());
         b.set_single_has_frame(false);
         b.set_single_status(self.tile_status(&cam).into());
-        // Pan/tilt goes through the camera's local API, so it needs an IP.
-        let ptz = cam.ptz && cam.has_ip();
-        b.set_single_ptz(ptz);
+        // The pan/tilt panel appears once the camera says it has pan/tilt.
+        b.set_single_ptz(false);
         b.set_presets(ModelRc::default());
         b.set_ptz_message(SharedString::new());
         b.set_ptz_busy(false);
         b.set_page(Page::Single);
+        ui.invoke_focus_keys();
         self.sync_streams();
 
-        if ptz {
-            if self.ptz.borrow().contains_key(&id) {
-                self.ptz_changed(id);
-            } else {
-                self.ptz_send(PtzCmd::Refresh);
-            }
+        if self.ptz.borrow().contains_key(&id) {
+            self.ptz_changed(id);
+        } else {
+            self.ptz_send(PtzCmd::Refresh);
         }
     }
 
@@ -531,11 +525,9 @@ impl App {
         let controller = match ptz.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => {
-                let Some(cam) = self.cfg.borrow().camera(id).cloned().filter(CameraConfig::has_ip) else {
-                    return;
-                };
-                let (user, pass) = self.cloud_creds().unwrap_or_default();
-                slot.insert(Ptz::spawn(&self.rt, id, cam.host, user, pass))
+                let link = self.cfg.borrow().camera(id).and_then(|c| c.cloud.clone());
+                let (Some(camera), Some(client)) = (link, self.cloud_client()) else { return };
+                slot.insert(Ptz::spawn(&self.rt, id, client, camera))
             }
         };
         controller.send(cmd);
@@ -550,6 +542,7 @@ impl App {
         let state = p.state.lock().unwrap();
         let ui = self.ui();
         let b = ui.global::<Bridge>();
+        b.set_single_ptz(state.supported == Some(true));
         b.set_ptz_busy(state.busy);
         b.set_ptz_message(state.message.as_str().into());
         let rows: Vec<PresetRow> = state
@@ -640,9 +633,6 @@ impl App {
                     None => detail.push("⚠ not linked to your Tapo account".into()),
                 }
                 detail.push(format!("grid: {}", Quality::LABELS[c.grid_quality.index() as usize]));
-                if c.ptz && c.has_ip() {
-                    detail.push(format!("pan/tilt via {}", c.host));
-                }
                 CameraRow { id: c.id as i32, name: c.name.as_str().into(), detail: detail.join("  ·  ").into() }
             })
             .collect();
@@ -673,8 +663,6 @@ impl App {
         let b = ui.global::<Bridge>();
         b.set_cam_editing(if cam.id == 0 { 0 } else { cam.id as i32 });
         b.set_cam_name(cam.name.as_str().into());
-        b.set_cam_host(cam.host.as_str().into());
-        b.set_cam_ptz(cam.ptz);
         b.set_cam_quality(cam.grid_quality.index());
         self.set_cloud_choices(cam.cloud.as_ref().map(|l| l.device_id.as_str()));
         b.set_cam_error(SharedString::new());
@@ -723,7 +711,6 @@ impl App {
     fn save_camera(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let host = b.get_cam_host().trim().to_string();
         let Some(cloud) = self.selected_cloud_camera() else {
             b.set_cam_error(
                 "Pick the camera on your Tapo account. Sign in under “Tapo account” to list your cameras.".into(),
@@ -742,8 +729,6 @@ impl App {
                 id,
                 name,
                 cloud: Some(cloud),
-                host,
-                ptz: b.get_cam_ptz(),
                 grid_quality: Quality::from_index(b.get_cam_quality()),
             };
             match cfg.cameras.iter_mut().find(|c| c.id == id) {
@@ -1011,6 +996,7 @@ impl App {
         self.ui().global::<Bridge>().set_cloud_code(SharedString::new());
         self.refresh_cloud_ui();
         self.refresh_camera_lists();
+        self.ptz.borrow_mut().clear();
         self.restart_streams();
         self.cloud_refresh();
     }
@@ -1161,14 +1147,8 @@ impl App {
         let b = ui.global::<Bridge>();
         b.set_scanning(false);
         match result {
-            Ok((mut found, failed)) => {
-                found.sort_by_key(|f| match f.kind {
-                    FoundKind::Camera | FoundKind::CameraPtz => 0,
-                    FoundKind::Hub => 1,
-                    FoundKind::Other => 2,
-                });
-                let useful = found.iter().filter(|f| f.kind != FoundKind::Other).count();
-                let mut msg = format!("Found {useful} camera(s)/hub(s), {} device(s) in total.", found.len());
+            Ok((found, failed)) => {
+                let mut msg = format!("Found {} hub(s).", found.len());
                 if failed > 0 {
                     msg += &format!(" {failed} device(s) answered but could not be logged in to.");
                 }
@@ -1187,19 +1167,13 @@ impl App {
             .borrow()
             .iter()
             .map(|f| {
-                let added = cfg.cameras.iter().any(|c| c.host == f.host) || cfg.hubs.iter().any(|h| h.host == f.host);
-                let kind = match f.kind {
-                    FoundKind::Camera => "camera",
-                    FoundKind::CameraPtz => "pan/tilt camera",
-                    FoundKind::Hub => "hub",
-                    FoundKind::Other => "other device",
-                };
+                let added = cfg.hubs.iter().any(|h| h.host == f.host);
                 FoundRow {
                     name: f.name.as_str().into(),
                     model: f.model.as_str().into(),
                     host: f.host.as_str().into(),
-                    kind: if added { format!("{kind} (added)") } else { kind.to_string() }.into(),
-                    can_add: !added && f.kind != FoundKind::Other,
+                    kind: if added { "hub (added)" } else { "hub" }.into(),
+                    can_add: !added,
                 }
             })
             .collect();
@@ -1208,38 +1182,15 @@ impl App {
 
     fn add_found(&self, index: usize) {
         let Some(f) = self.found.borrow().get(index).cloned() else { return };
-        match f.kind {
-            FoundKind::Camera | FoundKind::CameraPtz => {
-                // Usually the camera is already here from the Tapo account:
-                // fill in its IP (for pan/tilt) instead of adding it twice.
-                let existing = self.cfg.borrow().cameras.iter().find(|c| same_name(&c.name, &f.name)).cloned();
-                let cloud = self.cloud_cameras.borrow().iter().find(|c| same_name(&c.name, &f.name)).cloned();
-                let cam = match existing {
-                    Some(cam) => CameraConfig { host: f.host.clone(), ptz: f.kind == FoundKind::CameraPtz, ..cam },
-                    None => CameraConfig {
-                        name: f.name.clone(),
-                        host: f.host.clone(),
-                        ptz: f.kind == FoundKind::CameraPtz,
-                        cloud,
-                        ..Default::default()
-                    },
-                };
-                self.new_camera(cam);
-                self.status(format!("Check {} in the camera form above, then press Save camera.", f.name));
-            }
-            FoundKind::Hub => {
-                {
-                    let mut cfg = self.cfg.borrow_mut();
-                    let id = cfg.next_hub_id();
-                    cfg.hubs.push(HubConfig { id, name: f.name.clone(), host: f.host.clone() });
-                }
-                self.persist();
-                self.refresh_hub_lists();
-                self.refresh_found();
-                self.status(format!("Added hub {}.", f.name));
-            }
-            FoundKind::Other => {}
+        {
+            let mut cfg = self.cfg.borrow_mut();
+            let id = cfg.next_hub_id();
+            cfg.hubs.push(HubConfig { id, name: f.name.clone(), host: f.host.clone() });
         }
+        self.persist();
+        self.refresh_hub_lists();
+        self.refresh_found();
+        self.status(format!("Added hub {}.", f.name));
     }
 
     // ------------------------------------------------------------ recordings
@@ -1467,20 +1418,16 @@ async fn discover(user: String, pass: String, target: String) -> Result<(Vec<Fou
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     while let Ok(Some(item)) = tokio::time::timeout_at(deadline, discovery.next()).await {
         match item {
-            Ok(r) => {
-                let kind = match r.device_type() {
-                    DeviceType::Camera => FoundKind::Camera,
-                    DeviceType::CameraPtz => FoundKind::CameraPtz,
-                    DeviceType::CameraHub => FoundKind::Hub,
-                    _ => FoundKind::Other,
-                };
+            // Cameras come from the Tapo account; only hubs need an address.
+            Ok(r) if r.device_type() == DeviceType::CameraHub => {
                 let (host, _port) = r.address();
                 let name = match r.nickname() {
                     "" => r.model().to_string(),
                     n => n.to_string(),
                 };
-                found.push(Found { name, model: r.model().to_string(), host, kind });
+                found.push(Found { name, model: r.model().to_string(), host });
             }
+            Ok(_) => {}
             Err(e) => {
                 log::warn!("discovery: {e}");
                 failed += 1;
@@ -1490,8 +1437,8 @@ async fn discover(user: String, pass: String, target: String) -> Result<(Vec<Fou
     Ok((found, failed))
 }
 
-/// Camera names compare loosely: the Tapo app's nickname is what both
-/// "Find devices" and the cloud list use.
+/// Camera names compare loosely: settings from the RTSP version used the
+/// Tapo app's nickname, which is also what the cloud list has.
 fn same_name(a: &str, b: &str) -> bool {
     a.trim().to_lowercase() == b.trim().to_lowercase()
 }
@@ -1525,7 +1472,6 @@ fn link_cloud_cameras(cameras: &mut Vec<CameraConfig>, account: &[CloudCamera]) 
             name: cloud_cam.name.clone(),
             grid_quality: Quality::Sd,
             cloud: Some(cloud_cam.clone()),
-            ..Default::default()
         });
         added += 1;
     }
@@ -1605,7 +1551,7 @@ mod tests {
     #[test]
     fn links_account_cameras() {
         let cloud = |id: &str, name: &str| CloudCamera { device_id: id.into(), name: name.into(), ..Default::default() };
-        let local = |id: u32, name: &str| CameraConfig { id, name: name.into(), host: "10.0.0.1".into(), ..Default::default() };
+        let local = |id: u32, name: &str| CameraConfig { id, name: name.into(), ..Default::default() };
         let mut cameras = vec![
             local(1, "Front Door"),
             local(2, "Garage"),
@@ -1624,7 +1570,6 @@ mod tests {
         assert_eq!(cameras[2].cloud.as_ref().unwrap().name, "Yard");
         assert!(cameras[3].cloud.is_none() && cameras[4].cloud.is_none());
         let office = cameras.iter().find(|c| c.name == "Office").unwrap();
-        assert!(!office.has_ip());
         assert_eq!(office.id, 7);
         // Running it again changes nothing.
         let (linked, added) = link_cloud_cameras(&mut cameras, &account);

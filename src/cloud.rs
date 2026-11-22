@@ -7,7 +7,9 @@
 //! (<https://github.com/abdulmominsakib/tapo-android-tv>, MIT licence), which
 //! is itself based on Topo (<https://github.com/filirnd/topo>, MIT licence).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -41,6 +43,13 @@ const TIMESTAMP: &str = "9999999999";
 /// TP-Link's own root certificates (`tp-link-CA` and `TP-Link Cloud Root CA`).
 /// Some cloud servers use them and they aren't in the Windows trust store.
 const TP_LINK_ROOTS: &[u8] = include_bytes!("../certs/tapo-cloud-roots.pem");
+
+/// Service ids for the cloud's service lookup.
+const CIPC_SERVICE: &str = "cipc.api.cloud";
+const IOT_SERVICE: &str = "nbu.iot-app-server.app";
+
+/// Pan/tilt steps the camera accepts in one move.
+pub const MAX_MOVE: i32 = 200;
 
 /// The saved sign-in is no longer accepted.
 const AUTH_EXPIRED: i64 = -20651;
@@ -230,9 +239,11 @@ pub struct CloudClient {
     tls: Arc<rustls::ClientConfig>,
     terminal_uuid: String,
     session: Mutex<Option<Session>>,
-    /// (account API server, CIPC URL) from the last service lookup. Held
-    /// during a lookup so streams starting together share one.
-    cipc: tokio::sync::Mutex<Option<(String, String)>>,
+    /// Service URLs by (account API server, service id). Held during a
+    /// lookup so streams starting together share one.
+    services: tokio::sync::Mutex<HashMap<(String, String), String>>,
+    /// Set when the camera-control gateway only has the v1 API.
+    iot_v1: AtomicBool,
 }
 
 impl CloudClient {
@@ -247,7 +258,14 @@ impl CloudClient {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| CloudError::new(format!("HTTP client setup failed: {e}")))?;
-        Ok(Self { http, tls, terminal_uuid, session: Mutex::default(), cipc: Default::default() })
+        Ok(Self {
+            http,
+            tls,
+            terminal_uuid,
+            session: Mutex::default(),
+            services: Default::default(),
+            iot_v1: AtomicBool::new(false),
+        })
     }
 
     pub fn tls(&self) -> Arc<rustls::ClientConfig> {
@@ -258,7 +276,7 @@ impl CloudClient {
         self.session.lock().unwrap().clone()
     }
 
-    /// The CIPC URL is cached per regional server, so it needn't be cleared.
+    /// Service URLs are cached per regional server, so they needn't be cleared.
     pub fn set_session(&self, session: Option<Session>) {
         *self.session.lock().unwrap() = session;
     }
@@ -269,7 +287,7 @@ impl CloudClient {
 
     // ------------------------------------------------------------------ HTTP
 
-    async fn post_raw(&self, url: &str, body: Vec<u8>, headers: Vec<(&'static str, String)>) -> Result<(u16, Value)> {
+    async fn post_bytes(&self, url: &str, body: Vec<u8>, headers: Vec<(&'static str, String)>) -> Result<(u16, Vec<u8>)> {
         let mut request = self.http.post(url).body(body);
         for (name, value) in headers {
             request = request.header(name, value);
@@ -277,6 +295,11 @@ impl CloudClient {
         let response = request.send().await.map_err(network_error)?;
         let status = response.status().as_u16();
         let bytes = response.bytes().await.map_err(network_error)?;
+        Ok((status, bytes.to_vec()))
+    }
+
+    async fn post_raw(&self, url: &str, body: Vec<u8>, headers: Vec<(&'static str, String)>) -> Result<(u16, Value)> {
+        let (status, bytes) = self.post_bytes(url, body, headers).await?;
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(value @ Value::Object(_)) => Ok((status, value)),
             _ if status == 401 => Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED)),
@@ -429,33 +452,35 @@ impl CloudClient {
 
     // ----------------------------------------------------------------- relay
 
-    /// The CIPC (camera video) service URL for the session's region.
-    async fn cipc_url(&self, session: &Session) -> Result<String> {
-        let mut cached = self.cipc.lock().await;
-        if let Some((base, url)) = &*cached
-            && *base == session.base_url
-        {
+    /// A service's URL for the session's region, e.g. the CIPC (camera video)
+    /// service.
+    async fn service_url(&self, session: &Session, service: &str) -> Result<String> {
+        let mut cache = self.services.lock().await;
+        let key = (session.base_url.clone(), service.to_string());
+        if let Some(url) = cache.get(&key) {
             return Ok(url.clone());
         }
-        let payload = json!({ "serviceIds": ["cipc.api.cloud"] });
+        let payload = json!({ "serviceIds": [service] });
         let response = self
             .post(&session.base_url, "/api/v2/common/getAppServiceUrl", &payload, Some(&session.token))
             .await?;
-        check_outer(&response, "Video service lookup refused")?;
-        let url = result_of(&response)
-            .get("serviceUrls")
-            .map(|s| str_field(s, "cipc.api.cloud"))
-            .unwrap_or_default();
+        check_outer(&response, "Service lookup refused")?;
+        let url = result_of(&response).get("serviceUrls").map(|s| str_field(s, service)).unwrap_or_default();
         if url.is_empty() {
-            return Err(CloudError::new("The Tapo cloud did not return its video service address"));
+            return Err(CloudError::new(format!("The Tapo cloud did not return the address of {service}")));
         }
         let url = url.replacen("http://", "https://", 1);
-        *cached = Some((session.base_url.clone(), url.clone()));
+        cache.insert(key, url.clone());
         Ok(url)
     }
 
+    /// Looks the service up again next time, e.g. after a network error.
+    async fn forget_service(&self, session: &Session, service: &str) {
+        self.services.lock().await.remove(&(session.base_url.clone(), service.to_string()));
+    }
+
     async fn post_cipc(&self, session: &Session, endpoint: &str, payload: &Value, player_id: &str) -> Result<Value> {
-        let url = format!("{}{endpoint}", self.cipc_url(session).await?.trim_end_matches('/'));
+        let url = format!("{}{endpoint}", self.service_url(session, CIPC_SERVICE).await?.trim_end_matches('/'));
         let body = serde_json::to_vec(payload).expect("JSON values always serialise");
         let headers = vec![
             // CIPC takes the bare token (the account API's `ut|` prefix is not used).
@@ -472,7 +497,7 @@ impl CloudClient {
         match self.post_raw(&url, body, headers).await {
             Ok((_, value)) => Ok(value),
             Err(e) => {
-                *self.cipc.lock().await = None; // look the service up again next time
+                self.forget_service(session, CIPC_SERVICE).await;
                 Err(e)
             }
         }
@@ -519,6 +544,164 @@ impl CloudClient {
         let elb_cookie = Some(str_field(&info, "elbCookie")).filter(|c| !c.is_empty());
         Ok(RelayInfo { host, port, path, token, player_id, elb_cookie })
     }
+    // -------------------------------------------------------- camera control
+
+    fn iot_headers(&self, session: &Session) -> Vec<(&'static str, String)> {
+        vec![
+            ("Authorization", format!("ut|{}", session.token)),
+            ("app-cid", format!("app:{APP_NAME}:{}", self.terminal_uuid)),
+            ("x-app-name", APP_NAME.into()),
+            ("x-app-version", APP_VERSION.into()),
+            ("x-term-id", self.terminal_uuid.clone()),
+            ("x-ospf", PLATFORM.into()),
+            ("x-net-type", "wifi".into()),
+            ("x-strict", "0".into()),
+            ("x-locale", "en_US".into()),
+            ("Content-Type", "application/json; charset=UTF-8".into()),
+            ("User-Agent", format!("{APP_NAME}/{APP_VERSION}(cloud-only;Windows)")),
+        ]
+    }
+
+    /// Sends requests in the camera's own API (the same ones it accepts on the
+    /// local network) through the cloud, as the Tapo app does for pan/tilt and
+    /// settings. Returns one response per request.
+    pub async fn camera_requests(&self, camera: &CloudCamera, requests: Vec<Value>) -> Result<Vec<Value>> {
+        if camera.device_id.is_empty() {
+            return Err(CloudError::new("This camera isn't linked to a camera on your Tapo account"));
+        }
+        let session = self.require_session()?;
+        let gateway = self.service_url(&session, IOT_SERVICE).await?;
+        let body = serde_json::to_vec(&json!({
+            "inputParams": {
+                "requestData": { "method": "multipleRequest", "params": { "requests": requests } },
+            },
+            "serviceId": "passthrough",
+        }))
+        .expect("JSON values always serialise");
+        let device: String = url::form_urlencoded::byte_serialize(camera.device_id.as_bytes()).collect();
+        let url = |version: &str| format!("{}/{version}/things/{device}/services-sync", gateway.trim_end_matches('/'));
+
+        let v1 = self.iot_v1.load(Ordering::Relaxed);
+        let sent = self.post_bytes(&url(if v1 { "v1" } else { "v2" }), body.clone(), self.iot_headers(&session)).await;
+        let (mut status, mut bytes) = match sent {
+            Ok(answer) => answer,
+            Err(e) => {
+                self.forget_service(&session, IOT_SERVICE).await;
+                return Err(e);
+            }
+        };
+        if !v1 && matches!(status, 404 | 405 | 501) {
+            // Some regional gateways only have the older API.
+            self.iot_v1.store(true, Ordering::Relaxed);
+            (status, bytes) = self.post_bytes(&url("v1"), body, self.iot_headers(&session)).await?;
+        }
+        parse_camera_answer(status, &bytes)
+    }
+
+    /// Whether the camera has pan/tilt.
+    pub async fn ptz_supported(&self, camera: &CloudCamera) -> Result<bool> {
+        let request = json!({
+            "method": "getAppComponentList",
+            "params": { "app_component": { "name": ["app_component_list"] } },
+        });
+        let result = first_result(&self.camera_requests(camera, vec![request]).await?, "getAppComponentList")?;
+        let list = result.pointer("/app_component/app_component_list").and_then(Value::as_array);
+        Ok(list.is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz"))))
+    }
+
+    /// Moves the camera relative to where it is: `x > 0` pans right, `y > 0`
+    /// tilts up.
+    pub async fn move_motor(&self, camera: &CloudCamera, x: i32, y: i32) -> Result<()> {
+        let (x, y) = (x.clamp(-MAX_MOVE, MAX_MOVE), y.clamp(-MAX_MOVE, MAX_MOVE));
+        let request = json!({
+            "method": "motorMove",
+            "params": { "motor": { "move": { "x_coord": x.to_string(), "y_coord": y.to_string() } } },
+        });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "motorMove").map(drop)
+    }
+
+    /// The saved positions, as (id, name).
+    pub async fn presets(&self, camera: &CloudCamera) -> Result<Vec<(String, String)>> {
+        let request = json!({ "method": "getPresetConfig", "params": { "preset": { "name": ["preset"] } } });
+        let result = first_result(&self.camera_requests(camera, vec![request]).await?, "getPresetConfig")?;
+        Ok(parse_presets(&result))
+    }
+
+    pub async fn goto_preset(&self, camera: &CloudCamera, id: &str) -> Result<()> {
+        let request = json!({ "method": "motorMoveToPreset", "params": { "preset": { "goto_preset": { "id": id } } } });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "motorMoveToPreset").map(drop)
+    }
+
+    /// Saves the current position under `name`.
+    pub async fn save_preset(&self, camera: &CloudCamera, name: &str) -> Result<()> {
+        // "Postion" is the API's spelling.
+        let request = json!({ "method": "addMotorPostion", "params": { "preset": { "set_preset": { "name": name } } } });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "addMotorPostion").map(drop)
+    }
+}
+
+/// Unwraps the gateway's answer to [`CloudClient::camera_requests`].
+fn parse_camera_answer(status: u16, bytes: &[u8]) -> Result<Vec<Value>> {
+    let value: Option<Value> = serde_json::from_slice(bytes).ok();
+    if status == 401 {
+        return Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED));
+    }
+    if status >= 400 {
+        let detail = value
+            .as_ref()
+            .and_then(|v| v.get("message").or_else(|| v.get("msg")))
+            .and_then(Value::as_str)
+            .map(|m| format!(": {m}"))
+            .unwrap_or_default();
+        return Err(CloudError::new(format!("Camera control refused (HTTP {status}){detail}")));
+    }
+    let data = value
+        .as_ref()
+        .and_then(|v| v.pointer("/outputParams/responseData"))
+        .filter(|d| d.is_object())
+        .ok_or_else(|| CloudError::new("The camera did not answer"))?;
+    match error_code(data) {
+        0 => {}
+        AUTH_EXPIRED => return Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED)),
+        code @ (-40401 | -40406) => return Err(CloudError::with_code("Camera is offline", code)),
+        code => return Err(CloudError::with_code(device_error("Camera control refused", code), code)),
+    }
+    data.pointer("/result/responses")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| CloudError::new("The camera returned no answer"))
+}
+
+/// The result of the first response, or the camera's error.
+fn first_result(responses: &[Value], method: &str) -> Result<Value> {
+    let response = responses.first().ok_or_else(|| CloudError::new(format!("No answer to {method}")))?;
+    match error_code(response) {
+        0 => Ok(response.get("result").cloned().unwrap_or_else(|| json!({}))),
+        code => Err(CloudError::with_code(device_error(&format!("The camera refused {method}"), code), code)),
+    }
+}
+
+fn device_error(what: &str, code: i64) -> String {
+    match code {
+        -64303 => "Motor busy: wait for the movement to finish".into(),
+        -64304 => "Reached the end of the pan/tilt range".into(),
+        -64324 => "Privacy mode is on".into(),
+        -64336 => "Movement blocked by a privacy zone".into(),
+        _ => format!("{what} (code {code})"),
+    }
+}
+
+/// Zips the parallel `id`/`name` arrays of `getPresetConfig`.
+fn parse_presets(result: &Value) -> Vec<(String, String)> {
+    let section = result.pointer("/preset/preset").unwrap_or(&Value::Null);
+    let list = |key: &str| -> Vec<String> {
+        section
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    list("id").into_iter().zip(list("name")).collect()
 }
 
 // ----------------------------------------------------------------- helpers
@@ -703,6 +886,32 @@ mod tests {
         assert_eq!(cam.mac, "A842A1001122");
         assert!(camera_from(&json!({"alias": "no id"})).is_none());
         assert_eq!(camera_from(&json!({"deviceId": "1"})).unwrap().name, "Camera");
+    }
+
+    #[test]
+    fn camera_control_answers() {
+        let ok = br#"{"outputParams":{"responseData":{"error_code":0,"result":{"responses":[{"method":"motorMove","result":{},"error_code":0}]}}}}"#;
+        assert!(first_result(&parse_camera_answer(200, ok).unwrap(), "motorMove").is_ok());
+
+        let at_limit = br#"{"outputParams":{"responseData":{"error_code":0,"result":{"responses":[{"method":"motorMove","error_code":-64304}]}}}}"#;
+        let e = first_result(&parse_camera_answer(200, at_limit).unwrap(), "motorMove").unwrap_err();
+        assert_eq!(e.to_string(), "Reached the end of the pan/tilt range");
+
+        assert!(parse_camera_answer(401, b"").unwrap_err().is_auth());
+        let expired = br#"{"outputParams":{"responseData":{"error_code":-20651}}}"#;
+        assert!(parse_camera_answer(200, expired).unwrap_err().is_auth());
+        let offline = br#"{"outputParams":{"responseData":{"error_code":-40401}}}"#;
+        assert!(parse_camera_answer(200, offline).unwrap_err().is_offline());
+        let e = parse_camera_answer(403, br#"{"message":"forbidden"}"#).unwrap_err().to_string();
+        assert!(e.contains("HTTP 403") && e.contains("forbidden"), "{e}");
+        assert!(parse_camera_answer(200, b"{}").is_err());
+    }
+
+    #[test]
+    fn presets_zip_ids_and_names() {
+        let result = json!({"preset": {"preset": {"id": ["1", "2"], "name": ["Door", "Gate"], "read_only": ["0", "0"]}}});
+        assert_eq!(parse_presets(&result), vec![("1".to_string(), "Door".to_string()), ("2".into(), "Gate".into())]);
+        assert!(parse_presets(&json!({})).is_empty());
     }
 
     #[test]

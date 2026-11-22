@@ -1,4 +1,4 @@
-import { AboutSlint, Button, LineEdit, ComboBox, CheckBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView } from "std-widgets.slint";
+import { AboutSlint, Button, LineEdit, ComboBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView } from "std-widgets.slint";
 
 export enum Page { live, single, recordings, settings }
 
@@ -84,8 +84,6 @@ export global Bridge {
     in property <[CameraRow]> cameras;
     in-out property <int> cam-editing: -1; // -1 closed, 0 new, otherwise camera id
     in-out property <string> cam-name;
-    in-out property <string> cam-host;
-    in-out property <bool> cam-ptz;
     in-out property <int> cam-quality;
     in-out property <int> cam-cloud; // index into cloud-camera-labels
     in property <string> cam-error;
@@ -447,7 +445,7 @@ component RecordingsPage inherits Rectangle {
         spacing: 12px;
         Heading { text: "Recordings stored on the hub"; font-size: 18px; }
         if Bridge.hub-names.length == 0: Muted {
-            text: "Add your H500 under Settings › Hubs first (or find it with “Find devices”).";
+            text: "Add your H500 under Settings › Hubs first (or find it with “Find hubs”).";
         }
         HorizontalLayout {
             spacing: 8px;
@@ -550,7 +548,7 @@ component SettingsPage inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Your TP-Link / Tapo app login. Live video comes through TP-Link's cloud, the way the Tapo app shows it, so this PC doesn't need to be on the cameras' network. The account is also used to find devices, to pan/tilt cameras and to browse H500 recordings. This uses TP-Link's private service and may stop working if they change it.";
+                        text: "Your TP-Link / Tapo app login. Live video and pan/tilt go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. H500 recordings are read from the hub on the local network with the same login. This uses TP-Link's private service and may stop working if they change it.";
                     }
                     Field {
                         label: "Email";
@@ -685,17 +683,6 @@ component SettingsPage inherits Rectangle {
                                 ComboBox { width: 200px; model: Bridge.quality-labels; current-index <=> Bridge.cam-quality; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
-                            Field {
-                                label: "";
-                                CheckBox { text: "Pan/tilt camera (C2xx, C5xx, TC40, TC70…)"; checked <=> Bridge.cam-ptz; }
-                            }
-                            Field {
-                                label: "IP address";
-                                LineEdit { text <=> Bridge.cam-host; placeholder-text: "Optional: 192.168.1.50"; horizontal-stretch: 1; }
-                            }
-                            Muted {
-                                text: "Pan/tilt still uses the camera's local API, so it only works with an IP address, when this PC is on the camera's network. “Find devices” below fills it in.";
-                            }
                             if Bridge.cam-error != "": Text { text: Bridge.cam-error; color: #e5484d; }
                             HorizontalLayout {
                                 spacing: 8px;
@@ -752,11 +739,11 @@ component SettingsPage inherits Rectangle {
             }
 
             GroupBox {
-                title: "Find devices on the network";
+                title: "Find hubs on the network";
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Scans this network for hubs (for recordings) and for cameras' IP addresses (for pan/tilt), using your Tapo account above. If nothing shows up, try your subnet's broadcast address, e.g. 192.168.1.255.";
+                        text: "Scans this network for H500/H200 hubs, using your Tapo account above. If nothing shows up, try your subnet's broadcast address, e.g. 192.168.1.255.";
                     }
                     HorizontalLayout {
                         spacing: 8px;
@@ -828,6 +815,14 @@ component SettingsPage inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "Tapo Viewer";
+
+    // Gives the keyboard back to the shortcuts (F11, Esc, arrow keys): a
+    // focused text box that disappears with its page would otherwise leave
+    // nothing focused.
+    public function focus-keys() {
+        keys.focus();
+    }
+
     preferred-width: 1280px;
     preferred-height: 800px;
     min-width: 760px;
