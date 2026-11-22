@@ -59,6 +59,8 @@ for _camera in CAMERAS:
     _camera["deviceType"] = "SMART.IPCAMERA"
 OFFLINE = {"FAKE0003"}
 PATTERNS = {"FAKE0001": "testsrc2", "FAKE0002": "testsrc"}
+# Download sessions the hub serves at once.
+MAX_CLIP_SESSIONS = 2
 # Cameras with pan/tilt (the C310 has none), and how far they can turn.
 PTZ = {"FAKE0001", "FAKE0003"}
 PAN_RANGE, TILT_RANGE = 170, 35
@@ -106,6 +108,7 @@ class State:
         self.presets = {}  # device id -> [(id, name, pan, tilt)]
         self.privacy = set()  # device ids with privacy mode on
         self.search_players = set()  # player ids clip searches used
+        self.clip_sessions = 0  # open download sessions on the hub
 
     def new_token(self):
         token = "tok-" + uuid.uuid4().hex
@@ -454,6 +457,25 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": -40210}}
             self.send_part("application/json", json.dumps(reply).encode())
             return
+        with self.state.lock:
+            busy = self.state.clip_sessions >= MAX_CLIP_SESSIONS
+            if not busy:
+                self.state.clip_sessions += 1
+        if busy:
+            # Like a hub whose playback slots are all taken.
+            print(f"  clip REFUSED: all {MAX_CLIP_SESSIONS} sessions are open", flush=True)
+            reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": -64323}}
+            self.send_part("application/json", json.dumps(reply).encode())
+            return
+        try:
+            self.clip_session(camera, download, request)
+        finally:
+            with self.state.lock:
+                self.state.clip_sessions -= 1
+                left = self.state.clip_sessions
+            print(f"  clip: session closed ({left} open)", flush=True)
+
+    def clip_session(self, camera, download, request):
         start, end = int(download["start_time"]), int(download["end_time"])
         print(f"  clip: {camera} {end - start}s from {datetime.datetime.fromtimestamp(start)}", flush=True)
         reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": 0, "session_id": "42"}}
@@ -464,6 +486,8 @@ class Handler(BaseHTTPRequestHandler):
                "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-pix_fmt", "yuv420p", "-f", "mpegts", "pipe:1"]
         ts = subprocess.run(cmd, capture_output=True, check=True).stdout
         chunks = [ts[i:i + 4 * 1316] for i in range(0, len(ts), 4 * 1316)]
+        # --slow-clips: send in real time, like a hub on a slow uplink.
+        pace = (end - start) / len(chunks) if self.state.args.slow_clips else 0
         acked, heartbeats = 0, 0
         try:
             for seq, chunk in enumerate(chunks, 1):
@@ -480,10 +504,13 @@ class Handler(BaseHTTPRequestHandler):
                             print("  clip: acknowledgement without the session id", flush=True)
                     elif event == "heartbeat":
                         heartbeats += 1
+                        print(f"  clip: heartbeat {heartbeats}", flush=True)
                     elif message.get("params", {}).get("method") == "do":
                         print("  clip: client stopped early", flush=True)
                         return
                 self.send_part("video/mp2t", chunk, f"X-Data-Sequence: {seq}\r\nX-If-Encrypt: 0\r\n")
+                if pace:
+                    time.sleep(pace)
             done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
             self.send_part("application/json", json.dumps(done).encode())
             print(f"  clip: sent {len(chunks)} parts, {len(ts)} bytes; acknowledged up to {acked}", flush=True)
@@ -502,6 +529,7 @@ def main():
     ap.add_argument("--mfa", action="store_true", help="ask for a verification code at the first sign-in")
     ap.add_argument("--expire-after", type=float, default=0, help="session tokens stop working after N seconds")
     ap.add_argument("--control-delay", type=float, default=0, help="seconds each camera-control call takes, like the real cloud")
+    ap.add_argument("--slow-clips", action="store_true", help="send recordings in real time instead of at full speed")
     args = ap.parse_args()
 
     certs = Path(args.certs)
