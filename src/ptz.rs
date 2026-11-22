@@ -1,15 +1,14 @@
-//! Pan/tilt and presets through the camera's local Tapo API.
-//!
-//! This uses the Tapo app login and the camera's IP address, so it works only
-//! on the camera's network. The login happens lazily on the first command.
+//! Pan/tilt and presets through the Tapo cloud, so they work from anywhere,
+//! like live view. One task per camera handles its commands in order.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use tapo::{ApiClient, CameraPtzHandler};
 use tokio::sync::mpsc;
 
+use crate::cloud::{CloudCamera, CloudClient, CloudError, MAX_MOVE};
+
 pub enum PtzCmd {
+    /// Relative move: positive pans right / tilts up.
     Move(i32, i32),
     Goto(String),
     Save(String),
@@ -22,6 +21,8 @@ pub struct PtzState {
     pub message: String,
     /// (id, name)
     pub presets: Vec<(String, String)>,
+    /// Whether the camera has pan/tilt; `None` until it has answered.
+    pub supported: Option<bool>,
 }
 
 pub struct Ptz {
@@ -31,16 +32,10 @@ pub struct Ptz {
 }
 
 impl Ptz {
-    pub fn spawn(
-        rt: &tokio::runtime::Handle,
-        camera_id: u32,
-        host: String,
-        cloud_user: String,
-        cloud_pass: String,
-    ) -> Self {
+    pub fn spawn(rt: &tokio::runtime::Handle, camera_id: u32, client: Arc<CloudClient>, camera: CloudCamera) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(PtzState::default()));
-        let task = rt.spawn(run(camera_id, host, cloud_user, cloud_pass, rx, state.clone()));
+        let task = rt.spawn(run(camera_id, client, camera, rx, state.clone()));
         Self { tx, state, task }
     }
 
@@ -57,9 +52,8 @@ impl Drop for Ptz {
 
 async fn run(
     camera_id: u32,
-    host: String,
-    user: String,
-    pass: String,
+    client: Arc<CloudClient>,
+    camera: CloudCamera,
     mut rx: mpsc::UnboundedReceiver<PtzCmd>,
     state: Arc<Mutex<PtzState>>,
 ) {
@@ -72,59 +66,87 @@ async fn run(
         }
     };
 
-    let mut handler: Option<CameraPtzHandler> = None;
-    while let Some(cmd) = rx.recv().await {
+    let mut next: Option<PtzCmd> = None;
+    loop {
+        let cmd = match next.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv().await {
+                Some(cmd) => cmd,
+                None => break,
+            },
+        };
+        // Each move is a round trip through the cloud, so arrow presses that
+        // queued up meanwhile become one bigger move.
+        let cmd = match cmd {
+            PtzCmd::Move(mut x, mut y) => {
+                while let Ok(more) = rx.try_recv() {
+                    match more {
+                        PtzCmd::Move(dx, dy) => (x, y) = (x + dx, y + dy),
+                        other => {
+                            next = Some(other);
+                            break;
+                        }
+                    }
+                }
+                PtzCmd::Move(x.clamp(-MAX_MOVE, MAX_MOVE), y.clamp(-MAX_MOVE, MAX_MOVE))
+            }
+            other => other,
+        };
+
         set(true, None);
         notify();
 
-        if handler.is_none() {
-            if user.is_empty() {
-                set(false, Some("Enter your Tapo account in Settings to use pan/tilt.".into()));
-                notify();
-                continue;
-            }
-            let login = ApiClient::new(user.clone(), pass.clone())
-                .with_timeout(Duration::from_secs(10))
-                .c210(host.clone())
-                .await;
-            match login {
-                Ok(h) => handler = Some(h),
+        let supported = state.lock().unwrap().supported;
+        let supported = match supported {
+            Some(s) => s,
+            None => match client.ptz_supported(&camera).await {
+                Ok(s) => {
+                    state.lock().unwrap().supported = Some(s);
+                    s
+                }
                 Err(e) => {
-                    set(false, Some(format!("Could not log in to the camera: {e}")));
+                    report(&e, &set);
                     notify();
                     continue;
                 }
-            }
+            },
+        };
+        if !supported {
+            set(false, Some(String::new()));
+            notify();
+            continue;
         }
-        let h = handler.as_ref().expect("logged in above");
 
         let result = match cmd {
-            PtzCmd::Move(pan, tilt) => h.pan_tilt(pan, tilt).await.map(|_| String::new()),
-            PtzCmd::Goto(id) => h.goto_preset(&id).await.map(|_| "Moving to preset…".into()),
-            PtzCmd::Save(name) => match h.save_preset(&name).await {
-                Ok(()) => load_presets(h, &state).await.map(|_| format!("Saved preset “{name}”.")),
+            PtzCmd::Move(x, y) => client.move_motor(&camera, x, y).await.map(|_| String::new()),
+            PtzCmd::Goto(id) => client.goto_preset(&camera, &id).await.map(|_| "Moving to preset…".into()),
+            PtzCmd::Save(name) => match client.save_preset(&camera, &name).await {
+                Ok(()) => load_presets(&client, &camera, &state).await.map(|_| format!("Saved preset “{name}”.")),
                 Err(e) => Err(e),
             },
-            PtzCmd::Refresh => load_presets(h, &state).await.map(|_| String::new()),
+            PtzCmd::Refresh => load_presets(&client, &camera, &state).await.map(|_| String::new()),
         };
-
         match result {
             Ok(msg) => set(false, Some(msg)),
-            Err(e) => {
-                // A device error (e.g. "reached the end of travel") keeps the
-                // session; anything else forces a fresh login next time.
-                if !matches!(e, tapo::Error::Tapo(tapo::TapoResponseError::DeviceError { .. })) {
-                    handler = None;
-                }
-                set(false, Some(format!("Pan/tilt: {e}")));
-            }
+            Err(e) => report(&e, &set),
         }
         notify();
     }
 }
 
-async fn load_presets(h: &CameraPtzHandler, state: &Arc<Mutex<PtzState>>) -> Result<(), tapo::Error> {
-    let presets = h.get_presets().await?;
-    state.lock().unwrap().presets = presets.into_iter().map(|p| (p.id, p.name)).collect();
+fn report(e: &CloudError, set: &impl Fn(bool, Option<String>)) {
+    if e.is_auth() {
+        crate::app::on_ui(|app| app.cloud_auth_failed());
+    }
+    set(false, Some(format!("Pan/tilt: {e}")));
+}
+
+async fn load_presets(
+    client: &CloudClient,
+    camera: &CloudCamera,
+    state: &Arc<Mutex<PtzState>>,
+) -> Result<(), CloudError> {
+    let presets = client.presets(camera).await?;
+    state.lock().unwrap().presets = presets;
     Ok(())
 }

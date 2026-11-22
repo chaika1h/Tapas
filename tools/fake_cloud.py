@@ -4,8 +4,9 @@
 Serves over HTTPS on 127.0.0.1:
   * the account API: sign-in (with a regional redirect and, with --mfa, a
     verification code), the service lookup and the camera list;
-  * the CIPC relay request; and
-  * the video relay itself, streaming live MPEG-TS made by ffmpeg.
+  * the CIPC relay request;
+  * the video relay itself, streaming live MPEG-TS made by ffmpeg; and
+  * camera control (pan/tilt and presets) through the IoT gateway.
 
 Signed account calls are checked like the real cloud checks them (Content-MD5
 and the HMAC signature), so a client signing wrongly fails here too.
@@ -17,8 +18,10 @@ Only debug builds of Tapo Viewer can be pointed at it:
   TAPO_VIEWER_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
 
 Sign in with any email and the password "secret"; the verification code is
-123456. "Back yard" is reported offline. --expire-after N makes session tokens
-stop working after N seconds, to test signing in again.
+123456. "Back yard" is reported offline; "Front door" has pan/tilt and
+"Garage" hasn't. --expire-after N makes session tokens stop working after N
+seconds, to test signing in again; --control-delay adds the cloud's latency to
+pan/tilt calls.
 
 Needs Python 3, the openssl command and an ffmpeg with libx264 on PATH.
 """
@@ -52,6 +55,9 @@ for _camera in CAMERAS:
     _camera["deviceType"] = "SMART.IPCAMERA"
 OFFLINE = {"FAKE0003"}
 PATTERNS = {"FAKE0001": "testsrc2", "FAKE0002": "testsrc"}
+# Cameras with pan/tilt (the C310 has none), and how far they can turn.
+PTZ = {"FAKE0001", "FAKE0003"}
+PAN_RANGE, TILT_RANGE = 170, 35
 
 
 class State:
@@ -62,6 +68,8 @@ class State:
         self.verified = set()  # terminal UUIDs that passed two-step verification
         self.pending_terminal = None
         self.relays = {}  # relay token -> (device id, resolution)
+        self.position = {}  # device id -> [pan, tilt]
+        self.presets = {}  # device id -> [(id, name, pan, tilt)]
 
     def new_token(self):
         token = "tok-" + uuid.uuid4().hex
@@ -140,6 +148,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self.read_body()
         if url.path.startswith("/cipc/"):
             return self.cipc(url.path[len("/cipc"):], body)
+        if url.path.startswith("/iot/"):
+            return self.camera_control(url.path, body)
 
         regional = url.path.startswith("/eu/")
         endpoint = url.path[len("/eu"):] if regional else url.path
@@ -172,8 +182,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({"error_code": -20651, "msg": "Token expired"})
         if endpoint == "/api/v2/common/getAppServiceUrl":
             # The real cloud answers with http://; clients switch to https.
-            cipc = self.base.replace("https://", "http://") + "/cipc"
-            return self.reply({"error_code": 0, "result": {"serviceUrls": {"cipc.api.cloud": cipc}}})
+            base = self.base.replace("https://", "http://")
+            known = {"cipc.api.cloud": base + "/cipc", "nbu.iot-app-server.app": base + "/iot"}
+            urls = {s: known[s] for s in payload.get("serviceIds", []) if s in known}
+            return self.reply({"error_code": 0, "result": {"serviceUrls": urls}})
         if endpoint == "/api/v2/common/getDeviceListByPage":
             index, limit = int(payload.get("index", 0)), int(payload.get("limit", 20))
             page = CAMERAS[index:index + limit]
@@ -200,6 +212,65 @@ class Handler(BaseHTTPRequestHandler):
             "relayToken": relay_token,
             "elbCookie": "AWSELB=fake",
         }})
+
+    def camera_control(self, path, body):
+        # /iot/v2/things/<device id>/services-sync
+        parts = path.strip("/").split("/")
+        if len(parts) != 5 or parts[1] not in ("v1", "v2") or parts[4] != "services-sync":
+            return self.reply({"message": "not found"}, 404)
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("ut|") or not self.state.valid(auth[3:]):
+            return self.reply({"message": "token expired"}, 401)
+        device = parts[3]
+        time.sleep(self.state.args.control_delay)
+        payload = json.loads(body or b"{}")
+        requests = payload.get("inputParams", {}).get("requestData", {}).get("params", {}).get("requests", [])
+        if device in OFFLINE:
+            return self.reply({"outputParams": {"responseData": {"error_code": -40401}}})
+        responses = [self.camera_method(device, r.get("method"), r.get("params", {})) for r in requests]
+        return self.reply({"outputParams": {"responseData": {"error_code": 0, "result": {"responses": responses}}}})
+
+    def camera_method(self, device, method, params):
+        state = self.state
+        pos = state.position.setdefault(device, [0, 0])
+        presets = state.presets.setdefault(device, [])
+        result, code = {}, 0
+        if method == "getAppComponentList":
+            components = [{"name": "video", "version": 1}] + ([{"name": "ptz", "version": 1}] if device in PTZ else [])
+            result = {"app_component": {"app_component_list": components}}
+        elif device not in PTZ:
+            code = -40106  # method not supported
+        elif method == "motorMove":
+            move = params.get("motor", {}).get("move", {})
+            dx, dy = int(move.get("x_coord", 0)), int(move.get("y_coord", 0))
+            pan = max(-PAN_RANGE, min(PAN_RANGE, pos[0] + dx))
+            tilt = max(-TILT_RANGE, min(TILT_RANGE, pos[1] + dy))
+            if [pan, tilt] == pos and (dx or dy):
+                code = -64304  # already at the end stop
+            pos[:] = [pan, tilt]
+        elif method == "getPresetConfig":
+            result = {"preset": {"preset": {
+                "id": [p[0] for p in presets], "name": [p[1] for p in presets],
+                "position_pan": [str(p[2]) for p in presets], "position_tilt": [str(p[3]) for p in presets],
+                "read_only": ["0" for _ in presets],
+            }}}
+        elif method == "motorMoveToPreset":
+            target = params.get("preset", {}).get("goto_preset", {}).get("id")
+            match = [p for p in presets if p[0] == target]
+            if match:
+                pos[:] = [match[0][2], match[0][3]]
+            else:
+                code = -64321
+        elif method == "addMotorPostion":
+            name = params.get("preset", {}).get("set_preset", {}).get("name", "")
+            presets.append((str(len(presets) + 1), name, pos[0], pos[1]))
+        else:
+            code = -40106
+        print(f"  {device} {method} -> code {code}, position pan {pos[0]} tilt {pos[1]}", flush=True)
+        reply = {"method": method, "error_code": code}
+        if code == 0:
+            reply["result"] = result
+        return reply
 
     def relay(self, query):
         with self.state.lock:
@@ -238,6 +309,7 @@ def main():
     ap.add_argument("--certs", default="target/fake-cloud", help="directory for the test CA and certificate")
     ap.add_argument("--mfa", action="store_true", help="ask for a verification code at the first sign-in")
     ap.add_argument("--expire-after", type=float, default=0, help="session tokens stop working after N seconds")
+    ap.add_argument("--control-delay", type=float, default=0, help="seconds each camera-control call takes, like the real cloud")
     args = ap.parse_args()
 
     certs = Path(args.certs)

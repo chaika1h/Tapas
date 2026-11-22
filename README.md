@@ -8,8 +8,8 @@ A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, wr
   or camera accounts.
 - **Live grid** of all cameras, sized to fit the window; click a camera for a full view.
 - **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
-- **Pan/tilt** and **presets** for C2xx/C5xx/TC40/TC70 cameras (arrow keys work too), on the
-  local network.
+- **Pan/tilt** and **presets** from anywhere for cameras that have them (arrow keys work too);
+  the app finds out which do.
 - **H500 recordings**: browse each paired camera's clips by day, download and play them.
 - **Snapshots** to `Pictures\TapoViewer`.
 - Passwords and the cloud session are encrypted with Windows DPAPI, so they only work for your
@@ -22,7 +22,8 @@ Everything uses your **Tapo app login** (email and password).
 | Feature | How | Where it works |
 |---|---|---|
 | Live video | Tapo cloud video relay (HTTPS) | Anywhere with internet |
-| Pan/tilt, presets, H500 recordings, Find devices | Tapo local API | On the cameras' network |
+| Pan/tilt, presets | Tapo cloud camera control (HTTPS) | Anywhere with internet |
+| H500 recordings, Find hubs | Tapo local API | On the hub's network |
 
 ### Getting started
 
@@ -38,17 +39,19 @@ change either per camera. The PC keeps the session token, encrypted like the pas
 session expires, the app signs in again by itself; if Tapo then asks for a code, sign in
 again under *Settings*.
 
-Pan/tilt still uses the camera's local API, so it needs the camera's IP address (edit the camera,
-or use *Find devices*) and only works when the PC is on the camera's network. The same goes for
-H500 recordings. To use those away from the office, put the PC on the office network over a VPN
-(e.g. a [Tailscale subnet router](https://tailscale.com/kb/1019/subnets) on an always-on machine
-there, or your router's built-in WireGuard/OpenVPN server).
+In the single-camera view, the pan/tilt panel appears for cameras that have it. Each move goes
+through the cloud, so it takes a moment; arrow presses made meanwhile are combined into one move.
+
+H500 recordings are still read from the hub on the local network, because there is no known way
+to reach them through the cloud. To browse them away from the office, put the PC on the office
+network over a VPN (e.g. a [Tailscale subnet router](https://tailscale.com/kb/1019/subnets) on an
+always-on machine there, or your router's built-in WireGuard/OpenVPN server).
 
 ### About the cloud
 
-Live view uses TP-Link's private, undocumented cloud service, ported from the MIT-licensed
+Live view and pan/tilt use TP-Link's private, undocumented cloud service, ported from the MIT-licensed
 [Topo](https://github.com/filirnd/topo) and [Topo TV](https://github.com/abdulmominsakib/tapo-android-tv)
-projects (see `src/cloud.rs` and `src/relay.rs`). TP-Link can change it at any time; if live view
+projects (see `src/cloud.rs` and `src/relay.rs`). TP-Link can change it at any time; if it
 stops working after a Tapo app update, the protocol has probably changed (see *Troubleshooting*).
 Cameras that send encrypted video through the cloud aren't supported yet; their tile says so.
 
@@ -115,8 +118,9 @@ tools/build-ffmpeg.sh windows
 
 `tools/fake_cloud.py` is a fake Tapo cloud and video relay for testing cloud live view without
 an account. It checks request signatures like the real cloud, redirects to a "regional" server,
-can ask for a verification code (`--mfa`, code `123456`) and can expire sessions
-(`--expire-after 60`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
+can ask for a verification code (`--mfa`, code `123456`), can expire sessions
+(`--expire-after 60`) and simulates pan/tilt and presets, with the cloud's delay if you like
+(`--control-delay 0.4`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
 pointed at it:
 
 ```bash
@@ -127,13 +131,16 @@ python3 tools/fake_cloud.py --certs target/fake-cloud --mfa
 TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
 ```
 
-Sign in with any email and the password `secret`. "Back yard" is reported offline.
+Sign in with any email and the password `secret`. "Back yard" is reported offline; "Front door"
+has pan/tilt and "Garage" hasn't.
 
 ## Troubleshooting
 
-- **Pan/tilt or hub login fails**: check the Tapo account and the camera's IP address under
-  *Settings*, and that the PC is on the camera's network. Cameras on very new
-  firmware may need a newer version of the `tapo` crate.
+- **Hub login fails**: check the Tapo account and the hub's IP address under *Settings*, and that
+  the PC is on the hub's network. Hubs on very new firmware may need a newer version of the
+  `tapo` crate.
+- **"Pan/tilt: Reached the end of the pan/tilt range"**: the camera is at its end stop in that
+  direction.
 - **"Camera is offline"**: the cloud can't reach the camera; check it in the
   Tapo app.
 - **"The cloud relay refused the stream (code …)"** or **sign-in refused**:

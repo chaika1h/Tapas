@@ -88,19 +88,9 @@ impl Renderer {
 pub struct CameraConfig {
     pub id: u32,
     pub name: String,
-    /// The camera on the Tapo account; live video comes through the cloud.
+    /// The camera on the Tapo account; video and pan/tilt go through the cloud.
     pub cloud: Option<CloudCamera>,
-    /// Optional local IP address, only for pan/tilt and presets, which use
-    /// the camera's local API.
-    pub host: String,
-    pub ptz: bool,
     pub grid_quality: Quality,
-}
-
-impl CameraConfig {
-    pub fn has_ip(&self) -> bool {
-        !self.host.trim().is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -114,7 +104,7 @@ pub struct HubConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
-    /// TP-Link / Tapo app account: live view, discovery, pan/tilt and the hub.
+    /// TP-Link / Tapo app account: the cloud, and the hub's local API.
     pub cloud_username: String,
     pub cloud_password: Secret,
     pub cameras: Vec<CameraConfig>,
