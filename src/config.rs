@@ -122,20 +122,16 @@ pub struct CameraConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct HubConfig {
-    pub id: u32,
-    pub name: String,
-    pub host: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AppConfig {
-    /// TP-Link / Tapo app account: the cloud, and the hub's local API.
+    /// The TP-Link / Tapo app account.
     pub cloud_username: String,
     pub cloud_password: Secret,
     pub cameras: Vec<CameraConfig>,
-    pub hubs: Vec<HubConfig>,
+    /// The camera hubs (H500, H200) on the account, from its last list.
+    /// Settings from the local-network version listed hubs by IP address;
+    /// those have no device id and are dropped.
+    #[serde(deserialize_with = "account_hubs")]
+    pub hubs: Vec<CloudCamera>,
     /// Empty = look next to the exe, then on PATH.
     pub ffmpeg_path: String,
     pub renderer: Renderer,
@@ -148,13 +144,14 @@ impl AppConfig {
         self.cameras.iter().map(|c| c.id).max().unwrap_or(0) + 1
     }
 
-    pub fn next_hub_id(&self) -> u32 {
-        self.hubs.iter().map(|h| h.id).max().unwrap_or(0) + 1
-    }
-
     pub fn camera(&self, id: u32) -> Option<&CameraConfig> {
         self.cameras.iter().find(|c| c.id == id)
     }
+}
+
+fn account_hubs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CloudCamera>, D::Error> {
+    let hubs: Vec<CloudCamera> = Vec::deserialize(d)?;
+    Ok(hubs.into_iter().filter(|h| !h.device_id.is_empty()).collect())
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {
@@ -213,4 +210,20 @@ fn user_subdir(pick: impl Fn(&directories::UserDirs) -> Option<PathBuf>) -> Path
         .and_then(|u| pick(&u).or_else(|| Some(u.home_dir().to_path_buf())))
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("TapoViewer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hubs_from_the_local_version_are_dropped() {
+        let cfg: AppConfig = serde_json::from_str(
+            r#"{"hubs": [{"id": 1, "name": "HomeBase", "host": "192.168.1.40"},
+                         {"device_id": "HUB1", "name": "HomeBase", "model": "H500"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hubs.len(), 1);
+        assert_eq!(cfg.hubs[0].device_id, "HUB1");
+    }
 }

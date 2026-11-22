@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::Engine;
+use chrono::NaiveDate;
 use base64::engine::general_purpose::STANDARD as B64;
 use hmac::{Hmac, KeyInit, Mac};
 use md5::{Digest, Md5};
@@ -46,6 +47,11 @@ const TP_LINK_ROOTS: &[u8] = include_bytes!("../certs/tapo-cloud-roots.pem");
 
 /// Service ids for the cloud's service lookup.
 const CIPC_SERVICE: &str = "cipc.api.cloud";
+const CAMERA_TYPE: &str = "SMART.IPCAMERA";
+const HUB_TYPE: &str = "SMART.TAPOHUB";
+/// Relay stream types (`StreamType` in the Tapo app).
+const STREAM_PREVIEW: i64 = 0;
+const STREAM_DOWNLOAD: i64 = 3;
 const IOT_SERVICE: &str = "nbu.iot-app-server.app";
 
 /// Pan/tilt steps the camera accepts in one move.
@@ -158,6 +164,75 @@ pub struct CloudCamera {
     pub device_type: String,
     /// Upper-case hex digits only.
     pub mac: String,
+}
+
+/// A camera paired with a hub, as the hub lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubCamera {
+    pub device_id: String,
+    pub name: String,
+    pub model: String,
+    /// As the hub reports it (the Tapo app passes it on unchanged).
+    pub mac: String,
+    /// Whether the hub stores this camera's recordings.
+    pub hub_storage: bool,
+}
+
+/// One recording on a hub, in Unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clip {
+    pub start: i64,
+    pub end: i64,
+    /// What triggered it (the API's `video_type`); see [`clip_kind`].
+    pub kind: i64,
+}
+
+impl Clip {
+    pub fn seconds(&self) -> i64 {
+        (self.end - self.start).max(0)
+    }
+}
+
+/// Whether a `SMART.TAPOHUB` model stores camera video (the H500 HomeBase and
+/// the H200), unlike the smart-home hubs (H100, H110).
+pub fn is_camera_hub(model: &str) -> bool {
+    let model = model.trim().to_ascii_uppercase();
+    model.starts_with("H2") || model.starts_with("H5")
+}
+
+/// A recording's trigger, from its `video_type`.
+pub fn clip_kind(code: i64) -> String {
+    match code {
+        1 => "Continuous",
+        2 => "Motion",
+        3 => "Camera tampering",
+        4 => "Line crossing",
+        5 => "Area intrusion",
+        6 => "Person",
+        7 => "Baby crying",
+        8 => "Vehicle",
+        9 => "Pet",
+        10 => "Doorbell ring",
+        11 => "Dog barking",
+        12 => "Cat meowing",
+        13 => "Glass breaking",
+        14 => "Smoke alarm",
+        15 => "Package delivered",
+        16 => "Package picked up",
+        17 => "Missed ring",
+        18 => "Answered ring",
+        19 => "Anti-theft",
+        20 => "Face",
+        21 => "Unfamiliar face",
+        22 => "Unfamiliar person",
+        23..=26 | 30 => "Baby monitor",
+        27 => "Face covered",
+        28 => "Left safe zone",
+        31 => "Panoramic",
+        33 => "Animal",
+        _ => return format!("Event {code}"),
+    }
+    .to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,24 +505,35 @@ impl CloudClient {
     // --------------------------------------------------------------- cameras
 
     pub async fn list_cameras(&self) -> Result<Vec<CloudCamera>> {
+        self.list_devices(CAMERA_TYPE, "Could not load the cameras on your Tapo account").await
+    }
+
+    /// The camera hubs (H500 HomeBase, H200) on the account. Smart-home hubs
+    /// such as the H100 are the same device type but store no video.
+    pub async fn list_hubs(&self) -> Result<Vec<CloudCamera>> {
+        let hubs = self.list_devices(HUB_TYPE, "Could not load the hubs on your Tapo account").await?;
+        Ok(hubs.into_iter().filter(|h| is_camera_hub(&h.model)).collect())
+    }
+
+    async fn list_devices(&self, device_type: &str, what: &str) -> Result<Vec<CloudCamera>> {
         const PAGE: usize = 20;
         let session = self.require_session()?;
-        let mut cameras = Vec::new();
+        let mut devices = Vec::new();
         for index in (0..200).step_by(PAGE) {
-            let payload = json!({ "deviceTypeList": ["SMART.IPCAMERA"], "index": index, "limit": PAGE });
+            let payload = json!({ "deviceTypeList": [device_type], "index": index, "limit": PAGE });
             let response = self
                 .post(&session.base_url, "/api/v2/common/getDeviceListByPage", &payload, Some(&session.token))
                 .await?;
-            check_outer(&response, "Could not load the cameras on your Tapo account")?;
+            check_outer(&response, what)?;
             let result = result_of(&response);
             let Some(page) = result.get("deviceList").and_then(Value::as_array) else { break };
-            cameras.extend(page.iter().filter_map(camera_from));
+            devices.extend(page.iter().filter_map(camera_from).filter(|d| d.device_type.is_empty() || d.device_type == device_type));
             let total = result.get("totalNum").and_then(int_value).unwrap_or(i64::MAX);
-            if page.len() < PAGE || cameras.len() as i64 >= total {
+            if page.len() < PAGE || devices.len() as i64 >= total {
                 break;
             }
         }
-        Ok(cameras)
+        Ok(devices)
     }
 
     // ----------------------------------------------------------------- relay
@@ -508,9 +594,8 @@ impl CloudClient {
         if camera.device_id.is_empty() {
             return Err(CloudError::new("This camera isn't linked to a camera on your Tapo account"));
         }
-        let session = self.require_session()?;
         let player_id = new_uuid();
-        let device_type = if camera.device_type.is_empty() { "SMART.IPCAMERA" } else { &camera.device_type };
+        let device_type = if camera.device_type.is_empty() { CAMERA_TYPE } else { &camera.device_type };
         let payload = json!({
             "deviceId": camera.device_id,
             "dataTimeoutCount": 0,
@@ -518,17 +603,60 @@ impl CloudClient {
             "deviceType": device_type,
             "playerId": player_id,
             "rootCaVer": "1",
-            "streamType": 0,
+            "streamType": STREAM_PREVIEW,
             "preConnection": 0,
             "resolution": resolution.as_str(),
         });
-        let response = self.post_cipc(&session, "/v2/relay/request", &payload, &player_id).await?;
+        self.relay_request(&payload, player_id, "Camera").await
+    }
+
+    /// Asks the cloud for a relay that downloads one of `camera`'s recordings
+    /// from `hub`. Shaped like the Tapo app's: the relay goes to the hub, and
+    /// `customParams` names the camera. `sub_type` is "cover" (the app's
+    /// download) or "video" (its download of a playback clip); both are
+    /// stream type 3.
+    pub async fn request_clip_relay(
+        &self,
+        hub: &CloudCamera,
+        camera: &HubCamera,
+        player_id: &str,
+        sub_type: &str,
+    ) -> Result<RelayInfo> {
+        let device_type = if hub.device_type.is_empty() { HUB_TYPE } else { &hub.device_type };
+        let mut custom = serde_json::Map::new();
+        if !camera.device_id.is_empty() {
+            custom.insert("camera_device_id".into(), camera.device_id.clone().into());
+        }
+        if !camera.mac.is_empty() {
+            custom.insert("camera_mac".into(), camera.mac.clone().into());
+        }
+        custom.insert("audio_config".into(), json!({ "encode_type": "G711ulaw", "sample_rate": "16" }));
+        let payload = json!({
+            "deviceId": hub.device_id,
+            "dataTimeoutCount": 0,
+            "cloudType": 2,
+            "deviceType": device_type,
+            "playerId": player_id,
+            "rootCaVer": "1",
+            "streamType": STREAM_DOWNLOAD,
+            "subType": sub_type,
+            "preConnection": 0,
+            "customParams": Value::Object(custom).to_string(),
+        });
+        log::info!("clip relay request: {}", redact_relay_request(&payload));
+        self.relay_request(&payload, player_id.to_string(), "Hub").await
+    }
+
+    async fn relay_request(&self, payload: &Value, player_id: String, device: &str) -> Result<RelayInfo> {
+        let session = self.require_session()?;
+        let response = self.post_cipc(&session, "/v2/relay/request", payload, &player_id).await?;
         match error_code(&response) {
             0 => {}
-            code @ (-40401 | -40406) => return Err(CloudError::with_code("Camera is offline", code)),
+            code @ (-40401 | -40406) => return Err(CloudError::with_code(format!("{device} is offline"), code)),
             AUTH_EXPIRED => return Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED)),
             code @ -64324 => return Err(CloudError::with_code("Privacy mode is on", code)),
             code => {
+                log::warn!("relay request refused: {response}");
                 return Err(CloudError::with_code(format!("The cloud relay refused the stream (code {code})"), code));
             }
         }
@@ -545,6 +673,7 @@ impl CloudClient {
         let elb_cookie = Some(str_field(&info, "elbCookie")).filter(|c| !c.is_empty());
         Ok(RelayInfo { host, port, path, token, player_id, elb_cookie })
     }
+
     // -------------------------------------------------------- camera control
 
     fn iot_headers(&self, session: &Session) -> Vec<(&'static str, String)> {
@@ -673,7 +802,83 @@ impl CloudClient {
         let request = json!({ "method": "addMotorPostion", "params": { "preset": { "set_preset": { "name": name } } } });
         first_result(&self.camera_requests(camera, vec![request]).await?, "addMotorPostion").map(drop)
     }
+
+    // ------------------------------------------------------------------ hubs
+
+    /// The cameras paired with `hub`, from the hub itself (through the cloud).
+    pub async fn hub_cameras(&self, hub: &CloudCamera) -> Result<Vec<HubCamera>> {
+        let request = json!({
+            "method": "getGeneralDeviceList",
+            "params": { "general_camera_manage": { "paired_general_device_list": {} } },
+        });
+        let result = first_result(&self.camera_requests(hub, vec![request]).await?, "getGeneralDeviceList")?;
+        Ok(parse_hub_cameras(&result))
+    }
+
+    /// The days from `from` to `to` (the hub's calendar) on which the hub
+    /// recorded the camera.
+    pub async fn hub_recording_days(
+        &self,
+        hub: &CloudCamera,
+        camera_id: &str,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<NaiveDate>> {
+        let request = json!({
+            "method": "searchDateWithVideo",
+            "params": { "playback": { "search_year_utility": {
+                "channel": [0],
+                "start_date": from.format("%Y%m%d").to_string(),
+                "end_date": to.format("%Y%m%d").to_string(),
+                "child_device_id": camera_id,
+            } } },
+        });
+        let result = first_result(&self.camera_requests(hub, vec![request]).await?, "searchDateWithVideo")?;
+        Ok(parse_recording_days(&result))
+    }
+
+    /// The camera's recordings that overlap `start`..`end` (Unix seconds),
+    /// oldest first. `player_id` must be the one the clips are downloaded with.
+    pub async fn hub_clips(
+        &self,
+        hub: &CloudCamera,
+        camera_id: &str,
+        start: i64,
+        end: i64,
+        player_id: &str,
+    ) -> Result<Vec<Clip>> {
+        // Like the Tapo app: pages of 100, up to a start index of 12288.
+        const PAGE: i64 = 100;
+        let mut clips = Vec::new();
+        let mut index = 0;
+        while index <= 12288 {
+            let request = json!({
+                "method": "searchVideoWithUTC",
+                "params": { "playback": { "search_video_with_utc": {
+                    "channel": 0,
+                    "start_time": start,
+                    "end_time": end,
+                    "start_index": index,
+                    "end_index": index + PAGE - 1,
+                    "child_device_id": camera_id,
+                    "player_id": player_id,
+                } } },
+            });
+            let result = first_result(&self.camera_requests(hub, vec![request]).await?, "searchVideoWithUTC")?;
+            let page = parse_clips(&result);
+            let full = page.len() as i64 >= PAGE;
+            clips.extend(page);
+            if !full {
+                break;
+            }
+            index += PAGE;
+        }
+        clips.sort_by_key(|c| (c.start, c.end));
+        clips.dedup();
+        Ok(clips)
+    }
 }
+
 
 /// Unwraps the gateway's answer to [`CloudClient::camera_requests`].
 fn parse_camera_answer(status: u16, bytes: &[u8]) -> Result<Vec<Value>> {
@@ -746,6 +951,71 @@ fn parse_presets(result: &Value) -> Vec<(String, String)> {
             .unwrap_or_default()
     };
     list("id").into_iter().zip(list("name")).collect()
+}
+
+/// `general_camera_manage.paired_general_device_list` of `getGeneralDeviceList`.
+fn parse_hub_cameras(result: &Value) -> Vec<HubCamera> {
+    let list = result.pointer("/general_camera_manage/paired_general_device_list").and_then(Value::as_array);
+    list.into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let device_id = str_field(c, "device_id");
+            if device_id.is_empty() {
+                return None;
+            }
+            let name = Some(str_field(c, "alias").trim().to_string()).filter(|n| !n.is_empty());
+            let model = str_field(c, "device_model");
+            Some(HubCamera {
+                name: name.unwrap_or_else(|| if model.is_empty() { "Camera".into() } else { model.clone() }),
+                device_id,
+                model,
+                mac: str_field(c, "mac"),
+                hub_storage: c.get("hub_storage_enabled").is_none_or(|v| v.as_bool().unwrap_or(true)),
+            })
+        })
+        .collect()
+}
+
+/// The hub wraps every list entry in an object of its own:
+/// `[{"search_results_1": {...}}, {"search_results_2": {...}}]`.
+fn section_entries(list: Option<&Value>) -> impl Iterator<Item = &Value> {
+    list.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.values())
+}
+
+/// `playback.search_results` of `searchDateWithVideo`: days as `YYYYMMDD`.
+fn parse_recording_days(result: &Value) -> Vec<NaiveDate> {
+    let mut days: Vec<NaiveDate> = section_entries(result.pointer("/playback/search_results"))
+        .filter_map(|e| NaiveDate::parse_from_str(&str_field(e, "date"), "%Y%m%d").ok())
+        .collect();
+    days.sort();
+    days.dedup();
+    days
+}
+
+/// `playback.search_video_results` of `searchVideoWithUTC`.
+fn parse_clips(result: &Value) -> Vec<Clip> {
+    let time = |e: &Value, keys: [&str; 2]| keys.iter().find_map(|k| e.get(*k).and_then(int_value));
+    section_entries(result.pointer("/playback/search_video_results"))
+        .filter_map(|e| {
+            let start = time(e, ["startTime", "start_time"])?;
+            let end = time(e, ["endTime", "end_time"])?;
+            let kind = e.get("video_type").and_then(int_value).unwrap_or(0);
+            (end > start).then_some(Clip { start, end, kind })
+        })
+        .collect()
+}
+
+/// The clip relay request for the log, without the player id.
+fn redact_relay_request(payload: &Value) -> Value {
+    let mut copy = payload.clone();
+    if let Some(o) = copy.as_object_mut() {
+        o.remove("playerId");
+    }
+    copy
 }
 
 // ----------------------------------------------------------------- helpers
@@ -963,6 +1233,60 @@ mod tests {
         let result = json!({"preset": {"preset": {"id": ["1", "2"], "name": ["Door", "Gate"], "read_only": ["0", "0"]}}});
         assert_eq!(parse_presets(&result), vec![("1".to_string(), "Door".to_string()), ("2".into(), "Gate".into())]);
         assert!(parse_presets(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn hub_camera_list() {
+        let result = json!({"general_camera_manage": {"max_bound": 4, "paired_general_device_list": [
+            {"device_id": "CAM1", "alias": "Front door", "device_model": "C210", "mac": "A8-42-A1-00-00-01",
+             "hub_storage_enabled": true, "parent_device_id": "HUB"},
+            {"device_id": "CAM2", "alias": "", "device_model": "C120", "mac": "A8-42-A1-00-00-02",
+             "hub_storage_enabled": false},
+            {"alias": "no id"}
+        ]}});
+        let cams = parse_hub_cameras(&result);
+        assert_eq!(cams.len(), 2);
+        assert_eq!(cams[0].name, "Front door");
+        assert_eq!(cams[0].mac, "A8-42-A1-00-00-01");
+        assert!(cams[0].hub_storage);
+        assert_eq!(cams[1].name, "C120");
+        assert!(!cams[1].hub_storage);
+        // H200 firmware leaves the list out when nothing is paired.
+        assert!(parse_hub_cameras(&json!({"general_camera_manage": {"max_bound": 4}})).is_empty());
+    }
+
+    #[test]
+    fn hub_recording_days_and_clips() {
+        let days = json!({"playback": {"search_results": [
+            {"search_results_2": {"date": "20261121"}},
+            {"search_results_1": {"date": "20261117"}},
+            {"search_results_3": {"date": "bad"}}
+        ]}});
+        let days = parse_recording_days(&days);
+        assert_eq!(days, vec![NaiveDate::from_ymd_opt(2026, 11, 17).unwrap(), NaiveDate::from_ymd_opt(2026, 11, 21).unwrap()]);
+
+        let clips = json!({"playback": {"search_video_results": [
+            {"search_video_results_1": {"startTime": 1786694400, "endTime": 1786694460, "video_type": "2"}},
+            {"search_video_results_2": {"startTime": "1786694500", "endTime": "1786694530", "video_type": 6}},
+            {"search_video_results_3": {"startTime": 5, "endTime": 5}}
+        ]}});
+        let clips = parse_clips(&clips);
+        assert_eq!(clips, vec![
+            Clip { start: 1786694400, end: 1786694460, kind: 2 },
+            Clip { start: 1786694500, end: 1786694530, kind: 6 },
+        ]);
+        assert_eq!(clips[0].seconds(), 60);
+        assert_eq!(clip_kind(2), "Motion");
+        assert_eq!(clip_kind(99), "Event 99");
+        assert!(parse_clips(&json!({"playback": {}})).is_empty());
+    }
+
+    #[test]
+    fn camera_hub_models() {
+        assert!(is_camera_hub("H500"));
+        assert!(is_camera_hub("h200(EU)"));
+        assert!(!is_camera_hub("H100"));
+        assert!(!is_camera_hub(""));
     }
 
     #[test]

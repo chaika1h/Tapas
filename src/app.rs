@@ -1,5 +1,5 @@
 //! Application state and the glue between the Slint UI and the background
-//! work (streams, PTZ, discovery, hub). All of it lives on the UI thread;
+//! work (streams, PTZ, hub recordings). All of it lives on the UI thread;
 //! background tasks report back through [`on_ui`].
 
 use std::cell::{Cell, RefCell};
@@ -9,19 +9,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{Local, NaiveDate, TimeZone, Utc};
-use futures_util::StreamExt;
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
-use tapo::responses::{GeneralDeviceHubResult, RecordingHubResult};
-use tapo::{ApiClient, CameraHubHandler, DeviceType};
 
-use crate::cloud::{self, CloudCamera, CloudClient, Login, MfaChallenge, MfaMethod, Session};
-use crate::config::{self, AppConfig, CameraConfig, HubConfig, Quality, Renderer, Theme};
+use crate::clip::{self, ClipRequest};
+use crate::cloud::{self, Clip, CloudCamera, CloudClient, HubCamera, Login, MfaChallenge, MfaMethod, Session};
+use crate::config::{self, AppConfig, CameraConfig, Quality, Renderer, Theme};
+use crate::player::{Player, Source};
 use crate::ptz::{Ptz, PtzCmd};
 use crate::secret::Secret;
 use crate::stream::{Frame, StreamHandle, StreamSpec};
 use crate::{
-    Bridge, CameraRow, DownloadRow, FoundRow, HomeCard, HubRow, MainWindow, Page, PresetRow, RecRow, Tile,
+    Bridge, CameraRow, DayChip, DownloadRow, HomeCard, HubRow, MainWindow, Page, PresetRow, RecRow, Tile,
 };
 
 thread_local! {
@@ -54,22 +53,32 @@ struct Live {
     shown_status: String,
 }
 
-/// A hub found on the network.
-#[derive(Clone)]
-struct Found {
-    name: String,
-    model: String,
-    host: String,
-}
-
+/// The Playback page: one hub's cameras and one day of a camera's clips.
 #[derive(Default)]
 struct HubSession {
-    /// Bumped on every (re)connect so stale results are ignored.
+    /// Bumped on every (re)load so stale results are ignored.
     generation: u64,
-    handler: Option<Arc<CameraHubHandler>>,
-    paired: Vec<GeneralDeviceHubResult>,
-    recordings: Vec<RecordingHubResult>,
+    hub: Option<CloudCamera>,
+    cameras: Vec<HubCamera>,
+    /// Newest first, as listed.
+    clips: Vec<Clip>,
+    /// Days with recordings around the selected day.
+    days: Vec<NaiveDate>,
     rec_request: u64,
+    days_request: u64,
+}
+
+/// The recording in the player.
+struct Playing {
+    player: Player,
+    camera_id: String,
+    clip: Clip,
+    path: PathBuf,
+    request: ClipRequest,
+    shown_version: u64,
+    /// When the first frame showed, for the position.
+    started: Option<Instant>,
+    shown_position: String,
 }
 
 /// A Tapo cloud sign-in waiting for its verification code.
@@ -93,8 +102,11 @@ pub struct App {
     single: RefCell<Option<StreamKey>>,
     single_shown: RefCell<(u64, String)>,
     ptz: RefCell<HashMap<u32, Ptz>>,
-    found: RefCell<Vec<Found>>,
     hub: RefCell<HubSession>,
+    /// Identifies this PC's player to the hubs: clip searches and downloads
+    /// must use the same one.
+    player_id: String,
+    playing: RefCell<Option<Playing>>,
     rec_date: RefCell<NaiveDate>,
     downloads: Rc<VecModel<DownloadRow>>,
     status_until: RefCell<Option<Instant>>,
@@ -117,8 +129,9 @@ pub struct App {
     home_cards: Rc<VecModel<HomeCard>>,
     /// Where the camera view's back button goes.
     return_page: Cell<Page>,
-    /// A camera to select once the hub's recordings are open.
-    pending_rec_camera: RefCell<Option<String>>,
+    /// A camera (cloud device id or name) to select once the hub's cameras
+    /// are listed.
+    pending_rec_camera: RefCell<Option<(String, String)>>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -159,8 +172,9 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         single: RefCell::default(),
         single_shown: RefCell::default(),
         ptz: RefCell::default(),
-        found: RefCell::default(),
         hub: RefCell::default(),
+        player_id: uuid::Uuid::new_v4().to_string(),
+        playing: RefCell::default(),
         rec_date: RefCell::new(Local::now().date_naive()),
         downloads: Rc::new(VecModel::default()),
         status_until: RefCell::default(),
@@ -221,17 +235,16 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_save_camera(cb!(&app, |a| a.save_camera()));
     b.on_delete_camera(cb!(&app, |a, id| a.delete_camera(id as u32)));
     b.on_move_camera(cb!(&app, |a, id, dir| a.move_camera(id as u32, dir)));
-    b.on_new_hub(cb!(&app, |a| a.new_hub()));
-    b.on_edit_hub(cb!(&app, |a, id| a.edit_hub(id as u32)));
-    b.on_save_hub(cb!(&app, |a| a.save_hub()));
-    b.on_delete_hub(cb!(&app, |a, id| a.delete_hub(id as u32)));
-    b.on_scan(cb!(&app, |a| a.scan()));
-    b.on_add_found(cb!(&app, |a, i| a.add_found(i as usize)));
 
     b.on_connect_hub(cb!(&app, |a| a.connect_hub()));
-    b.on_rec_camera_changed(cb!(&app, |a| a.load_recordings()));
+    b.on_rec_hub_changed(cb!(&app, |a| a.connect_hub()));
+    b.on_rec_camera_changed(cb!(&app, |a| a.camera_picked()));
     b.on_change_day(cb!(&app, |a, d| a.change_day(d)));
+    b.on_pick_day(cb!(&app, |a, i| a.pick_day(i)));
+    b.on_play_clip(cb!(&app, |a, i| a.play_clip(i as usize)));
     b.on_download(cb!(&app, |a, i| a.download(i as usize)));
+    b.on_player_stop(cb!(&app, |a| a.player_stop()));
+    b.on_player_replay(cb!(&app, |a| a.player_replay()));
     b.on_open_file(|p| open_path(Path::new(p.as_str())));
     b.on_show_in_folder(|p| show_in_folder(Path::new(p.as_str())));
 
@@ -306,6 +319,7 @@ impl App {
                 self.pump_tiles();
             }
             Page::Single => self.pump_single(&b),
+            Page::Recordings => self.pump_player(&b),
             _ => {}
         }
         let expired = self.status_until.borrow().is_some_and(|t| Instant::now() >= t);
@@ -486,6 +500,9 @@ impl App {
         b.set_page(page);
         ui.invoke_focus_keys();
         self.sync_streams();
+        if page == Page::Recordings && self.hub.borrow().hub.is_none() && !b.get_hub_busy() {
+            self.connect_hub();
+        }
     }
 
     fn set_fullscreen(&self, on: bool) {
@@ -673,53 +690,6 @@ impl App {
         }
         if changed {
             self.refresh_home_cards();
-        }
-    }
-
-    /// The hub card on Home: its recordings.
-    fn open_hub(&self, index: i32) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        let switching = b.get_rec_hub() != index;
-        b.set_rec_hub(index);
-        self.navigate(Page::Recordings);
-        if (switching || !b.get_hub_connected()) && !b.get_hub_busy() {
-            self.connect_hub();
-        }
-    }
-
-    /// "Playback & Download" in the camera view: this camera's recordings on
-    /// the hub.
-    fn open_playback(&self) {
-        let Some((id, _)) = *self.single.borrow() else { return };
-        let name = self.cfg.borrow().camera(id).map(|c| c.name.clone()).unwrap_or_default();
-        self.navigate(Page::Recordings);
-        if self.cfg.borrow().hubs.is_empty() {
-            self.status("Recordings are read from the H500: add it under Settings › Hubs first.");
-            return;
-        }
-        *self.pending_rec_camera.borrow_mut() = Some(name);
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        if b.get_hub_connected() {
-            self.select_pending_rec_camera();
-        } else if !b.get_hub_busy() {
-            self.connect_hub();
-        }
-    }
-
-    fn select_pending_rec_camera(&self) {
-        let Some(name) = self.pending_rec_camera.borrow_mut().take() else { return };
-        let index = self.hub.borrow().paired.iter().position(|p| same_name(&p.alias, &name));
-        match index {
-            Some(i) => {
-                self.ui().global::<Bridge>().set_rec_camera(i as i32);
-                self.load_recordings();
-            }
-            None => {
-                self.status(format!("{name} isn't paired with this hub; pick a camera."));
-                self.load_recordings();
-            }
         }
     }
 
@@ -954,7 +924,6 @@ impl App {
         self.restart_camera(id);
         b.set_cam_editing(-1);
         self.refresh_camera_lists();
-        self.refresh_found();
         self.sync_streams();
         self.status("Camera saved.");
     }
@@ -968,7 +937,6 @@ impl App {
             self.ui().global::<Bridge>().set_cam_editing(-1);
         }
         self.refresh_camera_lists();
-        self.refresh_found();
         self.sync_streams();
     }
 
@@ -993,68 +961,14 @@ impl App {
         let rows: Vec<HubRow> = cfg
             .hubs
             .iter()
-            .map(|h| HubRow { id: h.id as i32, name: h.name.as_str().into(), host: h.host.as_str().into() })
+            .enumerate()
+            .map(|(i, h)| HubRow { id: i as i32, name: h.name.as_str().into(), detail: hub_detail(h).into() })
             .collect();
         b.set_hubs(ModelRc::new(VecModel::from(rows)));
-        b.set_hub_names(string_model(cfg.hubs.iter().map(|h| format!("{} ({})", h.name, h.host))));
-        if b.get_rec_hub() as usize >= cfg.hubs.len() {
+        b.set_hub_names(string_model(cfg.hubs.iter().map(|h| h.name.clone())));
+        if b.get_rec_hub() < 0 || b.get_rec_hub() as usize >= cfg.hubs.len() {
             b.set_rec_hub(0);
         }
-    }
-
-    fn new_hub(&self) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        b.set_hub_editing(0);
-        b.set_hub_name(SharedString::new());
-        b.set_hub_host(SharedString::new());
-        b.set_hub_error(SharedString::new());
-    }
-
-    fn edit_hub(&self, id: u32) {
-        let Some(hub) = self.cfg.borrow().hubs.iter().find(|h| h.id == id).cloned() else { return };
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        b.set_hub_editing(id as i32);
-        b.set_hub_name(hub.name.into());
-        b.set_hub_host(hub.host.into());
-        b.set_hub_error(SharedString::new());
-    }
-
-    fn save_hub(&self) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        let host = b.get_hub_host().trim().to_string();
-        if host.is_empty() {
-            b.set_hub_error("Enter the hub's IP address.".into());
-            return;
-        }
-        let name = match b.get_hub_name().trim() {
-            "" => "H500".to_string(),
-            n => n.to_string(),
-        };
-        let edit = b.get_hub_editing();
-        {
-            let mut cfg = self.cfg.borrow_mut();
-            let id = if edit > 0 { edit as u32 } else { cfg.next_hub_id() };
-            let hub = HubConfig { id, name, host };
-            match cfg.hubs.iter_mut().find(|h| h.id == id) {
-                Some(existing) => *existing = hub,
-                None => cfg.hubs.push(hub),
-            }
-        }
-        self.persist();
-        b.set_hub_editing(-1);
-        self.refresh_hub_lists();
-        self.refresh_found();
-        self.status("Hub saved.");
-    }
-
-    fn delete_hub(&self, id: u32) {
-        self.cfg.borrow_mut().hubs.retain(|h| h.id != id);
-        self.persist();
-        self.refresh_hub_lists();
-        self.refresh_found();
     }
 
     // ------------------------------------------------------------ Tapo cloud
@@ -1332,6 +1246,7 @@ impl App {
         self.set_mfa_code("");
         // The account may have changed: reconnect everything that uses it.
         *self.hub.borrow_mut() = HubSession::default();
+        self.player_stop();
         b.set_hub_connected(false);
         b.set_hub_message(SharedString::new());
         self.ptz.borrow_mut().clear();
@@ -1382,8 +1297,39 @@ impl App {
         self.cloud_message("Loading the cameras on your Tapo account…");
         self.rt.spawn(async move {
             let result = client.list_cameras().await;
-            on_ui(move |app| app.cloud_cameras_loaded(result));
+            let hubs = match &result {
+                Ok(_) => Some(client.list_hubs().await),
+                Err(_) => None,
+            };
+            on_ui(move |app| {
+                app.cloud_cameras_loaded(result);
+                if let Some(hubs) = hubs {
+                    app.cloud_hubs_loaded(hubs);
+                }
+            });
         });
+    }
+
+    fn cloud_hubs_loaded(&self, result: cloud::Result<Vec<CloudCamera>>) {
+        let hubs = match result {
+            Ok(hubs) => hubs,
+            Err(e) => {
+                log::warn!("could not list the hubs on the account: {e}");
+                return;
+            }
+        };
+        if hubs == self.cfg.borrow().hubs {
+            return;
+        }
+        log::info!("{} camera hub(s) on the account", hubs.len());
+        let current = self.hub.borrow().hub.clone();
+        self.cfg.borrow_mut().hubs = hubs;
+        self.persist();
+        self.refresh_hub_lists();
+        // The page's hub went away or the list changed under it.
+        if current.is_some() && self.selected_hub() != current {
+            self.connect_hub();
+        }
     }
 
     fn cloud_cameras_loaded(&self, result: cloud::Result<Vec<CloudCamera>>) {
@@ -1476,151 +1422,182 @@ impl App {
         self.show_sign_in(1, "Your Tapo session has expired. Log in again.");
     }
 
-    // ------------------------------------------------------------- discovery
-
-    fn scan(&self) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        let Some((user, pass)) = self.cloud_creds() else {
-            b.set_scan_message("Enter and save your Tapo account first.".into());
-            return;
-        };
-        let target = b.get_scan_target().trim().to_string();
-        b.set_scanning(true);
-        b.set_scan_message("Scanning…".into());
-        self.found.borrow_mut().clear();
-        self.refresh_found();
-        self.rt.spawn(async move {
-            let result = discover(user, pass, target).await;
-            on_ui(move |app| app.scan_done(result));
-        });
-    }
-
-    fn scan_done(&self, result: Result<(Vec<Found>, usize), String>) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        b.set_scanning(false);
-        match result {
-            Ok((found, failed)) => {
-                let mut msg = format!("Found {} hub(s).", found.len());
-                if failed > 0 {
-                    msg += &format!(" {failed} device(s) answered but could not be logged in to.");
-                }
-                b.set_scan_message(msg.into());
-                *self.found.borrow_mut() = found;
-            }
-            Err(e) => b.set_scan_message(format!("Scan failed: {e}").into()),
-        }
-        self.refresh_found();
-    }
-
-    fn refresh_found(&self) {
-        let cfg = self.cfg.borrow();
-        let rows: Vec<FoundRow> = self
-            .found
-            .borrow()
-            .iter()
-            .map(|f| {
-                let added = cfg.hubs.iter().any(|h| h.host == f.host);
-                FoundRow {
-                    name: f.name.as_str().into(),
-                    model: f.model.as_str().into(),
-                    host: f.host.as_str().into(),
-                    kind: if added { "hub (added)" } else { "hub" }.into(),
-                    can_add: !added,
-                }
-            })
-            .collect();
-        self.ui().global::<Bridge>().set_found(ModelRc::new(VecModel::from(rows)));
-    }
-
-    fn add_found(&self, index: usize) {
-        let Some(f) = self.found.borrow().get(index).cloned() else { return };
-        {
-            let mut cfg = self.cfg.borrow_mut();
-            let id = cfg.next_hub_id();
-            cfg.hubs.push(HubConfig { id, name: f.name.clone(), host: f.host.clone() });
-        }
-        self.persist();
-        self.refresh_hub_lists();
-        self.refresh_found();
-        self.status(format!("Added hub {}.", f.name));
-    }
-
     // ------------------------------------------------------------ recordings
 
+    fn selected_hub(&self) -> Option<CloudCamera> {
+        let index = self.ui().global::<Bridge>().get_rec_hub().max(0) as usize;
+        self.cfg.borrow().hubs.get(index).cloned()
+    }
+
+    /// Lists the selected hub's cameras, through the cloud.
     fn connect_hub(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let Some(hub) = self.cfg.borrow().hubs.get(b.get_rec_hub().max(0) as usize).cloned() else { return };
-        let Some((user, pass)) = self.cloud_creds() else {
-            b.set_hub_message("Enter and save your Tapo account in Settings first.".into());
+        let generation = {
+            let mut hub = self.hub.borrow_mut();
+            *hub = HubSession { generation: hub.generation + 1, ..Default::default() };
+            hub.generation
+        };
+        b.set_hub_connected(false);
+        b.set_hub_busy(false);
+        b.set_rec_loading(false);
+        b.set_recordings(ModelRc::default());
+        b.set_paired_names(ModelRc::default());
+        self.update_day_chips();
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+            b.set_hub_message("Sign in to your Tapo account first.".into());
             return;
         };
-        let generation = {
-            let mut hub_session = self.hub.borrow_mut();
-            *hub_session = HubSession { generation: hub_session.generation + 1, ..Default::default() };
-            hub_session.generation
+        let Some(hub) = self.selected_hub() else {
+            b.set_hub_message(
+                "There's no H500 or H200 hub on your Tapo account. If you've just added one in the Tapo app, \
+                 press ⟳ to look again."
+                    .into(),
+            );
+            return;
         };
         b.set_hub_busy(true);
-        b.set_hub_connected(false);
-        b.set_hub_message(format!("Connecting to {}…", hub.host).into());
-        b.set_recordings(ModelRc::default());
+        b.set_hub_message(format!("Asking {} for its cameras…", hub.name).into());
         self.rt.spawn(async move {
-            let result = async {
-                let handler = ApiClient::new(user, pass)
-                    .with_timeout(Duration::from_secs(20))
-                    .h500(hub.host.clone())
-                    .await?;
-                let paired = handler.get_general_device_list().await?;
-                Ok::<_, tapo::Error>((Arc::new(handler), paired))
-            }
-            .await
-            .map_err(|e| e.to_string());
-            on_ui(move |app| app.hub_connected(generation, result));
+            let result = client.hub_cameras(&hub).await;
+            on_ui(move |app| app.hub_connected(generation, hub, result));
         });
     }
 
-    fn hub_connected(
-        &self,
-        generation: u64,
-        result: Result<(Arc<CameraHubHandler>, Vec<GeneralDeviceHubResult>), String>,
-    ) {
+    fn hub_connected(&self, generation: u64, hub: CloudCamera, result: cloud::Result<Vec<HubCamera>>) {
         if self.hub.borrow().generation != generation {
             return;
         }
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_hub_busy(false);
-        match result {
-            Ok((handler, paired)) => {
-                b.set_hub_message(format!("Connected · {} camera(s) paired", paired.len()).into());
-                b.set_paired_names(string_model(paired.iter().map(|p| format!("{} ({})", p.alias, p.device_model))));
-                b.set_rec_camera(0);
-                b.set_hub_connected(true);
-                let mut hub = self.hub.borrow_mut();
-                hub.handler = Some(handler);
-                hub.paired = paired;
+        let cameras = match result {
+            Ok(cameras) => cameras,
+            Err(e) => {
+                if e.is_auth() {
+                    self.cloud_auth_failed();
+                }
+                b.set_hub_message(format!("Could not reach {}: {e}", hub.name).into());
+                return;
             }
-            Err(e) => b.set_hub_message(format!("Could not connect: {e}").into()),
+        };
+        b.set_hub_message(match cameras.len() {
+            0 => "No cameras are paired with this hub yet (pair them in the Tapo app).".into(),
+            1 => "1 camera".into(),
+            n => format!("{n} cameras").into(),
+        });
+        b.set_paired_names(string_model(cameras.iter().map(|c| {
+            if c.hub_storage { c.name.clone() } else { format!("{} (not recording to the hub)", c.name) }
+        })));
+        // A camera that records to the hub, unless one was asked for.
+        let first = cameras.iter().position(|c| c.hub_storage).unwrap_or(0);
+        b.set_rec_camera(first as i32);
+        b.set_hub_connected(!cameras.is_empty());
+        {
+            let mut session = self.hub.borrow_mut();
+            session.hub = Some(hub);
+            session.cameras = cameras;
         }
         if self.pending_rec_camera.borrow().is_some() {
             self.select_pending_rec_camera();
         } else {
-            self.load_recordings();
+            self.camera_picked();
         }
+    }
+
+    /// The hub card on Home: its recordings.
+    fn open_hub(&self, index: i32) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_rec_hub() != index {
+            b.set_rec_hub(index);
+            self.connect_hub();
+        }
+        self.navigate(Page::Recordings); // connects, if it hasn't yet
+    }
+
+    /// "Playback & Download" in the camera view: this camera's recordings on
+    /// the hub.
+    fn open_playback(&self) {
+        let Some((id, _)) = *self.single.borrow() else { return };
+        let wanted = self.cfg.borrow().camera(id).map(|c| {
+            (c.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default(), c.name.clone())
+        });
+        self.navigate(Page::Recordings);
+        if self.cfg.borrow().hubs.is_empty() {
+            self.status("Recordings are played from the H500 hub, and there's none on your Tapo account.");
+            return;
+        }
+        *self.pending_rec_camera.borrow_mut() = wanted;
+        // Like the Tapo app: start from today's recordings.
+        *self.rec_date.borrow_mut() = Local::now().date_naive();
+        self.update_rec_date_label();
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_hub_connected() {
+            self.select_pending_rec_camera();
+        } else if !b.get_hub_busy() {
+            self.connect_hub();
+        }
+    }
+
+    fn select_pending_rec_camera(&self) {
+        let Some((device_id, name)) = self.pending_rec_camera.borrow_mut().take() else { return };
+        let index = {
+            let hub = self.hub.borrow();
+            hub.cameras
+                .iter()
+                .position(|c| !device_id.is_empty() && c.device_id == device_id)
+                .or_else(|| hub.cameras.iter().position(|c| same_name(&c.name, &name)))
+        };
+        match index {
+            Some(i) => self.ui().global::<Bridge>().set_rec_camera(i as i32),
+            None => self.status(format!("{name} isn't paired with this hub; pick a camera.")),
+        }
+        self.camera_picked();
+    }
+
+    fn selected_rec_camera(&self) -> Option<HubCamera> {
+        let index = self.ui().global::<Bridge>().get_rec_camera().max(0) as usize;
+        self.hub.borrow().cameras.get(index).cloned()
+    }
+
+    fn camera_picked(&self) {
+        self.hub.borrow_mut().days.clear();
+        self.load_recordings();
+        self.load_days();
     }
 
     fn change_day(&self, delta: i32) {
         let today = Local::now().date_naive();
-        let mut date = self.rec_date.borrow_mut();
-        *date = match delta {
+        let before = *self.rec_date.borrow();
+        let date = match delta {
             0 => today,
-            d => (*date + chrono::Duration::days(d as i64)).min(today),
+            d => (before + chrono::Duration::days(d as i64)).min(today),
         };
-        drop(date);
+        self.set_rec_date(date);
+    }
+
+    /// A day in the week strip (0 = Monday).
+    fn pick_day(&self, index: i32) {
+        let date = week_start(*self.rec_date.borrow()) + chrono::Duration::days(index as i64);
+        if date <= Local::now().date_naive() {
+            self.set_rec_date(date);
+        }
+    }
+
+    fn set_rec_date(&self, date: NaiveDate) {
+        let before = self.rec_date.replace(date);
         self.update_rec_date_label();
-        self.load_recordings();
+        self.update_day_chips();
+        if date != before {
+            self.load_recordings();
+        }
+        // The days fetched cover four weeks before the one shown.
+        let covered = self.hub.borrow().days_request > 0 && week_start(date) >= week_start(before) - chrono::Duration::days(21);
+        if !covered || week_start(date) > week_start(before) {
+            self.load_days();
+        }
     }
 
     fn update_rec_date_label(&self) {
@@ -1633,38 +1610,93 @@ impl App {
         self.ui().global::<Bridge>().set_rec_date(label.into());
     }
 
+    /// The week strip: the week of the selected day, marking days with
+    /// recordings.
+    fn update_day_chips(&self) {
+        let date = *self.rec_date.borrow();
+        let today = Local::now().date_naive();
+        let start = week_start(date);
+        let days = self.hub.borrow().days.clone();
+        let chips: Vec<DayChip> = (0..7)
+            .map(|i| {
+                let day = start + chrono::Duration::days(i);
+                DayChip {
+                    weekday: day.format("%a").to_string().into(),
+                    day: day.day().to_string().into(),
+                    has_video: days.contains(&day),
+                    selected: day == date,
+                    future: day > today,
+                }
+            })
+            .collect();
+        self.ui().global::<Bridge>().set_rec_days(ModelRc::new(VecModel::from(chips)));
+    }
+
+    /// Which days around the selected one have recordings.
+    fn load_days(&self) {
+        let (Some(client), Some(hub), Some(camera)) = (
+            self.cloud_client(),
+            self.hub.borrow().hub.clone(),
+            self.selected_rec_camera(),
+        ) else {
+            return;
+        };
+        let request = {
+            let mut session = self.hub.borrow_mut();
+            session.days_request += 1;
+            session.days_request
+        };
+        let date = *self.rec_date.borrow();
+        let from = week_start(date) - chrono::Duration::days(28);
+        let to = (week_start(date) + chrono::Duration::days(6)).min(Local::now().date_naive());
+        self.rt.spawn(async move {
+            let result = client.hub_recording_days(&hub, &camera.device_id, from, to).await;
+            on_ui(move |app| app.days_loaded(request, result));
+        });
+    }
+
+    fn days_loaded(&self, request: u64, result: cloud::Result<Vec<NaiveDate>>) {
+        if self.hub.borrow().days_request != request {
+            return;
+        }
+        match result {
+            Ok(days) => self.hub.borrow_mut().days = days,
+            // The clip list says what's wrong; the strip just has no marks.
+            Err(e) => log::warn!("could not list the days with recordings: {e}"),
+        }
+        self.update_day_chips();
+    }
+
     fn load_recordings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let (handler, device_id, request) = {
-            let mut hub = self.hub.borrow_mut();
-            let Some(handler) = hub.handler.clone() else { return };
-            let Some(cam) = hub.paired.get(b.get_rec_camera().max(0) as usize) else {
-                b.set_recordings(ModelRc::default());
-                return;
-            };
-            let device_id = cam.device_id.clone();
-            hub.rec_request += 1;
-            hub.recordings.clear();
-            (handler, device_id, hub.rec_request)
+        let (Some(client), Some(hub), Some(camera)) = (
+            self.cloud_client(),
+            self.hub.borrow().hub.clone(),
+            self.selected_rec_camera(),
+        ) else {
+            b.set_recordings(ModelRc::default());
+            return;
+        };
+        let request = {
+            let mut session = self.hub.borrow_mut();
+            session.rec_request += 1;
+            session.clips.clear();
+            session.rec_request
         };
         let date = *self.rec_date.borrow();
-        let start = Local
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
-            .earliest()
-            .unwrap_or_else(Local::now)
-            .with_timezone(&Utc);
-        let end = start + chrono::Duration::days(1) - chrono::Duration::seconds(1);
-
+        let (start, end) = local_day(date);
+        let player_id = self.player_id.clone();
         b.set_rec_loading(true);
         b.set_recordings(ModelRc::default());
+        b.set_rec_message(SharedString::new());
         self.rt.spawn(async move {
-            let result = handler.get_recordings(device_id, start, end).await.map_err(|e| e.to_string());
+            let result = client.hub_clips(&hub, &camera.device_id, start, end, &player_id).await;
             on_ui(move |app| app.recordings_loaded(request, result));
         });
     }
 
-    fn recordings_loaded(&self, request: u64, result: Result<Vec<RecordingHubResult>, String>) {
+    fn recordings_loaded(&self, request: u64, result: cloud::Result<Vec<Clip>>) {
         if self.hub.borrow().rec_request != request {
             return;
         }
@@ -1672,127 +1704,234 @@ impl App {
         let b = ui.global::<Bridge>();
         b.set_rec_loading(false);
         match result {
-            Ok(mut recs) => {
-                recs.sort_by_key(|r| std::cmp::Reverse(r.start_time)); // newest first
-                let rows: Vec<RecRow> = recs
-                    .iter()
-                    .map(|r| RecRow {
-                        time: format!(
-                            "{} – {}",
-                            r.start_time.with_timezone(&Local).format("%H:%M:%S"),
-                            r.end_time.with_timezone(&Local).format("%H:%M:%S")
-                        )
-                        .into(),
-                        kind: humanize(&format!("{:?}", r.video_type)).into(),
-                        duration: fmt_duration((r.end_time - r.start_time).num_seconds().max(0) as u64).into(),
-                    })
-                    .collect();
-                b.set_recordings(ModelRc::new(VecModel::from(rows)));
-                b.set_hub_message(format!("{} recording(s)", recs.len()).into());
-                self.hub.borrow_mut().recordings = recs;
+            Ok(mut clips) => {
+                clips.reverse(); // newest first
+                let total: i64 = clips.iter().map(Clip::seconds).sum();
+                b.set_rec_message(match clips.len() {
+                    0 => SharedString::new(),
+                    n => format!("{n} recording(s) · {}", fmt_duration(total as u64)).into(),
+                });
+                self.hub.borrow_mut().clips = clips;
             }
-            Err(e) => b.set_hub_message(format!("Could not list recordings: {e}").into()),
+            Err(e) => {
+                if e.is_auth() {
+                    self.cloud_auth_failed();
+                }
+                b.set_rec_message(format!("Could not list the recordings: {e}").into());
+            }
         }
+        self.refresh_rec_rows();
     }
 
-    fn download(&self, index: usize) {
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
-        let (handler, cam, rec) = {
-            let hub = self.hub.borrow();
-            let (Some(handler), Some(cam), Some(rec)) = (
-                hub.handler.clone(),
-                hub.paired.get(b.get_rec_camera().max(0) as usize).cloned(),
-                hub.recordings.get(index).cloned(),
-            ) else {
+    fn refresh_rec_rows(&self) {
+        let Some(camera) = self.selected_rec_camera() else { return };
+        let playing = self.playing.borrow().as_ref().map(|p| (p.camera_id.clone(), p.clip));
+        let rows: Vec<RecRow> = self
+            .hub
+            .borrow()
+            .clips
+            .iter()
+            .map(|clip| RecRow {
+                time: format!("{} – {}", local_time(clip.start).format("%H:%M:%S"), local_time(clip.end).format("%H:%M:%S"))
+                    .into(),
+                kind: cloud::clip_kind(clip.kind).into(),
+                duration: fmt_duration(clip.seconds() as u64).into(),
+                playing: playing.as_ref().is_some_and(|(id, c)| *id == camera.device_id && c == clip),
+                saved: is_saved(&clip_path(&camera, clip)),
+            })
+            .collect();
+        self.ui().global::<Bridge>().set_recordings(ModelRc::new(VecModel::from(rows)));
+    }
+
+    fn clip_request(&self, index: usize) -> Option<ClipRequest> {
+        let hub = self.hub.borrow();
+        Some(ClipRequest {
+            hub: hub.hub.clone()?,
+            camera: self.selected_rec_camera()?,
+            clip: *hub.clips.get(index)?,
+            player_id: self.player_id.clone(),
+        })
+    }
+
+    /// Plays a recording in the app: the saved copy if there is one, otherwise
+    /// through the cloud, saving it as it comes.
+    fn play_clip(&self, index: usize) {
+        let Some(request) = self.clip_request(index) else { return };
+        self.start_player(request);
+    }
+
+    fn start_player(&self, request: ClipRequest) {
+        let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
+            self.status("ffmpeg not found: playing recordings needs it (see Settings › Video & display).");
+            return;
+        };
+        let path = clip_path(&request.camera, &request.clip);
+        let source = if is_saved(&path) {
+            Source::File(path.clone())
+        } else {
+            let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+                self.status("Sign in to your Tapo account first.");
                 return;
             };
-            (handler, cam, rec)
+            Source::Cloud { client, request: Box::new(request.clone()), path: path.clone() }
         };
-        let local_start = rec.start_time.with_timezone(&Local);
-        let path = config::recordings_dir()
-            .join(format!("{}_{}.ts", file_safe(&cam.alias), local_start.format("%Y-%m-%d_%H-%M-%S")));
-        let label = format!("{} · {}", cam.alias, local_start.format("%d %b %H:%M:%S"));
+        let title = format!("{} · {}", request.camera.name, local_time(request.clip.start).format("%a %d %b, %H:%M:%S"));
+        // Stop the previous recording before starting this one.
+        *self.playing.borrow_mut() = None;
+        let player = Player::start(&self.rt, ffmpeg, source, || on_ui(|app| app.player_changed()));
+        *self.playing.borrow_mut() = Some(Playing {
+            player,
+            camera_id: request.camera.device_id.clone(),
+            clip: request.clip,
+            path,
+            request,
+            shown_version: 0,
+            started: None,
+            shown_position: String::new(),
+        });
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_player_open(true);
+        b.set_player_has_frame(false);
+        b.set_player_frame(Image::default());
+        b.set_player_title(title.into());
+        b.set_player_position(SharedString::new());
+        self.player_changed();
+        self.refresh_rec_rows();
+    }
 
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
-            self.downloads.push(DownloadRow {
-                label: label.into(),
-                status: "Already downloaded".into(),
-                path: path.display().to_string().into(),
-                done: true,
-            });
-            open_path(&path);
+    /// The player's download or playback moved on.
+    pub fn player_changed(&self) {
+        let (state, total, path) = {
+            let playing = self.playing.borrow();
+            let Some(p) = playing.as_ref() else { return };
+            let state = p.player.state.lock().unwrap().clone();
+            (state, p.clip.seconds(), p.path.clone())
+        };
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let mut status = state.message.clone();
+        if state.downloading && state.downloaded > 0.0 {
+            status += &format!(" {} of {}", fmt_duration(state.downloaded as u64), fmt_duration(total as u64));
+        }
+        b.set_player_status(status.into());
+        b.set_player_busy(state.downloading);
+        b.set_player_ended(state.ended);
+        let saved = state.saved.is_some() || is_saved(&path);
+        let was_saved = !b.get_player_file().is_empty();
+        b.set_player_file(if saved { path.display().to_string().into() } else { SharedString::new() });
+        if saved != was_saved {
+            self.refresh_rec_rows();
+        }
+    }
+
+    fn pump_player(&self, b: &Bridge) {
+        let mut playing = self.playing.borrow_mut();
+        let Some(p) = playing.as_mut() else { return };
+        {
+            let slot = p.player.slot.lock().unwrap();
+            if slot.version != p.shown_version {
+                if let Some(frame) = slot.frame.clone() {
+                    b.set_player_frame(Image::from_rgb8(frame));
+                    b.set_player_has_frame(true);
+                }
+                p.shown_version = slot.version;
+                p.started.get_or_insert_with(Instant::now);
+            }
+        }
+        let ended = p.player.state.lock().unwrap().ended;
+        let Some(started) = p.started else { return };
+        if ended {
+            return; // keep the last position
+        }
+        let total = p.clip.seconds();
+        let position = format!("{} / {}", clock(started.elapsed().as_secs().min(total as u64)), clock(total as u64));
+        if position != p.shown_position {
+            b.set_player_position(position.as_str().into());
+            p.shown_position = position;
+        }
+    }
+
+    fn player_stop(&self) {
+        *self.playing.borrow_mut() = None;
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_player_open(false);
+        b.set_player_frame(Image::default());
+        b.set_player_has_frame(false);
+        b.set_player_file(SharedString::new());
+        self.refresh_rec_rows();
+    }
+
+    fn player_replay(&self) {
+        let request = self.playing.borrow().as_ref().map(|p| p.request.clone());
+        if let Some(request) = request {
+            self.start_player(request);
+        }
+    }
+
+    /// Saves a recording without playing it.
+    fn download(&self, index: usize) {
+        let Some(request) = self.clip_request(index) else { return };
+        let path = clip_path(&request.camera, &request.clip);
+        let label = format!("{} · {}", request.camera.name, local_time(request.clip.start).format("%d %b %H:%M:%S"));
+        if is_saved(&path) {
+            self.push_download(label, "Already saved".into(), &path, true);
             return;
         }
-
-        let row = self.downloads.row_count();
-        self.downloads.push(DownloadRow {
-            label: label.into(),
-            status: "Downloading…".into(),
-            path: path.display().to_string().into(),
-            done: false,
-        });
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+            self.status("Sign in to your Tapo account first.");
+            return;
+        };
+        let row = self.push_download(label, "Asking the hub for the recording…".into(), &path, false);
+        let total = request.clip.seconds() as u64;
         self.rt.spawn(async move {
-            let result = async {
-                use tokio::io::AsyncWriteExt;
-                tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-                let mut file = tokio::fs::File::create(&path).await?;
-                let r = handler.download_recording(cam.device_id, rec.start_time, rec.end_time, &mut file).await?;
-                file.flush().await?;
-                Ok::<_, anyhow::Error>(r)
-            }
-            .await;
-            if result.is_err() {
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-            on_ui(move |app| {
-                let Some(mut d) = app.downloads.row_data(row) else { return };
-                match result {
-                    Ok(r) => {
-                        let mb = r.byte_count as f64 / 1_048_576.0;
-                        d.status = match r.duration_s {
-                            Some(s) => format!("Done · {mb:.1} MB · {}", fmt_duration(s as u64)),
-                            None => format!("Done · {mb:.1} MB"),
-                        }
-                        .into();
-                        d.done = true;
-                        open_path(&path);
-                    }
-                    Err(e) => d.status = format!("Failed: {e:#}").into(),
+            let mut last = Instant::now();
+            let mut progress = |p: clip::Progress| {
+                if last.elapsed() >= Duration::from_millis(500) {
+                    last = Instant::now();
+                    let text = format!("Downloading… {} of {}", fmt_duration(p.seconds as u64), fmt_duration(total));
+                    on_ui(move |app| app.set_download_status(row, text, false));
                 }
-                app.downloads.set_row_data(row, d);
+            };
+            let result = crate::player::save_clip(&client, &request, &path, None, &mut progress).await;
+            let (text, done) = match &result {
+                Ok(()) => {
+                    let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+                    (format!("Saved · {mb:.1} MB"), true)
+                }
+                Err(e) => (format!("Failed: {e:#}"), false),
+            };
+            let auth = result.as_ref().err().and_then(|e| e.downcast_ref::<cloud::CloudError>()).is_some_and(|e| e.is_auth());
+            on_ui(move |app| {
+                app.set_download_status(row, text, done);
+                if auth {
+                    app.cloud_auth_failed();
+                }
+                app.refresh_rec_rows();
             });
         });
     }
-}
 
-async fn discover(user: String, pass: String, target: String) -> Result<(Vec<Found>, usize), String> {
-    let mut discovery = ApiClient::new(user, pass)
-        .discover_devices(target, 5)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut found = Vec::new();
-    let mut failed = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    while let Ok(Some(item)) = tokio::time::timeout_at(deadline, discovery.next()).await {
-        match item {
-            // Cameras come from the Tapo account; only hubs need an address.
-            Ok(r) if r.device_type() == DeviceType::CameraHub => {
-                let (host, _port) = r.address();
-                let name = match r.nickname() {
-                    "" => r.model().to_string(),
-                    n => n.to_string(),
-                };
-                found.push(Found { name, model: r.model().to_string(), host });
-            }
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!("discovery: {e}");
-                failed += 1;
-            }
-        }
+    fn push_download(&self, label: String, status: String, path: &Path, done: bool) -> usize {
+        self.downloads.push(DownloadRow {
+            label: label.into(),
+            status: status.into(),
+            path: path.display().to_string().into(),
+            done,
+        });
+        self.downloads.row_count() - 1
     }
-    Ok((found, failed))
+
+    fn set_download_status(&self, row: usize, status: String, done: bool) {
+        let Some(mut d) = self.downloads.row_data(row) else { return };
+        if d.done && !done {
+            return; // a late progress update
+        }
+        d.status = status.into();
+        d.done = done;
+        self.downloads.set_row_data(row, d);
+    }
 }
 
 fn mfa_index(method: MfaMethod) -> i32 {
@@ -1855,18 +1994,49 @@ fn file_safe(name: &str) -> String {
     if s.is_empty() { "camera".into() } else { s }
 }
 
-/// "LineCrossing" -> "Line crossing"
-fn humanize(variant: &str) -> String {
-    let mut out = String::new();
-    for (i, c) in variant.chars().enumerate() {
-        if c.is_uppercase() && i > 0 {
-            out.push(' ');
-            out.extend(c.to_lowercase());
-        } else {
-            out.push(c);
-        }
+/// "H500" for the Home card and the list.
+fn hub_detail(hub: &CloudCamera) -> String {
+    match hub.model.trim() {
+        "" => "Hub".into(),
+        model => model.split('(').next().unwrap_or(model).trim().to_string(),
     }
-    out
+}
+
+/// Monday of `date`'s week.
+fn week_start(date: NaiveDate) -> NaiveDate {
+    date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64)
+}
+
+/// The day's first and last second (this PC's time zone), as Unix time.
+fn local_day(date: NaiveDate) -> (i64, i64) {
+    let midnight = |d: NaiveDate| {
+        Local.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().map(|t| t.timestamp())
+    };
+    let start = midnight(date).unwrap_or_else(|| date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp());
+    let end = midnight(date + chrono::Duration::days(1)).unwrap_or(start + 86_400) - 1;
+    (start, end)
+}
+
+fn local_time(unix: i64) -> chrono::DateTime<Local> {
+    Local.timestamp_opt(unix, 0).single().unwrap_or_else(Local::now)
+}
+
+/// Where a recording is saved: `Videos\TapoViewer\<camera>_<start>.ts`.
+fn clip_path(camera: &HubCamera, clip: &Clip) -> PathBuf {
+    let start = local_time(clip.start).format("%Y-%m-%d_%H-%M-%S");
+    config::recordings_dir().join(format!("{}_{start}.ts", file_safe(&camera.name)))
+}
+
+fn is_saved(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > 0)
+}
+
+/// "1:05", "1:02:03"
+fn clock(secs: u64) -> String {
+    match secs {
+        s if s >= 3600 => format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60),
+        s => format!("{}:{:02}", s / 60, s % 60),
+    }
 }
 
 fn fmt_duration(secs: u64) -> String {
@@ -1906,9 +2076,16 @@ mod tests {
 
     #[test]
     fn helpers() {
-        assert_eq!(humanize("LineCrossing"), "Line crossing");
-        assert_eq!(humanize("Motion"), "Motion");
         assert_eq!(fmt_duration(65), "1m 05s");
+        assert_eq!(clock(65), "1:05");
+        assert_eq!(clock(3723), "1:02:03");
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        assert_eq!(week_start(NaiveDate::from_ymd_opt(2026, 11, 22).unwrap()), monday);
+        assert_eq!(week_start(monday), monday);
+        let (start, end) = local_day(monday);
+        assert!((82_799..=90_000).contains(&(end - start)), "{}", end - start);
+        let hub = CloudCamera { model: "H500(EU)".into(), ..Default::default() };
+        assert_eq!(hub_detail(&hub), "H500");
         assert_eq!(fmt_duration(3700), "1h 01m");
         assert_eq!(file_safe("Front door/1"), "Front_door_1");
     }
