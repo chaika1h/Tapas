@@ -9,16 +9,19 @@ A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, wr
 - **Pan/tilt** and **presets** for C2xx/C5xx/TC40/TC70 cameras (arrow keys work too).
 - **H500 recordings**: browse each paired camera's clips by day, download and play them.
 - **Find devices** on the network and add them in one click.
+- **Live view from anywhere** through the Tapo cloud, like the Tapo app (optional, see below).
 - **Snapshots** to `Pictures\TapoViewer`.
 - Passwords are encrypted with Windows DPAPI, so they only work for your Windows user.
 
 ## How it talks to the devices
 
-Everything stays on the local network; nothing goes through TP-Link's cloud servers.
+By default everything stays on the local network and nothing goes through TP-Link's cloud
+servers. Only the optional cloud live view uses the cloud.
 
 | Feature | Protocol | Credentials |
 |---|---|---|
 | Live video | RTSP from each camera, port 554 | **Camera account** (per camera) |
+| Live video from anywhere (optional) | Tapo cloud video relay (HTTPS) | **Tapo app login** |
 | Pan/tilt, presets, discovery, H500 recordings | Tapo local API | **Tapo app login** (email + password) |
 
 The **camera account** is created in the Tapo app on your phone: open the camera, then
@@ -29,9 +32,33 @@ add them as cameras for live view. The hub itself is only used for the recording
 
 ### Access from outside the office
 
-The app talks to the devices directly, so it needs to be on the same network as them. TP-Link
-has no public cloud API for video, and the Tapo app's remote viewing uses a private relay protocol.
-To use Tapo Viewer from home or on the road, put the PC on the office network over a VPN:
+There are two ways to watch the cameras when the PC isn't on their network.
+
+**Live view through the Tapo cloud (built in).** The video comes through TP-Link's cloud relay,
+the way the Tapo app shows it away from home, so it needs no VPN, port forwarding or office PC.
+Under *Settings › Live view through the Tapo cloud*:
+
+1. Save your Tapo account under *Tapo account*, then press **Sign in**. The first time, Tapo asks
+   for a verification code, sent to the Tapo app or by email. The PC is remembered after that.
+2. The cameras on the account are linked to the ones you already have (by name) and the rest are
+   added. To link a camera by hand, edit it and pick its *Tapo cloud camera*.
+3. Set *Live view* to **Tapo cloud** on PCs away from the office. Leave it on **Local network** on
+   PCs in the office. Cameras without an IP address always use the cloud.
+
+The grid uses the cameras' sub-stream and the single view their HD stream. Only live video goes
+through the cloud: pan/tilt and H500 recordings still need the local network (or the VPN below).
+The PC saves the session token, encrypted like the passwords; the Tapo password isn't sent
+anywhere else. If the session expires, the app signs in again by itself. If Tapo then asks for a
+code, sign in again under *Settings*.
+
+This uses TP-Link's private, undocumented service, ported from the MIT-licensed
+[Topo](https://github.com/filirnd/topo) and [Topo TV](https://github.com/abdulmominsakib/tapo-android-tv)
+projects (see `src/cloud.rs`). TP-Link can change it at any time. If cloud live view stops working
+after a Tapo app update, the protocol has probably changed. Cameras that send encrypted video
+through the cloud aren't supported yet; their tile says so.
+
+**A VPN to the office network.** Live view, pan/tilt and H500 recordings then work exactly as in
+the office. Put the PC on the office network over a VPN:
 
 - **Tailscale** (simplest): install it on one always-on machine at the office (a mini PC,
   Raspberry Pi or NAS) and enable it as a
@@ -125,6 +152,22 @@ python3 tools/fake_camera.py --port 8554
 
 Add a camera with IP `127.0.0.1`, port `8554`, user `viewer` and password `secret`.
 
+`tools/fake_cloud.py` is a fake Tapo cloud and video relay for testing cloud live view without
+an account. It checks request signatures like the real cloud, redirects to a "regional" server,
+can ask for a verification code (`--mfa`, code `123456`) and can expire sessions
+(`--expire-after 60`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
+pointed at it:
+
+```bash
+python3 tools/fake_cloud.py --certs target/fake-cloud --mfa
+```
+
+```bash
+TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
+```
+
+Sign in with any email and the password `secret`. "Back yard" is reported offline.
+
 ## Troubleshooting
 
 - **"Camera account username/password rejected"**: re-check the camera account in the Tapo app.
@@ -134,9 +177,17 @@ Add a camera with IP `127.0.0.1`, port `8554`, user `viewer` and password `secre
 - **"Camera has no built-in MJPEG stream"**: switch that camera's grid stream to SD (ffmpeg).
 - **Pan/tilt or hub login fails**: check the Tapo account under *Settings*. Cameras on very new
   firmware may need a newer version of the `tapo` crate.
+- **Cloud live view: "Camera is offline"**: the cloud can't reach the camera; check it in the
+  Tapo app.
+- **Cloud live view: "The cloud relay refused the stream (code …)"** or **sign-in refused**:
+  TP-Link may have changed its service. Raising `APP_VERSION` in `src/cloud.rs` to the current
+  Tapo app version is the first thing to try. The log (see *Files*) has the details.
 
 ## License notes
 
 Slint is used under its Royalty-free License, which requires showing attribution (the "Made with
 Slint" badge, or a mention in the About information). The MJPEG depacketizing approach comes from
-the MIT-licensed `tapo` crate.
+the MIT-licensed `tapo` crate. The Tapo cloud client (`src/cloud.rs`, `src/relay.rs`) is a port
+of the MIT-licensed [Topo](https://github.com/filirnd/topo) and
+[Topo TV](https://github.com/abdulmominsakib/tapo-android-tv) projects. `certs/tapo-cloud-roots.pem`
+holds TP-Link's two public root certificates, as shipped by those projects.

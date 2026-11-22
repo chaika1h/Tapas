@@ -2,7 +2,7 @@
 //! work (streams, PTZ, discovery, hub). All of it lives on the UI thread;
 //! background tasks report back through [`on_ui`].
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,10 +15,11 @@ use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 use tapo::responses::{GeneralDeviceHubResult, RecordingHubResult};
 use tapo::{ApiClient, CameraHubHandler, DeviceType};
 
-use crate::config::{self, AppConfig, CameraConfig, HubConfig, Quality, Renderer};
+use crate::cloud::{self, CloudCamera, CloudClient, Login, MfaChallenge, MfaMethod, Session};
+use crate::config::{self, AppConfig, CameraConfig, HubConfig, LiveSource, Quality, Renderer};
 use crate::ptz::{Ptz, PtzCmd};
 use crate::secret::Secret;
-use crate::stream::{StreamHandle, StreamSpec};
+use crate::stream::{CloudTarget, StreamHandle, StreamSpec};
 use crate::{
     Bridge, CameraRow, DownloadRow, FoundRow, HubRow, MainWindow, Page, PresetRow, RecRow, Tile,
 };
@@ -79,6 +80,15 @@ struct HubSession {
     rec_request: u64,
 }
 
+/// A Tapo cloud sign-in waiting for its verification code.
+struct PendingMfa {
+    challenge: MfaChallenge,
+    user: String,
+    pass: String,
+    /// Where the code was sent, once it has been.
+    method: Option<MfaMethod>,
+}
+
 pub struct App {
     ui: slint::Weak<MainWindow>,
     rt: tokio::runtime::Handle,
@@ -96,6 +106,14 @@ pub struct App {
     status_until: RefCell<Option<Instant>>,
     last_grid_size: RefCell<(usize, i32, i32)>,
     timer: slint::Timer,
+    /// The Tapo cloud client, or why it couldn't be set up.
+    cloud: Result<Arc<CloudClient>, String>,
+    /// Cameras on the Tapo account, from the last list.
+    cloud_cameras: RefCell<Vec<CloudCamera>>,
+    /// The account cameras behind the camera form's "Tapo cloud camera" list.
+    cloud_choices: RefCell<Vec<CloudCamera>>,
+    pending_mfa: RefCell<Option<PendingMfa>>,
+    last_relogin: Cell<Option<Instant>>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -110,8 +128,22 @@ macro_rules! cb {
     }};
 }
 
-pub fn install(ui: &MainWindow, cfg: AppConfig, rt: tokio::runtime::Handle) {
+pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) {
     let ffmpeg = crate::ffmpeg::find(&cfg.ffmpeg_path);
+    let new_terminal = cfg.cloud.terminal_uuid.is_empty();
+    if new_terminal {
+        cfg.cloud.terminal_uuid = uuid::Uuid::new_v4().to_string();
+    }
+    let cloud = CloudClient::new(cfg.cloud.terminal_uuid.clone()).map(Arc::new).map_err(|e| e.to_string());
+    match &cloud {
+        Ok(client) => {
+            let token = cfg.cloud.token.reveal();
+            if !token.is_empty() && !cfg.cloud.base_url.is_empty() {
+                client.set_session(Some(Session { base_url: cfg.cloud.base_url.clone(), token }));
+            }
+        }
+        Err(e) => log::error!("Tapo cloud unavailable: {e}"),
+    }
     let app = Rc::new(App {
         ui: ui.as_weak(),
         rt,
@@ -129,13 +161,22 @@ pub fn install(ui: &MainWindow, cfg: AppConfig, rt: tokio::runtime::Handle) {
         status_until: RefCell::default(),
         last_grid_size: RefCell::default(),
         timer: slint::Timer::default(),
+        cloud,
+        cloud_cameras: RefCell::default(),
+        cloud_choices: RefCell::default(),
+        pending_mfa: RefCell::default(),
+        last_relogin: Cell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
+    if new_terminal {
+        app.persist();
+    }
 
     let b = ui.global::<Bridge>();
     b.set_tiles(app.tiles.clone().into());
     b.set_downloads(app.downloads.clone().into());
     b.set_quality_labels(string_model(Quality::LABELS.iter().copied()));
+    b.set_live_source_labels(string_model(LiveSource::LABELS.iter().copied()));
 
     b.on_navigate(cb!(&app, |a, page| a.navigate(page)));
     b.on_toggle_fullscreen(cb!(&app, |a| a.toggle_fullscreen()));
@@ -149,6 +190,12 @@ pub fn install(ui: &MainWindow, cfg: AppConfig, rt: tokio::runtime::Handle) {
     b.on_ptz_refresh(cb!(&app, |a| a.ptz_send(PtzCmd::Refresh)));
 
     b.on_save_settings(cb!(&app, |a| a.save_settings()));
+    b.on_live_source_changed(cb!(&app, |a, i| a.live_source_changed(i)));
+    b.on_cloud_sign_in(cb!(&app, |a| a.cloud_sign_in()));
+    b.on_cloud_send_code(cb!(&app, |a, m| a.cloud_send_code(m)));
+    b.on_cloud_verify(cb!(&app, |a| a.cloud_verify()));
+    b.on_cloud_sign_out(cb!(&app, |a| a.cloud_sign_out()));
+    b.on_cloud_refresh(cb!(&app, |a| a.cloud_refresh()));
     b.on_new_camera(cb!(&app, |a| a.new_camera(CameraConfig::default())));
     b.on_edit_camera(cb!(&app, |a, id| a.edit_camera(id as u32)));
     b.on_save_camera(cb!(&app, |a| a.save_camera()));
@@ -169,6 +216,7 @@ pub fn install(ui: &MainWindow, cfg: AppConfig, rt: tokio::runtime::Handle) {
     b.on_show_in_folder(|p| show_in_folder(Path::new(p.as_str())));
 
     app.load_settings_into_ui();
+    app.refresh_cloud_ui();
     app.refresh_camera_lists();
     app.refresh_hub_lists();
     app.update_rec_date_label();
@@ -329,7 +377,28 @@ impl App {
             password: cam.password.reveal(),
             quality,
             ffmpeg: self.ffmpeg.borrow().clone(),
+            cloud: self.cloud_target(cam),
         }
+    }
+
+    fn cloud_client(&self) -> Option<Arc<CloudClient>> {
+        self.cloud.as_ref().ok().cloned()
+    }
+
+    /// Whether this camera streams through the cloud: always for cloud-only
+    /// cameras, and for linked cameras when the PC is set to use the cloud.
+    fn cloud_target(&self, cam: &CameraConfig) -> Option<CloudTarget> {
+        let camera = cam.cloud.clone()?;
+        let use_cloud = !cam.has_local() || self.cfg.borrow().live_source == LiveSource::Cloud;
+        let client = self.cloud_client()?;
+        use_cloud.then_some(CloudTarget { client, camera })
+    }
+
+    /// Reconnects every camera linked to the Tapo account.
+    fn restart_cloud_streams(&self) {
+        let ids: Vec<u32> = self.cfg.borrow().cameras.iter().filter(|c| c.cloud.is_some()).map(|c| c.id).collect();
+        self.streams.borrow_mut().retain(|k, _| !ids.contains(&k.0));
+        self.sync_streams();
     }
 
     fn restart_camera(&self, id: u32) {
@@ -396,14 +465,16 @@ impl App {
         b.set_single_frame(Image::default());
         b.set_single_has_frame(false);
         b.set_single_status("Connecting…".into());
-        b.set_single_ptz(cam.ptz);
+        // Pan/tilt goes through the camera's local API, so it needs an IP.
+        let ptz = cam.ptz && cam.has_local();
+        b.set_single_ptz(ptz);
         b.set_presets(ModelRc::default());
         b.set_ptz_message(SharedString::new());
         b.set_ptz_busy(false);
         b.set_page(Page::Single);
         self.sync_streams();
 
-        if cam.ptz {
+        if ptz {
             if self.ptz.borrow().contains_key(&id) {
                 self.ptz_changed(id);
             } else {
@@ -459,7 +530,9 @@ impl App {
         let controller = match ptz.entry(id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(slot) => {
-                let Some(cam) = self.cfg.borrow().camera(id).cloned() else { return };
+                let Some(cam) = self.cfg.borrow().camera(id).cloned().filter(CameraConfig::has_local) else {
+                    return;
+                };
                 let (user, pass) = self.cloud_creds().unwrap_or_default();
                 slot.insert(Ptz::spawn(&self.rt, id, cam.host, user, pass))
             }
@@ -496,6 +569,7 @@ impl App {
         b.set_cloud_pass(cfg.cloud_password.reveal().into());
         b.set_ffmpeg_path(cfg.ffmpeg_path.as_str().into());
         b.set_renderer_index(cfg.renderer.index());
+        b.set_live_source(cfg.live_source.index());
         b.set_config_path(config::config_path().display().to_string().into());
         b.set_ffmpeg_found(
             match &*self.ffmpeg.borrow() {
@@ -524,6 +598,14 @@ impl App {
             }
         }
         self.persist();
+        let account_changed = {
+            let cfg = self.cfg.borrow();
+            !cfg.cloud.account.is_empty() && !cfg.cloud.account.eq_ignore_ascii_case(&cfg.cloud_username)
+        };
+        if account_changed {
+            self.clear_cloud_session();
+            b.set_cloud_message("Signed out of the Tapo cloud because the account changed.".into());
+        }
         *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
         // New credentials or ffmpeg: reconnect everything that uses them.
         self.ptz.borrow_mut().clear();
@@ -557,17 +639,21 @@ impl App {
             .cameras
             .iter()
             .map(|c| {
-                let mut detail = vec![
-                    if c.ptz { "pan/tilt" } else { "fixed" }.to_string(),
-                    format!("grid: {}", Quality::LABELS[c.grid_quality.index() as usize]),
-                ];
-                if c.username.is_empty() {
+                let mut detail = Vec::new();
+                if c.has_local() {
+                    detail.push(if c.ptz { "pan/tilt" } else { "fixed" }.to_string());
+                    detail.push(format!("grid: {}", Quality::LABELS[c.grid_quality.index() as usize]));
+                }
+                if let Some(link) = &c.cloud {
+                    detail.push(format!("Tapo cloud: {}", link.name));
+                }
+                if c.has_local() && c.username.is_empty() {
                     detail.push("⚠ no camera account".into());
                 }
                 CameraRow {
                     id: c.id as i32,
                     name: c.name.as_str().into(),
-                    host: c.host.as_str().into(),
+                    host: if c.has_local() { c.host.as_str() } else { "cloud only" }.into(),
                     detail: detail.join("  ·  ").into(),
                 }
             })
@@ -605,7 +691,42 @@ impl App {
         b.set_cam_pass(cam.password.reveal().into());
         b.set_cam_ptz(cam.ptz);
         b.set_cam_quality(cam.grid_quality.index());
+        self.set_cloud_choices(cam.cloud.as_ref().map(|l| l.device_id.as_str()));
         b.set_cam_error(SharedString::new());
+    }
+
+    /// Every camera the form can link to: the account's cameras from the last
+    /// list, plus any already-linked camera not in it.
+    fn known_cloud_cameras(&self) -> Vec<CloudCamera> {
+        let mut list = self.cloud_cameras.borrow().clone();
+        for cam in &self.cfg.borrow().cameras {
+            if let Some(link) = &cam.cloud
+                && !list.iter().any(|k| k.device_id == link.device_id)
+            {
+                list.push(link.clone());
+            }
+        }
+        list
+    }
+
+    /// Fills the camera form's "Tapo cloud camera" list and selects `selected`.
+    fn set_cloud_choices(&self, selected: Option<&str>) {
+        let list = self.known_cloud_cameras();
+        let labels = std::iter::once("Not linked".to_string()).chain(list.iter().map(|c| match c.model.as_str() {
+            "" => c.name.clone(),
+            model => format!("{} ({model})", c.name),
+        }));
+        let index = selected.and_then(|id| list.iter().position(|c| c.device_id == id)).map_or(0, |i| i as i32 + 1);
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_cloud_camera_labels(string_model(labels));
+        b.set_cam_cloud(index);
+        *self.cloud_choices.borrow_mut() = list;
+    }
+
+    fn selected_cloud_camera(&self) -> Option<CloudCamera> {
+        let index = self.ui().global::<Bridge>().get_cam_cloud();
+        usize::try_from(index - 1).ok().and_then(|i| self.cloud_choices.borrow().get(i).cloned())
     }
 
     fn edit_camera(&self, id: u32) {
@@ -618,16 +739,21 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         let host = b.get_cam_host().trim().to_string();
-        if host.is_empty() {
-            b.set_cam_error("Enter the camera's IP address.".into());
+        let cloud = self.selected_cloud_camera();
+        if host.is_empty() && cloud.is_none() {
+            b.set_cam_error("Enter the camera's IP address, or pick its camera on your Tapo account.".into());
             return;
         }
-        let Ok(port) = b.get_cam_port().trim().parse::<u16>() else {
-            b.set_cam_error("Port must be a number (normally 554).".into());
-            return;
+        let port = match b.get_cam_port().trim().parse::<u16>() {
+            Ok(port) => port,
+            Err(_) if host.is_empty() => 554,
+            Err(_) => {
+                b.set_cam_error("Port must be a number (normally 554).".into());
+                return;
+            }
         };
         let name = match b.get_cam_name().trim() {
-            "" => host.clone(),
+            "" => cloud.as_ref().map_or_else(|| host.clone(), |c| c.name.clone()),
             n => n.to_string(),
         };
         let edit = b.get_cam_editing();
@@ -643,6 +769,7 @@ impl App {
                 password: Secret::new(&b.get_cam_pass()),
                 ptz: b.get_cam_ptz(),
                 grid_quality: Quality::from_index(b.get_cam_quality()),
+                cloud,
             };
             match cfg.cameras.iter_mut().find(|c| c.id == id) {
                 Some(existing) => *existing = cam,
@@ -757,6 +884,292 @@ impl App {
         self.refresh_found();
     }
 
+    // ------------------------------------------------------------ Tapo cloud
+
+    fn cloud_message(&self, msg: impl Into<SharedString>) {
+        self.ui().global::<Bridge>().set_cloud_message(msg.into());
+    }
+
+    fn set_cloud_busy(&self, busy: bool) {
+        self.ui().global::<Bridge>().set_cloud_busy(busy);
+    }
+
+    fn refresh_cloud_ui(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let session = self.cloud_client().and_then(|c| c.session());
+        b.set_cloud_signed_in(session.is_some());
+        let status = match (&self.cloud, &session) {
+            (Err(e), _) => format!("Tapo cloud unavailable: {e}"),
+            (Ok(_), Some(s)) => {
+                let region = url::Url::parse(&s.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
+                let account = self.cfg.borrow().cloud.account.clone();
+                match region {
+                    Some(region) => format!("Signed in as {account} ({region})"),
+                    None => format!("Signed in as {account}"),
+                }
+            }
+            (Ok(_), None) => "Not signed in".to_string(),
+        };
+        b.set_cloud_status(status.into());
+        let pending = self.pending_mfa.borrow();
+        let methods = pending.as_ref().map(|p| p.challenge.methods.clone()).unwrap_or_default();
+        b.set_cloud_mfa(pending.is_some());
+        b.set_cloud_mfa_app(methods.contains(&MfaMethod::App));
+        b.set_cloud_mfa_email(methods.contains(&MfaMethod::Email));
+        b.set_cloud_code_sent(pending.as_ref().is_some_and(|p| p.method.is_some()));
+    }
+
+    fn live_source_changed(&self, index: i32) {
+        let source = LiveSource::from_index(index);
+        if self.cfg.borrow().live_source == source {
+            return;
+        }
+        self.cfg.borrow_mut().live_source = source;
+        self.persist();
+        self.restart_cloud_streams();
+        let signed_in = self.cloud_client().is_some_and(|c| c.session().is_some());
+        self.status(match (source, signed_in) {
+            (LiveSource::Cloud, false) => "Live view will use the Tapo cloud once you sign in.",
+            (LiveSource::Cloud, true) => "Live view now uses the Tapo cloud for cameras linked to your account.",
+            (LiveSource::Local, _) => "Live view now uses the local network.",
+        });
+    }
+
+    fn cloud_sign_in(&self) {
+        let Some(client) = self.cloud_client() else {
+            self.refresh_cloud_ui();
+            return;
+        };
+        let Some((user, pass)) = self.cloud_creds().filter(|(_, p)| !p.is_empty()) else {
+            self.cloud_message("Enter your Tapo email and password under “Tapo account” and press Save account first.");
+            return;
+        };
+        *self.pending_mfa.borrow_mut() = None;
+        self.set_cloud_busy(true);
+        self.cloud_message("Signing in…");
+        self.refresh_cloud_ui();
+        self.rt.spawn(async move {
+            let result = client.login(&user, &pass).await;
+            on_ui(move |app| app.cloud_login_done(user, pass, result));
+        });
+    }
+
+    fn cloud_login_done(&self, user: String, pass: String, result: cloud::Result<Login>) {
+        self.set_cloud_busy(false);
+        match result {
+            Ok(Login::Done(session)) => self.cloud_signed_in(user, session),
+            Ok(Login::NeedsMfa(challenge)) => {
+                *self.pending_mfa.borrow_mut() = Some(PendingMfa { challenge, user, pass, method: None });
+                self.ui().global::<Bridge>().set_cloud_code(SharedString::new());
+                self.cloud_message("Choose where Tapo should send the verification code.");
+            }
+            Err(e) => self.cloud_message(format!("Sign-in failed: {e}")),
+        }
+        self.refresh_cloud_ui();
+    }
+
+    fn cloud_send_code(&self, method: i32) {
+        let method = if method == 1 { MfaMethod::App } else { MfaMethod::Email };
+        let Some(client) = self.cloud_client() else { return };
+        let Some((challenge, user, pass)) =
+            self.pending_mfa.borrow().as_ref().map(|p| (p.challenge.clone(), p.user.clone(), p.pass.clone()))
+        else {
+            return;
+        };
+        self.set_cloud_busy(true);
+        self.cloud_message("Sending the code…");
+        self.rt.spawn(async move {
+            let result = client.request_mfa(&challenge, &user, &pass, method).await;
+            on_ui(move |app| app.cloud_code_sent(method, result));
+        });
+    }
+
+    fn cloud_code_sent(&self, method: MfaMethod, result: cloud::Result<()>) {
+        self.set_cloud_busy(false);
+        match result {
+            Ok(()) => {
+                if let Some(pending) = self.pending_mfa.borrow_mut().as_mut() {
+                    pending.method = Some(method);
+                }
+                self.cloud_message(match method {
+                    MfaMethod::App => "Code sent: open the Tapo app on your phone, then enter the code here.",
+                    MfaMethod::Email => "Code sent to your email: enter it here.",
+                });
+            }
+            Err(e) => self.cloud_message(format!("Could not send the code: {e}")),
+        }
+        self.refresh_cloud_ui();
+    }
+
+    fn cloud_verify(&self) {
+        let code = self.ui().global::<Bridge>().get_cloud_code().trim().to_string();
+        if code.is_empty() {
+            self.cloud_message("Enter the verification code.");
+            return;
+        }
+        let Some(client) = self.cloud_client() else { return };
+        let pending = self.pending_mfa.borrow().as_ref().map(|p| (p.challenge.clone(), p.user.clone(), p.method));
+        let Some((challenge, user, Some(method))) = pending else {
+            self.cloud_message("Send a code first.");
+            return;
+        };
+        self.set_cloud_busy(true);
+        self.cloud_message("Checking the code…");
+        self.rt.spawn(async move {
+            let result = client.verify_mfa(&challenge, &user, &code, method).await;
+            on_ui(move |app| app.cloud_verified(user, result));
+        });
+    }
+
+    fn cloud_verified(&self, user: String, result: cloud::Result<Session>) {
+        self.set_cloud_busy(false);
+        match result {
+            Ok(session) => self.cloud_signed_in(user, session),
+            Err(e) => self.cloud_message(format!("Verification failed: {e}")),
+        }
+        self.refresh_cloud_ui();
+    }
+
+    fn save_cloud_session(&self, user: String, session: &Session) {
+        {
+            let mut cfg = self.cfg.borrow_mut();
+            cfg.cloud.account = user;
+            cfg.cloud.base_url = session.base_url.clone();
+            cfg.cloud.token = Secret::new(&session.token);
+        }
+        self.persist();
+    }
+
+    fn cloud_signed_in(&self, user: String, session: Session) {
+        self.save_cloud_session(user, &session);
+        *self.pending_mfa.borrow_mut() = None;
+        self.ui().global::<Bridge>().set_cloud_code(SharedString::new());
+        self.refresh_cloud_ui();
+        self.restart_cloud_streams();
+        self.cloud_refresh();
+    }
+
+    /// Forgets the cloud session (camera links are kept).
+    fn clear_cloud_session(&self) {
+        if let Some(client) = self.cloud_client() {
+            client.set_session(None);
+        }
+        {
+            let mut cfg = self.cfg.borrow_mut();
+            cfg.cloud.account.clear();
+            cfg.cloud.base_url.clear();
+            cfg.cloud.token = Secret::default();
+        }
+        self.persist();
+        *self.pending_mfa.borrow_mut() = None;
+        self.refresh_cloud_ui();
+    }
+
+    fn cloud_sign_out(&self) {
+        self.clear_cloud_session();
+        self.cloud_message("Signed out of the Tapo cloud.");
+        self.restart_cloud_streams();
+    }
+
+    fn cloud_refresh(&self) {
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+            self.cloud_message("Sign in first.");
+            return;
+        };
+        self.set_cloud_busy(true);
+        self.cloud_message("Loading the cameras on your Tapo account…");
+        self.rt.spawn(async move {
+            let result = client.list_cameras().await;
+            on_ui(move |app| app.cloud_cameras_loaded(result));
+        });
+    }
+
+    fn cloud_cameras_loaded(&self, result: cloud::Result<Vec<CloudCamera>>) {
+        self.set_cloud_busy(false);
+        let list = match result {
+            Ok(list) => list,
+            Err(e) if e.is_auth() => {
+                self.cloud_session_lost();
+                return;
+            }
+            Err(e) => {
+                self.cloud_message(format!("Could not load the cameras on your Tapo account: {e}"));
+                return;
+            }
+        };
+        let (linked, added) = link_cloud_cameras(&mut self.cfg.borrow_mut().cameras, &list);
+        *self.cloud_cameras.borrow_mut() = list.clone();
+        self.persist();
+        for &id in &linked {
+            self.restart_camera(id);
+        }
+        // Keep the camera form's selection if it is open.
+        let selected = self.selected_cloud_camera().map(|c| c.device_id);
+        self.set_cloud_choices(selected.as_deref());
+        self.refresh_camera_lists();
+        self.sync_streams();
+
+        let mut msg = format!("{} camera(s) on your Tapo account.", list.len());
+        if !linked.is_empty() {
+            msg += &format!(" Linked {} camera(s) you already had, matched by name.", linked.len());
+        }
+        if added > 0 {
+            msg += &format!(" Added {added} camera(s).");
+            let unlinked_local = self.cfg.borrow().cameras.iter().any(|c| c.has_local() && c.cloud.is_none());
+            if unlinked_local {
+                msg += " If one of them duplicates a camera you already have, remove it and pick its \
+                        Tapo cloud camera in that camera's settings instead.";
+            }
+        }
+        self.cloud_message(msg);
+    }
+
+    /// A stream found the session token rejected. Signs in again with the
+    /// saved account; if the cloud wants a verification code, the user has to
+    /// sign in under Settings.
+    pub fn cloud_auth_failed(&self) {
+        if self.pending_mfa.borrow().is_some() {
+            return;
+        }
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        // Every cloud stream reports the same failure; act once a minute at most.
+        if self.last_relogin.get().is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.last_relogin.set(Some(Instant::now()));
+        let Some((user, pass)) = self.cloud_creds().filter(|(_, p)| !p.is_empty()) else {
+            self.cloud_session_lost();
+            return;
+        };
+        log::info!("Tapo cloud session expired; signing in again");
+        self.rt.spawn(async move {
+            let result = client.login(&user, &pass).await;
+            on_ui(move |app| app.cloud_relogin_done(user, result));
+        });
+    }
+
+    fn cloud_relogin_done(&self, user: String, result: cloud::Result<Login>) {
+        match result {
+            Ok(Login::Done(session)) => {
+                self.save_cloud_session(user, &session);
+                self.refresh_cloud_ui();
+                self.status("Signed in to the Tapo cloud again.");
+            }
+            Ok(Login::NeedsMfa(_)) => self.cloud_session_lost(),
+            Err(e) if e.is_auth() || e.is_refused() => self.cloud_session_lost(),
+            // A network problem: keep the session; the streams retry.
+            Err(e) => log::warn!("Tapo cloud sign-in failed: {e}"),
+        }
+    }
+
+    fn cloud_session_lost(&self) {
+        self.clear_cloud_session();
+        let msg = "Your Tapo cloud sign-in has expired: sign in again under Settings › Live view through the Tapo cloud.";
+        self.cloud_message(msg);
+        self.status(msg);
+    }
+
     // ------------------------------------------------------------- discovery
 
     fn scan(&self) {
@@ -831,10 +1244,12 @@ impl App {
         let Some(f) = self.found.borrow().get(index).cloned() else { return };
         match f.kind {
             FoundKind::Camera | FoundKind::CameraPtz => {
+                let cloud = self.cloud_cameras.borrow().iter().find(|c| same_name(&c.name, &f.name)).cloned();
                 self.new_camera(CameraConfig {
                     name: f.name.clone(),
                     host: f.host.clone(),
                     ptz: f.kind == FoundKind::CameraPtz,
+                    cloud,
                     ..Default::default()
                 });
                 self.status(format!(
@@ -1105,6 +1520,48 @@ async fn discover(user: String, pass: String, target: String) -> Result<(Vec<Fou
     Ok((found, failed))
 }
 
+/// Camera names compare loosely: the Tapo app's nickname is what both
+/// "Find devices" and the cloud list use.
+fn same_name(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// Links the account's cameras to the configured ones: by cloud id, then by
+/// a unique name match; any left over are added as cloud-only cameras.
+/// Returns the ids of newly linked cameras and how many were added.
+fn link_cloud_cameras(cameras: &mut Vec<CameraConfig>, account: &[CloudCamera]) -> (Vec<u32>, usize) {
+    let mut linked = Vec::new();
+    let mut added = 0;
+    for cloud_cam in account {
+        let id_match = cameras.iter_mut().find(|c| c.cloud.as_ref().is_some_and(|l| l.device_id == cloud_cam.device_id));
+        if let Some(cam) = id_match {
+            cam.cloud = Some(cloud_cam.clone()); // refresh its name and model
+            continue;
+        }
+        let by_name: Vec<usize> = cameras
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.cloud.is_none() && same_name(&c.name, &cloud_cam.name))
+            .map(|(i, _)| i)
+            .collect();
+        if let [i] = by_name[..] {
+            cameras[i].cloud = Some(cloud_cam.clone());
+            linked.push(cameras[i].id);
+            continue;
+        }
+        let id = cameras.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        cameras.push(CameraConfig {
+            id,
+            name: cloud_cam.name.clone(),
+            grid_quality: Quality::Sd,
+            cloud: Some(cloud_cam.clone()),
+            ..Default::default()
+        });
+        added += 1;
+    }
+    (linked, added)
+}
+
 fn string_model<S: Into<SharedString>>(items: impl IntoIterator<Item = S>) -> ModelRc<SharedString> {
     ModelRc::new(VecModel::from(items.into_iter().map(Into::into).collect::<Vec<SharedString>>()))
 }
@@ -1173,5 +1630,34 @@ mod tests {
         assert_eq!(fmt_duration(65), "1m 05s");
         assert_eq!(fmt_duration(3700), "1h 01m");
         assert_eq!(file_safe("Front door/1"), "Front_door_1");
+    }
+
+    #[test]
+    fn links_account_cameras() {
+        let cloud = |id: &str, name: &str| CloudCamera { device_id: id.into(), name: name.into(), ..Default::default() };
+        let local = |id: u32, name: &str| CameraConfig { id, name: name.into(), host: "10.0.0.1".into(), ..Default::default() };
+        let mut cameras = vec![
+            local(1, "Front Door"),
+            local(2, "Garage"),
+            // Already linked: only its details are refreshed.
+            CameraConfig { cloud: Some(cloud("c3", "Old name")), ..local(3, "Yard") },
+            // Two cameras share this name, so neither is linked by name.
+            local(4, "Hall"),
+            local(5, "hall"),
+        ];
+        let account = [cloud("c1", "front door "), cloud("c3", "Yard"), cloud("c4", "Hall"), cloud("c9", "Office")];
+        let (linked, added) = link_cloud_cameras(&mut cameras, &account);
+        assert_eq!(linked, vec![1]);
+        assert_eq!(added, 2); // "Hall" (ambiguous) and "Office"
+        assert_eq!(cameras[0].cloud.as_ref().unwrap().device_id, "c1");
+        assert!(cameras[1].cloud.is_none());
+        assert_eq!(cameras[2].cloud.as_ref().unwrap().name, "Yard");
+        assert!(cameras[3].cloud.is_none() && cameras[4].cloud.is_none());
+        let office = cameras.iter().find(|c| c.name == "Office").unwrap();
+        assert!(!office.has_local());
+        assert_eq!(office.id, 7);
+        // Running it again changes nothing.
+        let (linked, added) = link_cloud_cameras(&mut cameras, &account);
+        assert!(linked.is_empty() && added == 0);
     }
 }

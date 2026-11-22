@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use slint::{Rgb8Pixel, SharedPixelBuffer};
 
+use crate::cloud::{CloudCamera, CloudClient, CloudError};
 use crate::config::Quality;
 use crate::{ffmpeg, mjpeg};
 
@@ -23,6 +24,23 @@ pub struct StreamSpec {
     pub password: String,
     pub quality: Quality,
     pub ffmpeg: Option<PathBuf>,
+    /// Set to stream through the Tapo cloud relay instead of RTSP.
+    pub cloud: Option<CloudTarget>,
+}
+
+#[derive(Clone)]
+pub struct CloudTarget {
+    pub client: Arc<CloudClient>,
+    pub camera: CloudCamera,
+}
+
+impl StreamSpec {
+    fn label(&self) -> String {
+        match &self.cloud {
+            Some(t) => format!("{} (cloud)", t.camera.name),
+            None => self.host.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -94,7 +112,7 @@ pub struct FrameSink {
 }
 
 impl FrameSink {
-    fn new(slot: Arc<Mutex<Slot>>) -> Self {
+    pub(crate) fn new(slot: Arc<Mutex<Slot>>) -> Self {
         Self { slot, frames: 0, window_start: Instant::now(), window_frames: 0 }
     }
 
@@ -127,18 +145,24 @@ async fn run(spec: StreamSpec, mut sink: FrameSink) {
     loop {
         sink.set_status(Status::Connecting);
         let frames_before = sink.frames;
-        let result = match spec.quality {
-            Quality::Mjpeg => mjpeg::run(&spec, &mut sink).await,
-            Quality::Sd | Quality::Hd => ffmpeg::run(&spec, &mut sink).await,
+        let result = match (&spec.cloud, spec.quality) {
+            (Some(_), _) => ffmpeg::run_cloud(&spec, &mut sink).await,
+            (None, Quality::Mjpeg) => mjpeg::run(&spec, &mut sink).await,
+            (None, Quality::Sd | Quality::Hd) => ffmpeg::run(&spec, &mut sink).await,
         };
         let reason = match result {
             Ok(()) => "Stream ended".to_string(),
-            Err(e) => format!("{e:#}"),
+            Err(e) => {
+                if e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth) {
+                    crate::app::on_ui(|app| app.cloud_auth_failed());
+                }
+                format!("{e:#}")
+            }
         };
         if sink.frames > frames_before {
             backoff = MIN_BACKOFF; // it was working; reconnect quickly
         }
-        log::warn!("{} ({:?}): {reason}; retrying in {backoff:?}", spec.host, spec.quality);
+        log::warn!("{} ({:?}): {reason}; retrying in {backoff:?}", spec.label(), spec.quality);
         sink.set_status(Status::Retrying(format!("{reason} — retrying in {}s", backoff.as_secs())));
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
