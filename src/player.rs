@@ -1,7 +1,7 @@
 //! Plays a hub recording inside the app: either one saved earlier, or one
 //! coming through the cloud, which is saved to `Videos\TapoViewer` as it
-//! arrives. ffmpeg's `-re` paces the picture to real time, so a clip that
-//! downloads faster than it plays is buffered in memory meanwhile.
+//! arrives. ffmpeg's `-re` paces the picture to real time; the download runs
+//! ahead into the file, and the player follows the file.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::clip::{self, ClipRequest, Progress};
 use crate::cloud::{CloudClient, CloudError};
@@ -63,10 +63,11 @@ impl Player {
         let slot = Arc::new(Mutex::new(Slot { frame: None, version: 0, status: Status::Connecting, fps: 0.0 }));
         let state = Arc::new(Mutex::new(PlayerState::default()));
         let partial = match &source {
-            Source::Cloud { path, .. } => Some(path.with_extension("ts.part")),
+            Source::Cloud { path, .. } => Some(partial_path(path)),
             Source::File(_) => None,
         };
-        let task = rt.spawn(run(ffmpeg, source, FrameSink::new(slot.clone()), state.clone(), Arc::new(notify)));
+        let sink = FrameSink::new(slot.clone());
+        let task = rt.spawn(run(ffmpeg, source, partial.clone(), sink, state.clone(), Arc::new(notify)));
         Self { slot, state, task, rt: rt.clone(), partial }
     }
 }
@@ -86,29 +87,25 @@ impl Drop for Player {
 
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
-async fn run(ffmpeg: PathBuf, source: Source, mut sink: FrameSink, state: Arc<Mutex<PlayerState>>, notify: Notify) {
+async fn run(
+    ffmpeg: PathBuf,
+    source: Source,
+    partial: Option<PathBuf>,
+    mut sink: FrameSink,
+    state: Arc<Mutex<PlayerState>>,
+    notify: Notify,
+) {
     let update = |f: &dyn Fn(&mut PlayerState)| {
         f(&mut state.lock().unwrap());
         notify();
     };
+    // ffmpeg reads at the clip's pace, so this holds only a few chunks.
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     match source {
         Source::File(path) => {
             update(&|s| s.message = "Playing".into());
-            // Through a pipe like a download: the built-in ffmpeg reads no files.
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            let reading = async {
-                let mut file = tokio::fs::File::open(&path).await?;
-                let mut buf = vec![0u8; 256 * 1024];
-                loop {
-                    let n = file.read(&mut buf).await?;
-                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                drop(tx);
-                anyhow::Ok(())
-            };
-            let (read, played) = tokio::join!(reading, play(&ffmpeg, rx, &mut sink));
+            let (_, finished) = watch::channel(Some(true));
+            let (read, played) = tokio::join!(feed(&path, &path, finished, tx), play(&ffmpeg, rx, &mut sink));
             let result = read.and(played);
             update(&|s| {
                 s.ended = true;
@@ -124,9 +121,13 @@ async fn run(ffmpeg: PathBuf, source: Source, mut sink: FrameSink, state: Arc<Mu
                 s.downloading = true;
                 s.message = "Asking the hub for the recording…".into();
             });
-            let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            // The download runs at full speed into the file; the player
+            // follows the file. `finished` says how the download ended.
+            let partial = partial.unwrap_or_else(|| partial_path(&path));
+            let (done, finished) = watch::channel(None::<bool>);
             let download = async {
-                let saved = save(&client, &request, &path, tx, &state, &notify).await;
+                let saved = save(&client, &request, &path, &partial, &state, &notify).await;
+                let _ = done.send(Some(saved.is_ok()));
                 if let Err(e) = &saved {
                     if e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth) {
                         crate::app::on_ui(|app| app.cloud_auth_failed());
@@ -149,7 +150,10 @@ async fn run(ffmpeg: PathBuf, source: Source, mut sink: FrameSink, state: Arc<Mu
                 });
                 saved
             };
-            let playback = play(&ffmpeg, rx, &mut sink);
+            let playback = async {
+                let (fed, played) = tokio::join!(feed(&partial, &path, finished, tx), play(&ffmpeg, rx, &mut sink));
+                fed.and(played)
+            };
             let (saved, played) = tokio::join!(download, playback);
             update(&|s| {
                 s.ended = true;
@@ -163,12 +167,56 @@ async fn run(ffmpeg: PathBuf, source: Source, mut sink: FrameSink, state: Arc<Mu
     }
 }
 
-/// Downloads to `path` (through a `.part` file), copying the video to `tx`.
+/// Sends the recording being written to `partial` (renamed to `path` when
+/// complete) to `tx`, following the file as it grows until `finished` says
+/// the download is over: `Some(true)` complete, `Some(false)` failed.
+/// The built-in ffmpeg reads no files, so even a saved one goes through here.
+async fn feed(
+    partial: &Path,
+    path: &Path,
+    mut finished: watch::Receiver<Option<bool>>,
+    tx: mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let mut file = loop {
+        if let Ok(f) = tokio::fs::File::open(partial).await {
+            break f;
+        }
+        let outcome = *finished.borrow();
+        match outcome {
+            Some(true) => break tokio::fs::File::open(path).await?,
+            Some(false) => return Ok(()),
+            None => {}
+        }
+        // Before the hub has answered there's no file yet.
+        let _ = tokio::time::timeout(Duration::from_millis(200), finished.changed()).await;
+    };
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut last_pass = false;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n > 0 {
+            if tx.send(buf[..n].to_vec()).await.is_err() {
+                return Ok(()); // the player stopped
+            }
+            continue;
+        }
+        if last_pass {
+            return Ok(());
+        }
+        // Once everything is written: one more pass to the end of the file.
+        last_pass = finished.borrow().is_some();
+        if !last_pass {
+            let _ = tokio::time::timeout(Duration::from_millis(200), finished.changed()).await;
+        }
+    }
+}
+
+/// Downloads to `path` (through `partial`), reporting progress in `state`.
 async fn save(
     client: &CloudClient,
     request: &ClipRequest,
     path: &Path,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    partial: &Path,
     state: &Mutex<PlayerState>,
     notify: &Notify,
 ) -> Result<()> {
@@ -181,48 +229,51 @@ async fn save(
         drop(s);
         notify();
     };
-    save_clip(client, request, path, Some(tx), &mut progress).await
+    save_clip(client, request, path, partial, &mut progress).await
 }
 
-/// Downloads a recording to `path`, through a `.part` file that is renamed
-/// once the hub has sent all of it. With `tx`, the video is also copied
-/// there as it arrives.
+/// A download's own file until it's complete, so two downloads of a clip
+/// (or one stopped and one started) don't share one.
+pub fn partial_path(path: &Path) -> PathBuf {
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    path.with_extension(format!("ts.{tag}.part"))
+}
+
+/// Downloads a recording to `path`, through `partial` (see [`partial_path`]),
+/// which is renamed once the hub has sent all of it.
 pub async fn save_clip(
     client: &CloudClient,
     request: &ClipRequest,
     path: &Path,
-    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    partial: &Path,
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<()> {
-    let partial = path.with_extension("ts.part");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
     }
-    let file = std::fs::File::create(&partial).with_context(|| format!("Could not create {}", partial.display()))?;
+    let file = std::fs::File::create(partial).with_context(|| format!("Could not create {}", partial.display()))?;
     let mut file = std::io::BufWriter::new(file);
     let mut media = |data: &[u8]| -> Result<()> {
         file.write_all(data)?;
-        if let Some(tx) = &tx {
-            let _ = tx.send(data.to_vec()); // the player may have stopped
-        }
+        // Let the player see it soon.
+        file.flush()?;
         Ok(())
     };
     let result = clip::download(client, request, &mut media, progress).await;
-    drop(tx);
     let result = result.and_then(|_| {
         file.flush()?;
         drop(file);
-        std::fs::rename(&partial, path).with_context(|| format!("Could not save {}", path.display()))?;
+        std::fs::rename(partial, path).with_context(|| format!("Could not save {}", path.display()))?;
         Ok(())
     });
     if result.is_err() {
-        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(partial);
     }
     result
 }
 
 /// Shows the MPEG-TS that arrives on `feed` until it ends, at its own pace.
-async fn play(ffmpeg: &Path, mut feed: mpsc::UnboundedReceiver<Vec<u8>>, sink: &mut FrameSink) -> Result<()> {
+async fn play(ffmpeg: &Path, mut feed: mpsc::Receiver<Vec<u8>>, sink: &mut FrameSink) -> Result<()> {
     // Don't start ffmpeg (and its frame wait) before there's video.
     let Some(first) = feed.recv().await else {
         return Ok(()); // the download failed; it reports why
