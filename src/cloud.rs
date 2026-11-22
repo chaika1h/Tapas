@@ -51,7 +51,19 @@ const CAMERA_TYPE: &str = "SMART.IPCAMERA";
 const HUB_TYPE: &str = "SMART.TAPOHUB";
 /// Relay stream types (`StreamType` in the Tapo app).
 const STREAM_PREVIEW: i64 = 0;
+const STREAM_PLAYBACK: i64 = 1;
 const STREAM_DOWNLOAD: i64 = 3;
+
+/// The kinds of relay the Tapo app opens for a hub's recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipStream {
+    /// Stream type 3 with this sub-type: "video" (the app's download of a
+    /// recording) or "cover" (its download type 3, which looks to be for
+    /// thumbnails: an H500 accepts it and then sends nothing).
+    Download(&'static str),
+    /// Stream type 1: the app's playback, sent in real time.
+    Playback,
+}
 const IOT_SERVICE: &str = "nbu.iot-app-server.app";
 
 /// Pan/tilt steps the camera accepts in one move.
@@ -610,17 +622,15 @@ impl CloudClient {
         self.relay_request(&payload, player_id, "Camera").await
     }
 
-    /// Asks the cloud for a relay that downloads one of `camera`'s recordings
+    /// Asks the cloud for a relay that brings one of `camera`'s recordings
     /// from `hub`. Shaped like the Tapo app's: the relay goes to the hub, and
-    /// `customParams` names the camera. `sub_type` is "cover" (the app's
-    /// download) or "video" (its download of a playback clip); both are
-    /// stream type 3.
+    /// `customParams` names the camera.
     pub async fn request_clip_relay(
         &self,
         hub: &CloudCamera,
         camera: &HubCamera,
         player_id: &str,
-        sub_type: &str,
+        stream: ClipStream,
     ) -> Result<RelayInfo> {
         let device_type = if hub.device_type.is_empty() { HUB_TYPE } else { &hub.device_type };
         let mut custom = serde_json::Map::new();
@@ -631,18 +641,23 @@ impl CloudClient {
             custom.insert("camera_mac".into(), camera.mac.clone().into());
         }
         custom.insert("audio_config".into(), json!({ "encode_type": "G711ulaw", "sample_rate": "16" }));
-        let payload = json!({
+        let mut payload = json!({
             "deviceId": hub.device_id,
             "dataTimeoutCount": 0,
             "cloudType": 2,
             "deviceType": device_type,
             "playerId": player_id,
             "rootCaVer": "1",
-            "streamType": STREAM_DOWNLOAD,
-            "subType": sub_type,
             "preConnection": 0,
             "customParams": Value::Object(custom).to_string(),
         });
+        match stream {
+            ClipStream::Download(sub_type) => {
+                payload["streamType"] = STREAM_DOWNLOAD.into();
+                payload["subType"] = sub_type.into();
+            }
+            ClipStream::Playback => payload["streamType"] = STREAM_PLAYBACK.into(),
+        }
         log::info!("clip relay request: {}", redact_relay_request(&payload));
         self.relay_request(&payload, player_id.to_string(), "Hub").await
     }
@@ -834,7 +849,22 @@ impl CloudClient {
             } } },
         });
         let result = first_result(&self.camera_requests(hub, vec![request]).await?, "searchDateWithVideo")?;
-        Ok(parse_recording_days(&result))
+        let days = parse_recording_days(&result);
+        if days.is_empty() {
+            log::info!("searchDateWithVideo {from}..{to} found no days; the hub said {result}");
+        }
+        Ok(days)
+    }
+
+    /// The id the hub knows this account by, which its playback requests
+    /// carry as `client_id`.
+    pub async fn hub_user_id(&self, hub: &CloudCamera) -> Result<i64> {
+        let request = json!({ "method": "getUserID", "params": { "system": { "get_user_id": "null" } } });
+        let result = first_result(&self.camera_requests(hub, vec![request]).await?, "getUserID")?;
+        result
+            .get("user_id")
+            .and_then(int_value)
+            .ok_or_else(|| CloudError::new(format!("The hub gave no user id: {result}")))
     }
 
     /// The camera's recordings that overlap `start`..`end` (Unix seconds),
