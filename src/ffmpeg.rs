@@ -152,16 +152,16 @@ where
     }
 }
 
-enum Stopped {
+pub(crate) enum Stopped {
     NoVideo,
     /// ffmpeg exited; its last error line, if any.
     Exited(String),
 }
 
 /// An ffmpeg process writing fixed-size RGB frames to stdout.
-struct Decoder {
+pub(crate) struct Decoder {
     child: tokio::process::Child,
-    stdin: Option<tokio::process::ChildStdin>,
+    pub stdin: Option<tokio::process::ChildStdin>,
     stdout: tokio::process::ChildStdout,
     last_error: Arc<Mutex<String>>,
     width: usize,
@@ -169,7 +169,7 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn spawn(ffmpeg: &Path, input: &[&str], width: usize, height: usize) -> Result<Self> {
+    pub fn spawn(ffmpeg: &Path, input: &[&str], width: usize, height: usize) -> Result<Self> {
         let mut child = command(ffmpeg, input, width, height)
             .spawn()
             .with_context(|| format!("Could not start {}", ffmpeg.display()))?;
@@ -193,10 +193,15 @@ impl Decoder {
 
     /// Pushes frames into `sink` until ffmpeg stops or goes quiet.
     async fn push_frames(&mut self, sink: &mut FrameSink) -> Stopped {
+        self.push_frames_within(sink, FRAME_TIMEOUT).await
+    }
+
+    /// Like [`Decoder::push_frames`], waiting up to `quiet` for each frame.
+    pub async fn push_frames_within(&mut self, sink: &mut FrameSink, quiet: Duration) -> Stopped {
         let (w, h) = (self.width, self.height);
         let mut buf = vec![0u8; w * h * 3];
         loop {
-            match timeout(FRAME_TIMEOUT, self.stdout.read_exact(&mut buf)).await {
+            match timeout(quiet, self.stdout.read_exact(&mut buf)).await {
                 Err(_) => return Stopped::NoVideo,
                 Ok(Err(_)) => {
                     let _ = timeout(Duration::from_secs(2), self.child.wait()).await;

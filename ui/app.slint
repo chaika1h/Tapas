@@ -13,10 +13,10 @@ export struct Tile {
 
 export struct HomeCard { id: int, name: string, detail: string, thumb: image, has-thumb: bool, state: string }
 export struct CameraRow { id: int, name: string, detail: string }
-export struct HubRow { id: int, name: string, host: string }
-export struct FoundRow { name: string, model: string, host: string, kind: string, can-add: bool }
+export struct HubRow { id: int, name: string, detail: string }
 export struct PresetRow { id: string, name: string }
-export struct RecRow { time: string, kind: string, duration: string }
+export struct RecRow { time: string, kind: string, duration: string, playing: bool, saved: bool }
+export struct DayChip { weekday: string, day: string, has-video: bool, selected: bool, future: bool }
 export struct DownloadRow { label: string, status: string, path: string, done: bool }
 
 // Everything the Rust side reads, writes or handles.
@@ -117,26 +117,8 @@ export global Bridge {
     callback delete-camera(int);
     callback move-camera(int, int);
 
-    // settings: hubs
+    // playback: recordings on the hubs of the account
     in property <[HubRow]> hubs;
-    in-out property <int> hub-editing: -1;
-    in-out property <string> hub-name;
-    in-out property <string> hub-host;
-    in property <string> hub-error;
-    callback new-hub();
-    callback edit-hub(int);
-    callback save-hub();
-    callback delete-hub(int);
-
-    // settings: discovery
-    in-out property <string> scan-target: "255.255.255.255";
-    in property <bool> scanning;
-    in property <string> scan-message;
-    in property <[FoundRow]> found;
-    callback scan();
-    callback add-found(int);
-
-    // recordings
     in property <[string]> hub-names;
     in-out property <int> rec-hub;
     in property <bool> hub-busy;
@@ -145,13 +127,31 @@ export global Bridge {
     in property <[string]> paired-names;
     in-out property <int> rec-camera;
     in property <string> rec-date;
+    in property <[DayChip]> rec-days;
     in property <bool> rec-loading;
+    in property <string> rec-message;
     in property <[RecRow]> recordings;
     in property <[DownloadRow]> downloads;
     callback connect-hub();
+    callback rec-hub-changed();
     callback rec-camera-changed();
     callback change-day(int);
+    callback pick-day(int);
+    callback play-clip(int);
     callback download(int);
+    // the player
+    in property <bool> player-open;
+    in property <image> player-frame;
+    in property <bool> player-has-frame;
+    in property <string> player-title;
+    in property <string> player-status;
+    in property <string> player-position;
+    in property <bool> player-busy;
+    in property <bool> player-ended;
+    // The saved recording, once complete.
+    in property <string> player-file;
+    callback player-stop();
+    callback player-replay();
     callback open-file(string);
     callback show-in-folder(string);
 }
@@ -608,6 +608,11 @@ global Icons {
     out property <string> chevron-left: "M 15.5 4.5 L 8 12 L 15.5 19.5";
     out property <string> hub: "M 3.5 8.5 H 20.5 V 17.5 H 3.5 Z M 6.5 13 H 11 M 16 13 H 17.5 M 6 6 H 18";
     out property <string> refresh: "M 19.5 12 A 7.5 7.5 0 1 1 17.3 6.7 M 19.5 3.5 V 7.5 H 15.5";
+    out property <string> play: "M 8 5.5 L 18.5 12 L 8 18.5 Z";
+    out property <string> download: "M 12 4 V 15 M 7.5 10.5 L 12 15 L 16.5 10.5 M 5 19.5 H 19";
+    out property <string> folder: "M 3.5 6.5 H 9.5 L 11.5 8.5 H 20.5 V 18.5 H 3.5 Z";
+    out property <string> stop: "M 6.5 6.5 H 17.5 V 17.5 H 6.5 Z";
+    out property <string> check: "M 5 12.5 L 10 17 L 19 7.5";
 }
 
 component Icon inherits Path {
@@ -695,7 +700,7 @@ component Sidebar inherits Rectangle {
             clicked => { Bridge.navigate(Page.live); }
         }
         SideNavItem {
-            text: "Recordings";
+            text: "Playback";
             icon: Icons.playback;
             active: Bridge.page == Page.recordings;
             clicked => { Bridge.navigate(Page.recordings); }
@@ -952,7 +957,7 @@ component HubCard inherits Rectangle {
                 spacing: 2px;
                 Text { text: root.hub.name; font-size: 16px; font-weight: 600; overflow: elide; }
                 Text {
-                    text: "Recordings hub · " + root.hub.host;
+                    text: root.hub.detail + " · recordings through the cloud";
                     font-size: 13px;
                     color: Palette.foreground.transparentize(0.4);
                     overflow: elide;
@@ -960,7 +965,7 @@ component HubCard inherits Rectangle {
             }
         }
         AccentChip {
-            text: "Recordings";
+            text: "Playback";
             icon: Icons.playback;
             clicked => { root.open(); }
         }
@@ -1475,100 +1480,344 @@ component SinglePage inherits Rectangle {
     }
 }
 
-component RecordingsPage inherits Rectangle {
+// One day of the week strip on the Playback page.
+component DayButton inherits Rectangle {
+    in property <DayChip> chip;
+    callback clicked();
+    width: 46px;
+    height: 58px;
+    border-radius: 12px;
+    background: root.chip.selected ? Palette.accent-background
+        : ta.has-hover && !root.chip.future ? Palette.foreground.transparentize(0.92) : transparent;
+    opacity: root.chip.future ? 0.35 : 1;
+    accessible-role: button;
+    accessible-label: root.chip.weekday + " " + root.chip.day;
+    accessible-action-default => { root.clicked(); }
     VerticalLayout {
-        padding: 16px;
-        padding-left: 28px;
-        padding-right: 24px;
-        padding-top: 0px;
-        spacing: 12px;
-        PageHeader { title: "Recordings"; padding-left: 0px; padding-right: 0px; }
-        Muted { text: "Clips stored on the H500, read from the hub on the local network."; }
-        if Bridge.hub-names.length == 0: Muted {
-            text: "Add your H500 under Settings › Hubs first (or find it with “Find hubs”).";
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 2px;
+        Text {
+            text: root.chip.weekday;
+            font-size: 11px;
+            horizontal-alignment: center;
+            color: root.chip.selected ? Palette.accent-foreground : Palette.foreground.transparentize(0.4);
+        }
+        Text {
+            text: root.chip.day;
+            font-size: 16px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            color: root.chip.selected ? Palette.accent-foreground : Palette.foreground;
         }
         HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout { alignment: center; Text { text: "Hub"; width: 60px; } }
-            ComboBox { width: 240px; model: Bridge.hub-names; current-index <=> Bridge.rec-hub; }
-            Button {
-                text: Bridge.hub-connected ? "Reconnect" : "Connect";
-                primary: !Bridge.hub-connected;
-                enabled: !Bridge.hub-busy && Bridge.hub-names.length > 0;
-                clicked => { Bridge.connect-hub(); }
-            }
-            VerticalLayout {
-                alignment: center;
-                Spinner { width: 22px; height: 22px; indeterminate: true; visible: Bridge.hub-busy || Bridge.rec-loading; }
-            }
-            VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 1;
-                Muted { text: Bridge.hub-message; }
+            alignment: center;
+            Rectangle {
+                width: 5px;
+                height: 5px;
+                border-radius: 2.5px;
+                background: !root.chip.has-video ? transparent
+                    : root.chip.selected ? Palette.accent-foreground : Palette.accent-background;
             }
         }
-        if Bridge.hub-connected: HorizontalLayout {
-            spacing: 8px;
-            VerticalLayout { alignment: center; Text { text: "Camera"; width: 60px; } }
-            ComboBox {
-                width: 240px;
-                model: Bridge.paired-names;
-                current-index <=> Bridge.rec-camera;
-                selected => { Bridge.rec-camera-changed(); }
+    }
+    ta := TouchArea {
+        enabled: !root.chip.future;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A recording in the list: click to play; the arrow saves it.
+component ClipRow inherits Rectangle {
+    in property <RecRow> rec;
+    callback play();
+    callback save();
+    height: 58px;
+    border-radius: 10px;
+    background: root.rec.playing ? Palette.accent-background.transparentize(0.85)
+        : ta.has-hover ? Palette.foreground.transparentize(0.94) : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.play(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 6px;
+        spacing: 12px;
+        Rectangle {
+            width: 36px;
+            height: 36px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 18px;
+            background: root.rec.playing ? Palette.accent-background : Palette.foreground.transparentize(0.92);
+            Icon {
+                commands: Icons.play;
+                width: 18px;
+                height: 18px;
+                color: root.rec.playing ? Palette.accent-foreground : Palette.foreground;
             }
-            Rectangle { width: 16px; }
-            Button { text: "←"; clicked => { Bridge.change-day(-1); } }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text { text: root.rec.time; font-weight: 600; overflow: elide; }
+            Text {
+                text: root.rec.kind + "  ·  " + root.rec.duration + (root.rec.saved ? "  ·  saved" : "");
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.4);
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            RoundIconButton {
+                width: 34px;
+                height: 34px;
+                icon: root.rec.saved ? Icons.check : Icons.download;
+                label: root.rec.saved ? "Saved" : "Save to Videos";
+                base: transparent;
+                clicked => { root.save(); }
+            }
+        }
+    }
+}
+
+component PlaybackPage inherits Rectangle {
+    VerticalLayout {
+        PageHeader {
+            title: "Playback";
+            if Bridge.hub-names.length > 1: VerticalLayout {
+                alignment: center;
+                ComboBox {
+                    width: 220px;
+                    model: Bridge.hub-names;
+                    current-index <=> Bridge.rec-hub;
+                    selected => { Bridge.rec-hub-changed(); }
+                }
+            }
+            if Bridge.hub-busy || Bridge.cloud-busy: VerticalLayout {
+                alignment: center;
+                Spinner { width: 22px; height: 22px; indeterminate: true; }
+            }
             VerticalLayout {
                 alignment: center;
-                Text { text: Bridge.rec-date; font-weight: 600; min-width: 140px; horizontal-alignment: center; }
+                RoundIconButton {
+                    icon: Icons.refresh;
+                    label: "Reload";
+                    enabled: !Bridge.hub-busy;
+                    clicked => { Bridge.connect-hub(); }
+                }
             }
-            Button { text: "→"; clicked => { Bridge.change-day(1); } }
-            Button { text: "Today"; clicked => { Bridge.change-day(0); } }
-            Rectangle { horizontal-stretch: 1; }
         }
-        if Bridge.hub-connected: Rectangle {
+        HorizontalLayout {
             vertical-stretch: 1;
-            border-width: 1px;
-            border-color: Palette.border;
-            border-radius: 6px;
-            ListView {
-                width: parent.width;
-                height: parent.height;
-                for r[i] in Bridge.recordings: Rectangle {
-                    height: 44px;
-                    background: Math.mod(i, 2) == 0 ? transparent : Palette.alternate-background;
-                    HorizontalLayout {
-                        padding-left: 12px;
-                        padding-right: 8px;
-                        spacing: 12px;
-                        VerticalLayout { alignment: center; Text { text: r.time; font-weight: 600; width: 170px; } }
-                        VerticalLayout { alignment: center; Text { text: r.kind; width: 150px; } }
-                        VerticalLayout { alignment: center; horizontal-stretch: 1; Muted { text: r.duration; } }
-                        VerticalLayout {
+            padding-left: 28px;
+            padding-right: 24px;
+            padding-bottom: 20px;
+            spacing: 20px;
+
+            // The player.
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 10px;
+                Rectangle {
+                    vertical-stretch: 1;
+                    min-height: 200px;
+                    // 16:9 when there's room.
+                    max-height: self.width * 9 / 16;
+                    background: #0d0d0d;
+                    border-radius: 14px;
+                    clip: true;
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: Bridge.player-frame;
+                        image-fit: contain;
+                        visible: Bridge.player-open;
+                    }
+                    if !Bridge.player-open: VerticalLayout {
+                        alignment: center;
+                        spacing: 10px;
+                        HorizontalLayout {
                             alignment: center;
-                            Button { text: "Download & play"; clicked => { Bridge.download(i); } }
+                            Icon { commands: Icons.playback; width: 48px; height: 48px; color: #ffffff60; }
+                        }
+                        Text {
+                            text: Bridge.hub-connected ? "Pick a recording to play it." : Bridge.hub-message;
+                            color: #9a9a9a;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if Bridge.player-open && !Bridge.player-has-frame: VerticalLayout {
+                        alignment: center;
+                        spacing: 14px;
+                        if !Bridge.player-ended: HorizontalLayout {
+                            alignment: center;
+                            Spinner { width: 36px; height: 36px; indeterminate: true; }
+                        }
+                        Text {
+                            x: 20px;
+                            width: parent.width - 40px;
+                            text: Bridge.player-status;
+                            color: #b0b0b0;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if Bridge.player-open && Bridge.player-position != "": Rectangle {
+                        x: parent.width - self.width - 12px;
+                        y: parent.height - self.height - 12px;
+                        width: pos.preferred-width + 20px;
+                        height: 28px;
+                        border-radius: 14px;
+                        background: #000000a0;
+                        pos := Text {
+                            text: Bridge.player-position;
+                            color: white;
+                            font-size: 13px;
+                            vertical-alignment: center;
                         }
                     }
                 }
+                if Bridge.player-open: HorizontalLayout {
+                    spacing: 10px;
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text { text: Bridge.player-title; font-size: 16px; font-weight: 600; overflow: elide; }
+                        Muted { text: Bridge.player-status; wrap: no-wrap; overflow: elide; }
+                    }
+                    if Bridge.player-busy: VerticalLayout {
+                        alignment: center;
+                        Spinner { width: 20px; height: 20px; indeterminate: true; }
+                    }
+                    if Bridge.player-ended: VerticalLayout {
+                        alignment: center;
+                        Button { text: "Play again"; clicked => { Bridge.player-replay(); } }
+                    }
+                    if Bridge.player-file != "": VerticalLayout {
+                        alignment: center;
+                        Button { text: "Open file"; clicked => { Bridge.open-file(Bridge.player-file); } }
+                    }
+                    if Bridge.player-file != "": VerticalLayout {
+                        alignment: center;
+                        Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(Bridge.player-file); } }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        RoundIconButton {
+                            icon: Icons.stop;
+                            label: "Close the player";
+                            clicked => { Bridge.player-stop(); }
+                        }
+                    }
+                }
+                if Bridge.downloads.length > 0: VerticalLayout {
+                    spacing: 4px;
+                    Heading { text: "Saved to Videos"; }
+                    for d in Bridge.downloads: HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout { alignment: center; Text { text: d.label; width: 230px; overflow: elide; } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Muted { text: d.status; wrap: no-wrap; overflow: elide; }
+                        }
+                        if d.done: Button { text: "Open"; clicked => { Bridge.open-file(d.path); } }
+                        if d.done: Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(d.path); } }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
             }
-            if Bridge.recordings.length == 0 && !Bridge.rec-loading: Muted {
-                width: parent.width;
-                height: parent.height;
-                text: "No recordings on this day.";
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-        if !Bridge.hub-connected: Rectangle { vertical-stretch: 1; }
-        if Bridge.downloads.length > 0: VerticalLayout {
-            spacing: 6px;
-            Heading { text: "Downloads"; }
-            for d in Bridge.downloads: HorizontalLayout {
-                spacing: 8px;
-                VerticalLayout { alignment: center; Text { text: d.label; width: 280px; overflow: elide; } }
-                VerticalLayout { alignment: center; horizontal-stretch: 1; Muted { text: d.status; wrap: no-wrap; overflow: elide; } }
-                if d.done: Button { text: "Play"; clicked => { Bridge.open-file(d.path); } }
-                if d.done: Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(d.path); } }
+
+            // Camera, day and the day's recordings.
+            Rectangle {
+                width: 390px;
+                border-radius: 14px;
+                background: Palette.control-background;
+                border-width: 1px;
+                border-color: Palette.border;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 12px;
+                    if !Bridge.hub-connected: VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        Muted { text: Bridge.hub-message; horizontal-alignment: center; wrap: word-wrap; }
+                    }
+                    if Bridge.hub-connected: ComboBox {
+                        model: Bridge.paired-names;
+                        current-index <=> Bridge.rec-camera;
+                        selected => { Bridge.rec-camera-changed(); }
+                    }
+                    if Bridge.hub-connected: HorizontalLayout {
+                        spacing: 4px;
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.chevron-left;
+                            label: "Previous day";
+                            base: transparent;
+                            clicked => { Bridge.change-day(-1); }
+                        }
+                        Text {
+                            text: Bridge.rec-date;
+                            font-weight: 600;
+                            horizontal-stretch: 1;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.chevron-right;
+                            label: "Next day";
+                            base: transparent;
+                            clicked => { Bridge.change-day(1); }
+                        }
+                        Button { text: "Today"; clicked => { Bridge.change-day(0); } }
+                    }
+                    if Bridge.hub-connected: HorizontalLayout {
+                        alignment: space-between;
+                        for chip[i] in Bridge.rec-days: DayButton {
+                            chip: chip;
+                            clicked => { Bridge.pick-day(i); }
+                        }
+                    }
+                    if Bridge.hub-connected: Rectangle { height: 1px; background: Palette.border; }
+                    if Bridge.hub-connected: Rectangle {
+                        vertical-stretch: 1;
+                        ListView {
+                            width: parent.width;
+                            height: parent.height;
+                            for r[i] in Bridge.recordings: ClipRow {
+                                rec: r;
+                                play => { Bridge.play-clip(i); }
+                                save => { Bridge.download(i); }
+                            }
+                        }
+                        if Bridge.rec-loading: VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Spinner { width: 28px; height: 28px; indeterminate: true; }
+                            }
+                        }
+                        if !Bridge.rec-loading && Bridge.recordings.length == 0: Muted {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Bridge.rec-message != "" ? Bridge.rec-message : "No recordings on this day.";
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if Bridge.hub-connected && Bridge.recordings.length > 0: Muted { text: Bridge.rec-message; }
+                }
             }
         }
     }
@@ -1592,7 +1841,7 @@ component SettingsPage inherits Rectangle {
                 VerticalLayout {
                     spacing: 8px;
                     Muted {
-                        text: "Live video and pan/tilt go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. H500 recordings are read from the hub on the local network with the same login. This uses TP-Link's private service and may stop working if they change it.";
+                        text: "Live video, pan/tilt and the H500's recordings go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. This uses TP-Link's private service and may stop working if they change it.";
                     }
                     HorizontalLayout {
                         spacing: 8px;
@@ -1669,79 +1918,6 @@ component SettingsPage inherits Rectangle {
                                 Button { text: "Save camera"; primary: true; clicked => { Bridge.save-camera(); } }
                             }
                         }
-                    }
-                }
-            }
-
-            GroupBox {
-                title: "Hubs (H500 / H200)";
-                VerticalLayout {
-                    spacing: 6px;
-                    Muted { text: "The hub is used to browse and download the recordings it has stored, on the local network. Its cameras' live view comes from your Tapo account like the others."; }
-                    for h in Bridge.hubs: HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: h.name; font-weight: 600; width: 170px; overflow: elide; } }
-                        VerticalLayout { alignment: center; horizontal-stretch: 1; Muted { text: h.host; wrap: no-wrap; } }
-                        Button { text: "Edit"; clicked => { Bridge.edit-hub(h.id); } }
-                        Button { text: "Remove"; clicked => { Bridge.delete-hub(h.id); } }
-                    }
-                    if Bridge.hub-editing < 0: HorizontalLayout {
-                        alignment: start;
-                        Button { text: "Add hub"; clicked => { Bridge.new-hub(); } }
-                    }
-                    if Bridge.hub-editing >= 0: Rectangle {
-                        border-width: 1px;
-                        border-color: Palette.accent-background;
-                        border-radius: 6px;
-                        VerticalLayout {
-                            padding: 12px;
-                            spacing: 8px;
-                            Field {
-                                label: "Name";
-                                LineEdit { text <=> Bridge.hub-name; placeholder-text: "HomeBase"; horizontal-stretch: 1; }
-                            }
-                            Field {
-                                label: "IP address";
-                                LineEdit { text <=> Bridge.hub-host; placeholder-text: "192.168.1.40"; horizontal-stretch: 1; }
-                            }
-                            if Bridge.hub-error != "": Text { text: Bridge.hub-error; color: #e5484d; }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: end;
-                                Button { text: "Cancel"; clicked => { Bridge.hub-editing = -1; } }
-                                Button { text: "Save hub"; primary: true; clicked => { Bridge.save-hub(); } }
-                            }
-                        }
-                    }
-                }
-            }
-
-            GroupBox {
-                title: "Find hubs on the network";
-                VerticalLayout {
-                    spacing: 8px;
-                    Muted {
-                        text: "Scans this network for H500/H200 hubs, using your Tapo account above. If nothing shows up, try your subnet's broadcast address, e.g. 192.168.1.255.";
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        LineEdit { text <=> Bridge.scan-target; width: 200px; }
-                        Button { text: "Scan"; primary: true; enabled: !Bridge.scanning; clicked => { Bridge.scan(); } }
-                        VerticalLayout {
-                            alignment: center;
-                            Spinner { width: 22px; height: 22px; indeterminate: true; visible: Bridge.scanning; }
-                        }
-                        VerticalLayout { alignment: center; horizontal-stretch: 1; Muted { text: Bridge.scan-message; } }
-                    }
-                    for f[i] in Bridge.found: HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: f.name; font-weight: 600; width: 170px; overflow: elide; } }
-                        VerticalLayout {
-                            alignment: center;
-                            horizontal-stretch: 1;
-                            Muted { text: f.model + "  ·  " + f.host + "  ·  " + f.kind; wrap: no-wrap; overflow: elide; }
-                        }
-                        Button { text: "Add"; enabled: f.can-add; clicked => { Bridge.add-found(i); } }
                     }
                 }
             }
@@ -1863,7 +2039,7 @@ export component MainWindow inherits Window {
                 if Bridge.page == Page.home: HomePage { vertical-stretch: 1; }
                 if Bridge.page == Page.live: LivePage { vertical-stretch: 1; }
                 if Bridge.page == Page.single: SinglePage { vertical-stretch: 1; }
-                if Bridge.page == Page.recordings: RecordingsPage { vertical-stretch: 1; }
+                if Bridge.page == Page.recordings: PlaybackPage { vertical-stretch: 1; }
                 if Bridge.page == Page.settings: SettingsPage { vertical-stretch: 1; }
                 if !Bridge.fullscreen && Bridge.page != Page.single: StatusBar { }
             }

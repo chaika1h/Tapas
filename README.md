@@ -1,8 +1,8 @@
 # Tapo Viewer
 
 A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, written in Rust with
-[Slint](https://slint.dev) (Fluent style) on top of the
-[`tapo`](https://github.com/mihai-dinculescu/tapo) crate.
+[Slint](https://slint.dev) (Fluent style). Everything goes through the Tapo cloud with your Tapo
+app login, like the Tapo app.
 
 - **Live view from anywhere** through the Tapo cloud, like the Tapo app: no VPN, port forwarding
   or camera accounts.
@@ -11,7 +11,8 @@ A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, wr
 - **Camera view**: the video with Take Photo, Pan & Tilt (pad and presets; arrow keys work too),
   Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
 - **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
-- **H500 recordings**: browse each paired camera's clips by day, download and play them.
+- **Playback from anywhere**: the H500's recordings of each camera, by day, played in the app
+  through the cloud and saved to `Videos\TapoViewer` as they play.
 - **Snapshots** to `Pictures\TapoViewer`.
 - **Light or dark**, or the same as Windows (*Settings › Video & display*).
 - **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
@@ -26,8 +27,9 @@ Everything uses your **Tapo app login** (email and password).
 | Feature | How | Where it works |
 |---|---|---|
 | Live video | Tapo cloud video relay (HTTPS) | Anywhere with internet |
-| Pan/tilt, presets | Tapo cloud camera control (HTTPS) | Anywhere with internet |
-| H500 recordings, Find hubs | Tapo local API | On the hub's network |
+| Pan/tilt, presets, privacy | Tapo cloud camera control (HTTPS) | Anywhere with internet |
+| H500 recordings: list | Tapo cloud, passed through to the hub (HTTPS) | Anywhere with internet |
+| H500 recordings: play, save | Tapo cloud video relay, from the hub (HTTPS) | Anywhere with internet |
 
 ### Getting started
 
@@ -38,12 +40,12 @@ Everything uses your **Tapo app login** (email and password).
    Viewer has it sent straight to the Tapo app on your phone; *Receive Code via Email* sends it by
    email instead, and *Resend Code* becomes available after a minute. The PC is remembered after
    that.
-3. The cameras on your account are added automatically and **Home** opens. **Update camera
+3. The cameras and the H500 on your account are added automatically and **Home** opens. **Update camera
    list** (⟳ on Home, or *Settings › Tapo account*) picks up cameras added later. To change which account
    camera an entry shows, edit it and pick its *Tapo camera*.
 
 With **Remember me** ticked, the password is saved (encrypted) so the app can log in again by
-itself when the session expires and can open the H500's recordings after a restart. Without it,
+itself when the session expires. Without it,
 the password is only kept until the app closes. The session token is always saved, encrypted.
 If the session expires and the app can't renew it, the log-in card comes back. **Sign out**
 (*Settings › Tapo account*) forgets the session and the password and keeps the email.
@@ -60,10 +62,17 @@ cloud, so it takes a moment; arrow presses made meanwhile are combined into one 
 Mode** covers the camera's lens (the Tapo app's privacy mode); the video comes back by itself
 when it's turned off. **Playback & Download** opens that camera's recordings on the H500.
 
-H500 recordings are still read from the hub on the local network, because there is no known way
-to reach them through the cloud. To browse them away from the office, put the PC on the office
-network over a VPN (e.g. a [Tailscale subnet router](https://tailscale.com/kb/1019/subnets) on an
-always-on machine there, or your router's built-in WireGuard/OpenVPN server).
+### Playback
+
+**Playback** (in the sidebar, on the H500's Home card, or *Playback & Download* in a camera view)
+shows the recordings the H500 holds. Pick the camera, then the day: the week strip marks the days
+with recordings, and the arrows go a day back or forward. Click a recording to play it in the app.
+It comes from the hub through the cloud, the way the Tapo app plays recordings away from home,
+and is saved to `Videos\TapoViewer` while it plays, so playing it again (or *Open file*) uses the
+saved copy. The ↓ button saves a recording without playing it.
+
+Days follow this PC's time zone. Downloading usually runs faster than playback; the picture is
+paced to real time. There's no seeking yet: to jump around in a recording, open the saved file.
 
 ### About the cloud
 
@@ -72,6 +81,13 @@ Live view and pan/tilt use TP-Link's private, undocumented cloud service, ported
 projects (see `src/cloud.rs` and `src/relay.rs`). TP-Link can change it at any time; if it
 stops working after a Tapo app update, the protocol has probably changed (see *Troubleshooting*).
 Cameras that send encrypted video through the cloud aren't supported yet; their tile says so.
+
+Playback asks the cloud for a relay to the hub naming the camera, as the Tapo app does, and then
+has the conversation the hub has on its local media port (request, acknowledgements every 25
+parts, heartbeats, stop), ported from the MIT-licensed
+[`tapo`](https://github.com/mihai-dinculescu/tapo) crate (see `src/clip.rs`). It has been tested
+against `tools/fake_cloud.py`, not yet against a real H500; the log has the details of every
+step if it doesn't work.
 
 ## Rendering on Windows
 
@@ -150,13 +166,16 @@ TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/f
 ```
 
 Sign in with any email and the password `secret`. "Back yard" is reported offline; "Front door"
-has pan/tilt and "Garage" hasn't.
+has pan/tilt and "Garage" hasn't. The H500 "HomeBase" has recordings of "Front door" (today,
+yesterday and three days ago) and "Garage" (today).
 
 ## Troubleshooting
 
-- **Hub login fails**: check the Tapo account and the hub's IP address under *Settings*, and that
-  the PC is on the hub's network. Hubs on very new firmware may need a newer version of the
-  `tapo` crate.
+- **No hub on Playback**: hubs come from the Tapo account's device list; press ⟳ on Home after
+  adding one in the Tapo app. Only camera hubs (H500, H200) are shown.
+- **A recording won't play** ("The cloud relay refused the stream", "The hub refused the
+  recording", "encrypted"): the log has the hub's answers (lines starting `clip:`). Please send
+  them, as the cloud's playback path hasn't been checked against a real H500 yet.
 - **"Pan/tilt: Reached the end of the pan/tilt range"**: the camera is at its end stop in that
   direction.
 - **"Camera is offline"**: the cloud can't reach the camera; check it in the

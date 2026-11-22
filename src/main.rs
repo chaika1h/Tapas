@@ -2,9 +2,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod clip;
 mod cloud;
 mod config;
 mod ffmpeg;
+mod player;
 mod ptz;
 mod relay;
 mod secret;
