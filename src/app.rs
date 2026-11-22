@@ -1894,7 +1894,8 @@ impl App {
                     on_ui(move |app| app.set_download_status(row, text, false));
                 }
             };
-            let result = crate::player::save_clip(&client, &request, &path, None, &mut progress).await;
+            let partial = crate::player::partial_path(&path);
+            let result = crate::player::save_clip(&client, &request, &path, &partial, &mut progress).await;
             let (text, done) = match &result {
                 Ok(()) => {
                     let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
