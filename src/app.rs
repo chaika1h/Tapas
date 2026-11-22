@@ -16,12 +16,12 @@ use tapo::responses::{GeneralDeviceHubResult, RecordingHubResult};
 use tapo::{ApiClient, CameraHubHandler, DeviceType};
 
 use crate::cloud::{self, CloudCamera, CloudClient, Login, MfaChallenge, MfaMethod, Session};
-use crate::config::{self, AppConfig, CameraConfig, HubConfig, Quality, Renderer};
+use crate::config::{self, AppConfig, CameraConfig, HubConfig, Quality, Renderer, Theme};
 use crate::ptz::{Ptz, PtzCmd};
 use crate::secret::Secret;
-use crate::stream::{StreamHandle, StreamSpec};
+use crate::stream::{Frame, StreamHandle, StreamSpec};
 use crate::{
-    Bridge, CameraRow, DownloadRow, FoundRow, HubRow, MainWindow, Page, PresetRow, RecRow, Tile,
+    Bridge, CameraRow, DownloadRow, FoundRow, HomeCard, HubRow, MainWindow, Page, PresetRow, RecRow, Tile,
 };
 
 thread_local! {
@@ -110,6 +110,15 @@ pub struct App {
     last_relogin: Cell<Option<Instant>>,
     /// The Tapo password for this run, when "Remember me" was off.
     password: RefCell<String>,
+    /// The latest picture of each camera, for its Home card.
+    thumbnails: RefCell<HashMap<u32, Frame>>,
+    /// Home card badges, e.g. "Offline".
+    home_states: RefCell<HashMap<u32, String>>,
+    home_cards: Rc<VecModel<HomeCard>>,
+    /// Where the camera view's back button goes.
+    return_page: Cell<Page>,
+    /// A camera to select once the hub's recordings are open.
+    pending_rec_camera: RefCell<Option<String>>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -163,6 +172,11 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         pending_mfa: RefCell::default(),
         last_relogin: Cell::default(),
         password: RefCell::default(),
+        thumbnails: RefCell::default(),
+        home_states: RefCell::default(),
+        home_cards: Rc::new(VecModel::default()),
+        return_page: Cell::new(Page::Home),
+        pending_rec_camera: RefCell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     if new_terminal {
@@ -171,6 +185,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
 
     let b = ui.global::<Bridge>();
     b.set_tiles(app.tiles.clone().into());
+    b.set_home_cameras(app.home_cards.clone().into());
+    ui.invoke_set_theme(app.cfg.borrow().theme.index());
     b.set_downloads(app.downloads.clone().into());
     b.set_quality_labels(string_model(Quality::LABELS.iter().copied()));
 
@@ -178,6 +194,10 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_toggle_fullscreen(cb!(&app, |a| a.toggle_fullscreen()));
     b.on_escape(cb!(&app, |a| a.escape()));
     b.on_open_camera(cb!(&app, |a, id| a.open_camera(id as u32)));
+    b.on_open_hub(cb!(&app, |a, i| a.open_hub(i)));
+    b.on_single_back(cb!(&app, |a| a.single_back()));
+    b.on_privacy_toggle(cb!(&app, |a| a.privacy_toggle()));
+    b.on_open_playback(cb!(&app, |a| a.open_playback()));
     b.on_quality_changed(cb!(&app, |a, i| a.quality_changed(i)));
     b.on_snapshot(cb!(&app, |a| a.snapshot()));
     b.on_ptz_move(cb!(&app, |a, pan, tilt| a.ptz_send(PtzCmd::Move(pan, tilt))));
@@ -220,9 +240,6 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     app.refresh_camera_lists();
     app.refresh_hub_lists();
     app.update_rec_date_label();
-    if app.cfg.borrow().cameras.is_empty() {
-        b.set_page(Page::Settings);
-    }
     app.sync_streams();
 
     // Not signed in: the sign-in screens show. With a remembered password
@@ -283,6 +300,7 @@ impl App {
         let Some(ui) = self.ui.upgrade() else { return };
         let b = ui.global::<Bridge>();
         match b.get_page() {
+            Page::Home => self.pump_home(),
             Page::Live => {
                 self.update_columns(&ui);
                 self.pump_tiles();
@@ -349,8 +367,9 @@ impl App {
         let window = ui.window();
         let size = window.size().to_logical(window.scale_factor());
         let fullscreen = ui.global::<Bridge>().get_fullscreen();
-        let chrome = if fullscreen { 8.0 } else { 50.0 + 26.0 + 20.0 };
-        let (w, h) = (size.width - 20.0, size.height - chrome);
+        // Sidebar, page header and status bar around the grid (see app.slint).
+        let (chrome_w, chrome_h) = if fullscreen { (8.0, 8.0) } else { (236.0 + 20.0, 76.0 + 26.0 + 20.0) };
+        let (w, h) = (size.width - chrome_w, size.height - chrome_h);
         let key = (n, w as i32, h as i32);
         if *self.last_grid_size.borrow() == key || n == 0 {
             return;
@@ -377,6 +396,15 @@ impl App {
         let cfg = self.cfg.borrow();
         let page = if self.signed_in_now() { page } else { Page::Settings }; // nothing to show
         let wanted: Vec<StreamKey> = match page {
+            // Home only needs one picture per camera for its card.
+            Page::Home => {
+                let thumbs = self.thumbnails.borrow();
+                cfg.cameras
+                    .iter()
+                    .filter(|c| c.cloud.is_some() && !thumbs.contains_key(&c.id))
+                    .map(|c| (c.id, Quality::Sd))
+                    .collect()
+            }
             Page::Live => cfg.cameras.iter().map(|c| (c.id, c.grid_quality)).collect(),
             Page::Single => self.single.borrow().iter().copied().collect(),
             _ => Vec::new(),
@@ -435,11 +463,18 @@ impl App {
     fn navigate(&self, page: Page) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        if b.get_fullscreen() && page != b.get_page() {
+        let from = b.get_page();
+        if b.get_fullscreen() && page != from {
             self.set_fullscreen(false);
+        }
+        if matches!(from, Page::Live | Page::Single) {
+            self.capture_thumbnails();
         }
         if page != Page::Single {
             *self.single.borrow_mut() = None;
+        }
+        if page == Page::Home {
+            self.refresh_home_cards();
         }
         if page == Page::Live {
             // Force tiles to pick up the latest frame again.
@@ -473,25 +508,39 @@ impl App {
         if b.get_fullscreen() {
             self.set_fullscreen(false);
         } else if b.get_page() == Page::Single {
-            self.navigate(Page::Live);
+            self.single_back();
         }
+    }
+
+    /// Back from the camera view to where it was opened from.
+    fn single_back(&self) {
+        self.navigate(self.return_page.get());
     }
 
     fn open_camera(&self, id: u32) {
         let Some(cam) = self.cfg.borrow().camera(id).cloned() else { return };
         let quality = Quality::Hd;
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_page() != Page::Single {
+            self.return_page.set(b.get_page());
+            if b.get_page() == Page::Live {
+                self.capture_thumbnails();
+            }
+        }
         *self.single.borrow_mut() = Some((id, quality));
         *self.single_shown.borrow_mut() = (0, String::new());
 
-        let ui = self.ui();
-        let b = ui.global::<Bridge>();
         b.set_single_name(cam.name.as_str().into());
         b.set_single_quality(quality.index());
         b.set_single_frame(Image::default());
         b.set_single_has_frame(false);
         b.set_single_status(self.tile_status(&cam).into());
-        // The pan/tilt panel appears once the camera says it has pan/tilt.
+        // The pan/tilt and privacy tiles work once the camera has answered.
         b.set_single_ptz(false);
+        b.set_ptz_open(false);
+        b.set_single_privacy(false);
+        b.set_single_privacy_known(false);
         b.set_presets(ModelRc::default());
         b.set_ptz_message(SharedString::new());
         b.set_ptz_busy(false);
@@ -540,6 +589,162 @@ impl App {
         });
     }
 
+    // ------------------------------------------------------------------ home
+
+    /// Rebuilds the Home cards from the camera list.
+    fn refresh_home_cards(&self) {
+        let cfg = self.cfg.borrow();
+        let thumbs = self.thumbnails.borrow();
+        let states = self.home_states.borrow();
+        let cards: Vec<HomeCard> = cfg
+            .cameras
+            .iter()
+            .map(|c| {
+                let thumb = thumbs.get(&c.id).cloned();
+                HomeCard {
+                    id: c.id as i32,
+                    name: c.name.as_str().into(),
+                    detail: match &c.cloud {
+                        Some(link) if !link.model.is_empty() => link.model.as_str().into(),
+                        Some(_) => "Tapo camera".into(),
+                        None => "Not linked to your Tapo account".into(),
+                    },
+                    has_thumb: thumb.is_some(),
+                    thumb: thumb.map(Image::from_rgb8).unwrap_or_default(),
+                    state: states.get(&c.id).map(String::as_str).unwrap_or("").into(),
+                }
+            })
+            .collect();
+        self.home_cards.set_vec(cards);
+    }
+
+    /// Keeps the newest picture of each streaming camera for its Home card.
+    fn capture_thumbnails(&self) {
+        let streams = self.streams.borrow();
+        let mut thumbs = self.thumbnails.borrow_mut();
+        for (key, live) in streams.iter() {
+            if let Some(frame) = live.handle.latest_frame() {
+                thumbs.insert(key.0, frame);
+            }
+        }
+    }
+
+    /// On Home, each camera without a picture streams until its first frame,
+    /// which becomes its card's picture; cameras that can't be reached get a
+    /// badge instead.
+    fn pump_home(&self) {
+        let mut captured = Vec::new();
+        let mut changed = false;
+        {
+            let streams = self.streams.borrow();
+            let mut states = self.home_states.borrow_mut();
+            for (key, live) in streams.iter() {
+                let slot = live.handle.slot.lock().unwrap();
+                if let Some(frame) = slot.frame.clone() {
+                    self.thumbnails.borrow_mut().insert(key.0, frame);
+                    states.remove(&key.0);
+                    captured.push(*key);
+                    changed = true;
+                    continue;
+                }
+                let status = slot.status_text();
+                let badge = if status.contains("offline") {
+                    "Offline"
+                } else if status.contains("Privacy mode is on") {
+                    "Privacy mode"
+                } else {
+                    ""
+                };
+                if states.get(&key.0).map(String::as_str).unwrap_or("") != badge {
+                    if badge.is_empty() {
+                        states.remove(&key.0);
+                    } else {
+                        states.insert(key.0, badge.to_string());
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if !captured.is_empty() {
+            let mut streams = self.streams.borrow_mut();
+            for key in &captured {
+                streams.remove(key);
+            }
+        }
+        if changed {
+            self.refresh_home_cards();
+        }
+    }
+
+    /// The hub card on Home: its recordings.
+    fn open_hub(&self, index: i32) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let switching = b.get_rec_hub() != index;
+        b.set_rec_hub(index);
+        self.navigate(Page::Recordings);
+        if (switching || !b.get_hub_connected()) && !b.get_hub_busy() {
+            self.connect_hub();
+        }
+    }
+
+    /// "Playback & Download" in the camera view: this camera's recordings on
+    /// the hub.
+    fn open_playback(&self) {
+        let Some((id, _)) = *self.single.borrow() else { return };
+        let name = self.cfg.borrow().camera(id).map(|c| c.name.clone()).unwrap_or_default();
+        self.navigate(Page::Recordings);
+        if self.cfg.borrow().hubs.is_empty() {
+            self.status("Recordings are read from the H500: add it under Settings › Hubs first.");
+            return;
+        }
+        *self.pending_rec_camera.borrow_mut() = Some(name);
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_hub_connected() {
+            self.select_pending_rec_camera();
+        } else if !b.get_hub_busy() {
+            self.connect_hub();
+        }
+    }
+
+    fn select_pending_rec_camera(&self) {
+        let Some(name) = self.pending_rec_camera.borrow_mut().take() else { return };
+        let index = self.hub.borrow().paired.iter().position(|p| same_name(&p.alias, &name));
+        match index {
+            Some(i) => {
+                self.ui().global::<Bridge>().set_rec_camera(i as i32);
+                self.load_recordings();
+            }
+            None => {
+                self.status(format!("{name} isn't paired with this hub; pick a camera."));
+                self.load_recordings();
+            }
+        }
+    }
+
+    /// The Privacy Mode tile.
+    fn privacy_toggle(&self) {
+        let Some((id, _)) = *self.single.borrow() else { return };
+        let current = self.ptz.borrow().get(&id).and_then(|p| p.state.lock().unwrap().privacy);
+        if let Some(on) = current {
+            self.ptz_send(PtzCmd::Privacy(!on));
+        }
+    }
+
+    /// Privacy mode changed: reconnect the camera's video.
+    pub fn privacy_changed(&self, camera_id: u32) {
+        self.streams.borrow_mut().retain(|k, _| k.0 != camera_id);
+        if self.single.borrow().is_some_and(|k| k.0 == camera_id) {
+            *self.single_shown.borrow_mut() = (0, String::new());
+            let ui = self.ui();
+            let b = ui.global::<Bridge>();
+            b.set_single_has_frame(false);
+            b.set_single_frame(Image::default());
+        }
+        self.sync_streams();
+    }
+
     // ------------------------------------------------------------------- PTZ
 
     fn ptz_send(&self, cmd: PtzCmd) {
@@ -566,6 +771,8 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_single_ptz(state.supported == Some(true));
+        b.set_single_privacy_known(state.privacy.is_some());
+        b.set_single_privacy(state.privacy == Some(true));
         b.set_ptz_busy(state.busy);
         b.set_ptz_message(state.message.as_str().into());
         let rows: Vec<PresetRow> = state
@@ -584,6 +791,7 @@ impl App {
         let cfg = self.cfg.borrow();
         b.set_ffmpeg_path(cfg.ffmpeg_path.as_str().into());
         b.set_renderer_index(cfg.renderer.index());
+        b.set_theme_index(cfg.theme.index());
         b.set_config_path(config::config_path().display().to_string().into());
         b.set_ffmpeg_found(
             match &*self.ffmpeg.borrow() {
@@ -609,8 +817,10 @@ impl App {
                 cfg.renderer = renderer;
                 self.status("Renderer will change after restarting the app.");
             }
+            cfg.theme = Theme::from_index(b.get_theme_index());
         }
         self.persist();
+        ui.invoke_set_theme(self.cfg.borrow().theme.index());
         *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
         // A different ffmpeg: reconnect the streams.
         self.streams.borrow_mut().clear();
@@ -652,6 +862,8 @@ impl App {
             })
             .collect();
         self.tiles.set_vec(tiles);
+        drop(cfg);
+        self.refresh_home_cards();
         *self.last_grid_size.borrow_mut() = Default::default();
         for live in self.streams.borrow_mut().values_mut() {
             live.shown_version = 0;
@@ -877,6 +1089,8 @@ impl App {
             (Ok(_), None) => "Not signed in".to_string(),
         };
         b.set_cloud_status(status.into());
+        let account = if session.is_some() { self.cfg.borrow().cloud.account.clone() } else { String::new() };
+        b.set_account_name(account.into());
     }
 
     // --------------------------------------------------------- sign-in screens
@@ -1123,7 +1337,7 @@ impl App {
         self.ptz.borrow_mut().clear();
         self.refresh_cloud_ui();
         self.refresh_camera_lists();
-        self.navigate(Page::Live);
+        self.navigate(Page::Home);
         self.restart_streams();
         self.cloud_refresh();
     }
@@ -1390,7 +1604,11 @@ impl App {
             }
             Err(e) => b.set_hub_message(format!("Could not connect: {e}").into()),
         }
-        self.load_recordings();
+        if self.pending_rec_camera.borrow().is_some() {
+            self.select_pending_rec_camera();
+        } else {
+            self.load_recordings();
+        }
     }
 
     fn change_day(&self, delta: i32) {
