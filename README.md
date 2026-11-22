@@ -167,7 +167,9 @@ TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/f
 
 Sign in with any email and the password `secret`. "Back yard" is reported offline; "Front door"
 has pan/tilt and "Garage" hasn't. The H500 "HomeBase" has recordings of "Front door" (today,
-yesterday and three days ago) and "Garage" (today).
+yesterday and three days ago) and "Garage" (today). Like a real hub it serves only two downloads
+at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
+open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output.
 
 ## Troubleshooting
 

@@ -82,12 +82,16 @@ pub async fn download(
 
     let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(64 * 1024, read_half);
-    relay::read_response_head(&mut reader).await?;
-
     let session = Arc::new(Mutex::new(None::<String>));
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(write_parts(write_half, rx));
-    let heartbeat = tokio::spawn({
+    // From here on the hub has a session for us. The guard ends it however
+    // this function ends, including when the download is cancelled (the
+    // player stopped, another clip picked): it says stop, stops the
+    // heartbeat, and lets the writer close the connection.
+    let mut guard = SessionGuard { tx: Some(tx.clone()), session: session.clone(), heartbeat: None };
+    relay::read_response_head(&mut reader).await?;
+    guard.heartbeat = Some(tokio::spawn({
         let (tx, session) = (tx.clone(), session.clone());
         async move {
             let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
@@ -99,9 +103,9 @@ pub async fn download(
                 }
             }
         }
-    });
+    }));
 
-    let mut state = Download { tx: tx.clone(), session: session.clone(), clock: TsClock::default(), got: Progress::default(), last_sequence: None };
+    let mut state = Download { tx, session: session.clone(), clock: TsClock::default(), got: Progress::default(), last_sequence: None };
     let expected = request.clip.seconds() as f64;
     let deadline = Instant::now() + Duration::from_secs(request.clip.seconds().max(0) as u64 + 300);
     let result = async {
@@ -127,13 +131,11 @@ pub async fn download(
     }
     .await;
 
-    // Best effort: release the hub's download slot either way.
+    // Release the hub's download slot either way.
     let got = state.got;
-    let _ = tx.send(control_part(&session, &[], &json!({"type": "request", "seq": 2, "params": {"method": "do", "stop": "null"}})));
-    drop(tx);
     drop(state);
-    heartbeat.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+    drop(guard);
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
     result?;
     if got.bytes == 0 {
         bail!("The hub finished without sending any video");
@@ -163,6 +165,31 @@ fn download_request(seq: u32, request: &ClipRequest) -> Value {
     })
 }
 
+/// Ends the hub's download session when dropped: sends `stop`, stops the
+/// heartbeat and drops its sender, so the writer task sends what's queued,
+/// closes the connection and ends. Without this, a cancelled download would
+/// leave the heartbeat keeping the session alive on the hub, which has only
+/// a few, until the app exits.
+struct SessionGuard {
+    tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    session: Arc<Mutex<Option<String>>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        if let Some(tx) = self.tx.take() {
+            let stop = json!({"type": "request", "seq": 2, "params": {"method": "do", "stop": "null"}});
+            if tx.send(control_part(&self.session, &[], &stop)).is_ok() {
+                log::info!("clip: told the hub to stop");
+            }
+        }
+    }
+}
+
 fn control_part(session: &Mutex<Option<String>>, extra: &[(&str, &str)], message: &Value) -> Vec<u8> {
     let session = session.lock().unwrap().clone();
     let mut headers: Vec<(&str, &str)> = Vec::new();
@@ -174,13 +201,21 @@ fn control_part(session: &Mutex<Option<String>>, extra: &[(&str, &str)], message
     relay::client_part(&headers, message.to_string().as_bytes())
 }
 
+/// Sends the client's parts until every sender is gone, then closes the
+/// connection. Never waits long on a stuck connection, so it always ends.
 async fn write_parts<W: tokio::io::AsyncWrite + Unpin>(mut writer: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+    const WAIT: Duration = Duration::from_secs(10);
     while let Some(part) = rx.recv().await {
-        if writer.write_all(&part).await.is_err() || writer.flush().await.is_err() {
+        let sent = tokio::time::timeout(WAIT, async {
+            writer.write_all(&part).await?;
+            writer.flush().await
+        })
+        .await;
+        if !matches!(sent, Ok(Ok(()))) {
             return;
         }
     }
-    let _ = writer.shutdown().await;
+    let _ = tokio::time::timeout(WAIT, writer.shutdown()).await;
 }
 
 struct Download {
