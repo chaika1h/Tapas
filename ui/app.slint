@@ -1885,8 +1885,10 @@ component PlaybackPage inherits Rectangle {
                 video := Rectangle {
                     vertical-stretch: 1;
                     min-height: 200px;
-                    // 16:9 when there's room; all of the screen in full screen.
+                    // 16:9 when there's room, the same with or without a picture;
+                    // all of the screen in full screen.
                     max-height: Bridge.fullscreen ? 100000px : self.width * 9 / 16;
+                    preferred-height: Bridge.fullscreen ? 100000px : self.width * 9 / 16;
                     background: Bridge.fullscreen ? black : #0d0d0d;
                     border-radius: Bridge.fullscreen ? 0 : 14px;
                     clip: true;
@@ -2111,7 +2113,8 @@ component PlaybackPage inherits Rectangle {
                         if d.done: Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(d.path); } }
                     }
                 }
-                if !Bridge.fullscreen: Rectangle { vertical-stretch: 1; }
+                // Takes what's left under the player, not a share of its room.
+                if !Bridge.fullscreen: Rectangle { vertical-stretch: 0.001; }
             }
 
             // Camera, calendar and the day's recordings.

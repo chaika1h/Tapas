@@ -374,8 +374,10 @@ class Handler(BaseHTTPRequestHandler):
             result = {"device_info": {"basic_info": {"device_alias": "HomeBase", "device_model": "H500",
                                                      "sw_version": "1.2.3 Build 250101 Rel.1", "local_ip": "192.168.1.40"}}}
         elif method == "getSdCardStatus":
-            result = {"harddisk_manage": {"hd_info": [{"hd_info_1": {
-                "disk_name": "1", "total_space": "1.8TB", "free_space": "1.2TB", "status": "normal"}}]}}
+            # An H500: its own storage, and the hard disk.
+            result = {"harddisk_manage": {"hd_info": [
+                {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.44GB", "status": "normal"}},
+                {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931.5GB", "free_space": "812.0GB", "status": "normal"}}]}}
         elif method == "searchDetectionList":
             query = params.get("playback", {}).get("search_detection_list", {})
             camera = query.get("child_device_id")

@@ -156,7 +156,12 @@ impl AppConfig {
 
 fn account_hubs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CloudCamera>, D::Error> {
     let hubs: Vec<CloudCamera> = Vec::deserialize(d)?;
-    Ok(hubs.into_iter().filter(|h| !h.device_id.is_empty()).collect())
+    Ok(hubs
+        .into_iter()
+        .filter(|h| !h.device_id.is_empty())
+        // Saved before names were decoded (an H500 as "VGFwbyBINTAw").
+        .map(|h| CloudCamera { name: crate::cloud::decode_name(&h.name), ..h })
+        .collect())
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {
@@ -225,10 +230,11 @@ mod tests {
     fn hubs_from_the_local_version_are_dropped() {
         let cfg: AppConfig = serde_json::from_str(
             r#"{"hubs": [{"id": 1, "name": "HomeBase", "host": "192.168.1.40"},
-                         {"device_id": "HUB1", "name": "HomeBase", "model": "H500"}]}"#,
+                         {"device_id": "HUB1", "name": "VGFwbyBINTAw", "model": "H500"}]}"#,
         )
         .unwrap();
         assert_eq!(cfg.hubs.len(), 1);
         assert_eq!(cfg.hubs[0].device_id, "HUB1");
+        assert_eq!(cfg.hubs[0].name, "Tapo H500");
     }
 }
