@@ -233,6 +233,10 @@ pub struct Disk {
     pub free_bytes: u64,
     /// "normal", "unformatted"...
     pub status: String,
+    /// Drive temperature in Celsius when reported by the hub (e.g. SATA HDD).
+    pub temperature_c: Option<i64>,
+    /// Power-on hours when reported by SMART on the hub's drive.
+    pub power_on_hours: Option<u64>,
 }
 
 impl Disk {
@@ -240,6 +244,114 @@ impl Disk {
     pub fn used(&self) -> Option<f32> {
         (self.total_bytes > 0 && !self.free.is_empty())
             .then(|| 1.0 - (self.free_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32)
+    }
+}
+
+/// Camera night-vision / day-night mode (Tapo C520WS & compatible cameras).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NightVisionMode {
+    #[default]
+    Auto,
+    Day,
+    Infrared,
+    Color,
+    Smart,
+}
+
+impl NightVisionMode {
+    pub fn index(self) -> i32 {
+        match self {
+            Self::Auto => 0,
+            Self::Day => 1,
+            Self::Infrared => 2,
+            Self::Color => 3,
+            Self::Smart => 4,
+        }
+    }
+
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::Day,
+            2 => Self::Infrared,
+            3 => Self::Color,
+            4 => Self::Smart,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Day => "Day",
+            Self::Infrared => "Infrared",
+            Self::Color => "Color",
+            Self::Smart => "Smart",
+        }
+    }
+}
+
+/// Motor patrol (cruise) direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatrolAxis {
+    Horizontal,
+    Vertical,
+}
+
+impl PatrolAxis {
+    pub fn coord(self) -> &'static str {
+        match self {
+            Self::Horizontal => "x",
+            Self::Vertical => "y",
+        }
+    }
+}
+
+/// Snapshot of a camera's live capabilities and toggle states, fetched in one
+/// batched request when opening the camera view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CameraControls {
+    pub ptz: bool,
+    pub privacy: Option<bool>,
+    pub spotlight: Option<bool>,
+    pub night_vision: Option<NightVisionMode>,
+    pub auto_track: Option<bool>,
+    pub siren_on: Option<bool>,
+}
+
+/// Category filter for the Playback / AI Events list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventFilter {
+    #[default]
+    All,
+    Person,
+    Vehicle,
+    Pet,
+    Motion,
+    Alerts,
+}
+
+impl EventFilter {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::Person,
+            2 => Self::Vehicle,
+            3 => Self::Pet,
+            4 => Self::Motion,
+            5 => Self::Alerts,
+            _ => Self::All,
+        }
+    }
+
+    pub fn matches(self, d: &Detection) -> bool {
+        let has = |pred: fn(i64) -> bool| pred(d.kind) || d.kinds.iter().copied().any(pred);
+        match self {
+            Self::All => true,
+            Self::Person => has(|k| matches!(k, 6 | 20..=22 | 27)),
+            Self::Vehicle => has(|k| k == 8),
+            Self::Pet => has(|k| matches!(k, 9 | 11 | 12)),
+            Self::Motion => has(|k| k == 2),
+            Self::Alerts => has(|k| matches!(k, 3..=5 | 13..=16 | 19)),
+        }
     }
 }
 
@@ -809,22 +921,24 @@ impl CloudClient {
         parse_camera_answer(status, &bytes)
     }
 
-    /// Whether the camera has pan/tilt, and whether privacy mode is on
-    /// (`None` if the camera has no privacy mode), in one round trip.
-    pub async fn camera_overview(&self, camera: &CloudCamera) -> Result<(bool, Option<bool>)> {
+    /// Fetches a camera's capabilities and live toggle states (PTZ, privacy,
+    /// spotlight, night vision, auto-tracking, manual alarm) in one batched
+    /// cloud round trip.
+    pub async fn camera_controls(&self, camera: &CloudCamera) -> Result<CameraControls> {
         let requests = vec![
             json!({
                 "method": "getAppComponentList",
                 "params": { "app_component": { "name": ["app_component_list"] } },
             }),
             json!({ "method": "getLensMaskConfig", "params": { "lens_mask": { "name": ["lens_mask_info"] } } }),
+            json!({ "method": "getForceWhitelampState", "params": { "image": { "name": ["switch"] } } }),
+            json!({ "method": "getNightVisionModeConfig", "params": { "image": { "name": ["switch"] } } }),
+            json!({ "method": "getDayNightModeConfig", "params": { "image": { "name": ["common"] } } }),
+            json!({ "method": "getTargetTrackConfig", "params": { "target_track": { "name": ["target_track_info"] } } }),
+            json!({ "method": "getManualAlarmStatus", "params": { "msg_alarm": { "get_manual_status": {} } } }),
         ];
         let responses = self.camera_requests(camera, requests).await?;
-        let components = result_for(&responses, "getAppComponentList", 0)?;
-        let list = components.pointer("/app_component/app_component_list").and_then(Value::as_array);
-        let ptz = list.is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz")));
-        let privacy = result_for(&responses, "getLensMaskConfig", 1).ok().and_then(|r| parse_lens_mask(&r));
-        Ok((ptz, privacy))
+        Ok(parse_camera_controls(&responses))
     }
 
     pub async fn privacy_mode(&self, camera: &CloudCamera) -> Result<bool> {
@@ -852,6 +966,134 @@ impl CloudClient {
             }
         }
         Err(last_error.unwrap_or_else(|| CloudError::new("Privacy mode didn't change; try again")))
+    }
+
+    /// Turns the camera's white spotlight on or off (falls back to
+    /// `reverseWhitelampStatus` on firmware that toggles instead of setting).
+    pub async fn set_spotlight(&self, camera: &CloudCamera, on: bool) -> Result<bool> {
+        let value = if on { "on" } else { "off" };
+        let request = json!({
+            "method": "setForceWhitelampState",
+            "params": { "image": { "switch": { "force_wtl_state": value } } },
+        });
+        if first_result(&self.camera_requests(camera, vec![request]).await?, "setForceWhitelampState").is_ok() {
+            return Ok(on);
+        }
+        let toggle = json!({
+            "method": "reverseWhitelampStatus",
+            "params": { "image": { "reverse_wtl_status": {} } },
+        });
+        first_result(&self.camera_requests(camera, vec![toggle]).await?, "reverseWhitelampStatus")?;
+        Ok(on)
+    }
+
+    /// Changes the camera's day/night and night-vision mode.
+    pub async fn set_night_vision(&self, camera: &CloudCamera, mode: NightVisionMode) -> Result<NightVisionMode> {
+        let requests = match mode {
+            NightVisionMode::Auto => vec![json!({
+                "method": "setDayNightModeConfig",
+                "params": { "image": { "common": { "inf_type": "auto" } } },
+            })],
+            NightVisionMode::Day => vec![json!({
+                "method": "setDayNightModeConfig",
+                "params": { "image": { "common": { "inf_type": "off" } } },
+            })],
+            NightVisionMode::Infrared => vec![
+                json!({
+                    "method": "setNightVisionModeConfig",
+                    "params": { "image": { "switch": { "night_vision_mode": "inf_night_vision" } } },
+                }),
+                json!({
+                    "method": "setDayNightModeConfig",
+                    "params": { "image": { "common": { "inf_type": "on" } } },
+                }),
+            ],
+            NightVisionMode::Color => vec![
+                json!({
+                    "method": "setNightVisionModeConfig",
+                    "params": { "image": { "switch": { "night_vision_mode": "wtl_night_vision" } } },
+                }),
+                json!({
+                    "method": "setDayNightModeConfig",
+                    "params": { "image": { "common": { "inf_type": "on" } } },
+                }),
+            ],
+            NightVisionMode::Smart => vec![
+                json!({
+                    "method": "setNightVisionModeConfig",
+                    "params": { "image": { "switch": { "night_vision_mode": "md_night_vision" } } },
+                }),
+                json!({
+                    "method": "setDayNightModeConfig",
+                    "params": { "image": { "common": { "inf_type": "auto" } } },
+                }),
+            ],
+        };
+        let responses = self.camera_requests(camera, requests).await?;
+        let any_ok = responses.iter().any(|r| r.get("error_code").and_then(Value::as_i64).unwrap_or(0) == 0);
+        if !any_ok {
+            let first = responses.first().cloned().unwrap_or(Value::Null);
+            let code = first.get("error_code").and_then(Value::as_i64).unwrap_or(-1);
+            return Err(CloudError::new(format!("The camera refused the night vision change (code {code})")));
+        }
+        Ok(mode)
+    }
+
+    /// Enables or disables pan/tilt motion auto-tracking.
+    pub async fn set_auto_track(&self, camera: &CloudCamera, on: bool) -> Result<bool> {
+        let value = if on { "on" } else { "off" };
+        let request = json!({
+            "method": "setTargetTrackConfig",
+            "params": { "target_track": { "target_track_info": { "enabled": value } } },
+        });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "setTargetTrackConfig")?;
+        Ok(on)
+    }
+
+    /// Starts horizontal or vertical motor patrol (cruise).
+    pub async fn start_patrol(&self, camera: &CloudCamera, axis: PatrolAxis) -> Result<()> {
+        let request = json!({
+            "method": "cruiseMove",
+            "params": { "motor": { "cruise": { "coord": axis.coord() } } },
+        });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "cruiseMove").map(drop)
+    }
+
+    /// Stops any active motor patrol (cruise).
+    pub async fn stop_patrol(&self, camera: &CloudCamera) -> Result<()> {
+        let request = json!({
+            "method": "cruiseStop",
+            "params": { "motor": { "cruise_stop": {} } },
+        });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "cruiseStop").map(drop)
+    }
+
+    /// Starts or stops the camera's manual siren/alarm.
+    pub async fn set_camera_alarm(&self, camera: &CloudCamera, on: bool) -> Result<bool> {
+        let action = if on { "start" } else { "stop" };
+        let manual = json!({
+            "method": "doManualAlarm",
+            "params": { "msg_alarm": { "manual_alarm": { "action": action } } },
+        });
+        if first_result(&self.camera_requests(camera, vec![manual]).await?, "doManualAlarm").is_ok() {
+            return Ok(on);
+        }
+        let status = if on { "on" } else { "off" };
+        let siren = json!({
+            "method": "setSirenStatus",
+            "params": { "siren": { "status": status } },
+        });
+        first_result(&self.camera_requests(camera, vec![siren]).await?, "setSirenStatus")?;
+        Ok(on)
+    }
+
+    /// Reboots a camera or hub.
+    pub async fn reboot_device(&self, device: &CloudCamera) -> Result<()> {
+        let request = json!({
+            "method": "rebootDevice",
+            "params": { "system": { "reboot": { "delay": 1 } } },
+        });
+        first_result(&self.camera_requests(device, vec![request]).await?, "rebootDevice").map(drop)
     }
 
     /// Moves the camera relative to where it is: `x > 0` pans right, `y > 0`
@@ -882,6 +1124,15 @@ impl CloudClient {
         // "Postion" is the API's spelling.
         let request = json!({ "method": "addMotorPostion", "params": { "preset": { "set_preset": { "name": name } } } });
         first_result(&self.camera_requests(camera, vec![request]).await?, "addMotorPostion").map(drop)
+    }
+
+    /// Deletes a saved pan/tilt preset by id.
+    pub async fn delete_preset(&self, camera: &CloudCamera, id: &str) -> Result<()> {
+        let request = json!({
+            "method": "deletePreset",
+            "params": { "preset": { "remove_preset": { "id": [id] } } },
+        });
+        first_result(&self.camera_requests(camera, vec![request]).await?, "deletePreset").map(drop)
     }
 
     // ------------------------------------------------------------------ hubs
@@ -1000,6 +1251,42 @@ impl CloudClient {
         let answer = serde_json::to_string(&storage).unwrap_or_default();
         log::info!("hub {}: its storage answers: {}", hub.name, answer.chars().take(3000).collect::<String>());
         Ok(parsed)
+    }
+
+    /// Enables or disables circular (loop) recording on a hub's storage.
+    pub async fn set_loop_recording(&self, hub: &CloudCamera, on: bool) -> Result<bool> {
+        let value = if on { "on" } else { "off" };
+        let request = json!({
+            "method": "setCircularRecordingConfig",
+            "params": { "harddisk_manage": { "harddisk": { "loop": value } } },
+        });
+        first_result(&self.camera_requests(hub, vec![request]).await?, "setCircularRecordingConfig")?;
+        Ok(on)
+    }
+
+    /// Triggers or silences the hub's built-in alarm/siren (tries the H500
+    /// camera-hub siren API first, falling back to the IoT hub `play_alarm` /
+    /// `stop_alarm` method).
+    pub async fn set_hub_alarm(&self, hub: &CloudCamera, on: bool) -> Result<bool> {
+        let status = if on { "on" } else { "off" };
+        let siren = json!({
+            "method": "setSirenStatus",
+            "params": { "siren": { "status": status } },
+        });
+        if first_result(&self.camera_requests(hub, vec![siren]).await?, "setSirenStatus").is_ok() {
+            return Ok(on);
+        }
+        let hub_ring = json!({
+            "method": "setHubRingStatus",
+            "params": { "hub_ring": { "config": { "status": status } } },
+        });
+        if first_result(&self.camera_requests(hub, vec![hub_ring]).await?, "setHubRingStatus").is_ok() {
+            return Ok(on);
+        }
+        let method = if on { "play_alarm" } else { "stop_alarm" };
+        let fallback = json!({ "method": method, "params": {} });
+        first_result(&self.camera_requests(hub, vec![fallback]).await?, method)?;
+        Ok(on)
     }
 
     /// The account's homes and rooms (as in the Tapo app), from the IoT
@@ -1319,6 +1606,12 @@ fn parse_hub_info(info: &Value, disk_answers: &[Value]) -> HubInfo {
             true => format!("{label} {}", spaced(&total)),
         };
         let status = str_field(disk, "status");
+        let temperature_c = disk
+            .get("temperature")
+            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+        let power_on_hours = disk
+            .get("power_on_hours")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
         let entry = Disk {
             label: label.clone(),
             total: spaced(&total),
@@ -1326,6 +1619,8 @@ fn parse_hub_info(info: &Value, disk_answers: &[Value]) -> HubInfo {
             total_bytes,
             free_bytes,
             status,
+            temperature_c,
+            power_on_hours,
         };
         let key = if label == "Internal" {
             (label, String::new())
@@ -1355,6 +1650,55 @@ fn parse_hub_info(info: &Value, disk_answers: &[Value]) -> HubInfo {
     parsed.storage = found.iter().map(|(_, t, _)| t.clone()).collect();
     parsed.disks = found.into_iter().map(|(_, _, d)| d).collect();
     parsed
+}
+
+fn on_off(v: Option<&Value>) -> Option<bool> {
+    match v {
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("on") || s == "1" || s.eq_ignore_ascii_case("true") => Some(true),
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("off") || s == "0" || s.eq_ignore_ascii_case("false") => Some(false),
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::Number(n)) => n.as_i64().map(|x| x != 0),
+        _ => None,
+    }
+}
+
+/// Parses the batched `camera_controls` response array.
+fn parse_camera_controls(responses: &[Value]) -> CameraControls {
+    let ptz = result_for(responses, "getAppComponentList", 0)
+        .ok()
+        .and_then(|c| c.pointer("/app_component/app_component_list").and_then(Value::as_array).cloned())
+        .is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz")));
+    let privacy = result_for(responses, "getLensMaskConfig", 1).ok().and_then(|r| parse_lens_mask(&r));
+    let spotlight = result_for(responses, "getForceWhitelampState", 2)
+        .ok()
+        .and_then(|r| {
+            on_off(r.pointer("/image/switch/force_wtl_state"))
+                .or_else(|| on_off(r.pointer("/image/get_wtl_status/status")))
+        });
+    let nv_str = result_for(responses, "getNightVisionModeConfig", 3)
+        .ok()
+        .and_then(|r| r.pointer("/image/switch/night_vision_mode").and_then(Value::as_str).map(str::to_string));
+    let inf_str = result_for(responses, "getDayNightModeConfig", 4)
+        .ok()
+        .and_then(|r| r.pointer("/image/common/inf_type").and_then(Value::as_str).map(str::to_string));
+    let night_vision = match (nv_str.as_deref(), inf_str.as_deref()) {
+        (Some("wtl_night_vision") | Some("color"), _) => Some(NightVisionMode::Color),
+        (Some("md_night_vision"), _) => Some(NightVisionMode::Smart),
+        (_, Some("off")) => Some(NightVisionMode::Day),
+        (_, Some("on")) | (Some("inf_night_vision"), _) => Some(NightVisionMode::Infrared),
+        (_, Some("auto")) => Some(NightVisionMode::Auto),
+        _ => None,
+    };
+    let auto_track = result_for(responses, "getTargetTrackConfig", 5)
+        .ok()
+        .and_then(|r| on_off(r.pointer("/target_track/target_track_info/enabled")));
+    let siren_on = result_for(responses, "getManualAlarmStatus", 6)
+        .ok()
+        .and_then(|r| {
+            on_off(r.pointer("/msg_alarm/get_manual_status/status"))
+                .or_else(|| on_off(r.pointer("/siren/status")))
+        });
+    CameraControls { ptz, privacy, spotlight, night_vision, auto_track, siren_on }
 }
 
 /// "HDD", "SSD", "Internal", "SD card" from a disk's `type`, else its name.
@@ -1819,6 +2163,8 @@ mod tests {
                     total_bytes: 931_500_000_000,
                     free_bytes: 812_000_000_000,
                     status: "normal".into(),
+                    temperature_c: None,
+                    power_on_hours: None,
                 },
                 Disk {
                     label: "Internal".into(),
@@ -1827,6 +2173,8 @@ mod tests {
                     total_bytes: 10_000_000_000,
                     free_bytes: 7_440_000_000,
                     status: "normal".into(),
+                    temperature_c: None,
+                    power_on_hours: None,
                 },
             ],
             loop_recording: None,
@@ -1840,11 +2188,11 @@ mod tests {
         ]}});
         let hdd = json!({"harddisk_manage": {"hd_info": [
             {"hd_info_1": {"type": "emmc", "disk_name": "1", "total_space": "9.00GB", "free_space": "0GB", "status": "normal"}},
-            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931GB", "free_space": "163.00GB", "status": "normal", "temperature": 38}}
+            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931GB", "free_space": "163.00GB", "status": "normal", "temperature": 52, "power_on_hours": 26703}}
         ]}});
         let both = parse_hub_info(&json!({}), &[hdd, sd]);
         assert_eq!(both.disks.len(), 2);
-        assert_eq!((both.disks[0].label.as_str(), both.disks[0].total.as_str()), ("HDD", "931 GB"));
+        assert_eq!((both.disks[0].label.as_str(), both.disks[0].total.as_str(), both.disks[0].temperature_c, both.disks[0].power_on_hours), ("HDD", "931 GB", Some(52), Some(26703)));
         assert_eq!((both.disks[1].label.as_str(), both.disks[1].total.as_str(), both.disks[1].free.as_str()), ("Internal", "10.00 GB", "7.45 GB"));
         assert!((used - 0.128).abs() < 0.01, "{used}");
         let broken = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "hdd", "total_space": "1TB", "status": "unformatted"}}]}});
@@ -1870,6 +2218,36 @@ mod tests {
         let families = json!({"data": [{"familyId": "f1", "familyName": "T2ZmaWNl"}]});
         let names: Vec<_> = objects_with(&families, &["familyId", "id"]).iter().filter_map(|f| name_of(f, &["familyName", "name"])).collect();
         assert_eq!(names, vec!["Office"]);
+    }
+
+    #[test]
+    fn camera_controls_and_event_filters() {
+        let answers = vec![
+            json!({"method": "getAppComponentList", "error_code": 0, "result": {"app_component": {"app_component_list": [{"name": "ptz"}]}}}),
+            json!({"method": "getLensMaskConfig", "error_code": 0, "result": {"lens_mask": {"lens_mask_info": {"enabled": "off"}}}}),
+            json!({"method": "getForceWhitelampState", "error_code": 0, "result": {"image": {"switch": {"force_wtl_state": "on"}}}}),
+            json!({"method": "getNightVisionModeConfig", "error_code": 0, "result": {"image": {"switch": {"night_vision_mode": "md_night_vision"}}}}),
+            json!({"method": "getDayNightModeConfig", "error_code": 0, "result": {"image": {"common": {"inf_type": "auto"}}}}),
+            json!({"method": "getTargetTrackConfig", "error_code": 0, "result": {"target_track": {"target_track_info": {"enabled": "on"}}}}),
+            json!({"method": "getManualAlarmStatus", "error_code": 0, "result": {"msg_alarm": {"get_manual_status": {"status": 0}}}}),
+        ];
+        assert_eq!(parse_camera_controls(&answers), CameraControls {
+            ptz: true,
+            privacy: Some(false),
+            spotlight: Some(true),
+            night_vision: Some(NightVisionMode::Smart),
+            auto_track: Some(true),
+            siren_on: Some(false),
+        });
+
+        let person_motion = Detection { start: 1, end: 2, kind: 6, kinds: vec![2, 6] };
+        let vehicle = Detection { start: 3, end: 4, kind: 8, kinds: vec![8] };
+        assert!(EventFilter::All.matches(&person_motion));
+        assert!(EventFilter::Person.matches(&person_motion));
+        assert!(EventFilter::Motion.matches(&person_motion));
+        assert!(!EventFilter::Vehicle.matches(&person_motion));
+        assert!(EventFilter::Vehicle.matches(&vehicle));
+        assert!(!EventFilter::Pet.matches(&vehicle));
     }
 
     #[test]

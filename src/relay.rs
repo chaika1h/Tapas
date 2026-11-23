@@ -198,11 +198,27 @@ impl std::error::Error for RelayBusy {}
 
 /// Copies the MPEG-TS carried in the multipart body to `out` until the relay
 /// stops, which is always an error for a live stream.
+#[cfg(test)]
 pub async fn copy_video<R, W>(reader: &mut R, out: &mut W) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    copy_video_with_audio(reader, out, 0).await
+}
+
+/// Like [`copy_video`], also demuxing and playing embedded MPEG-TS audio when
+/// `audio_id` is currently the active audio source (zero overhead while muted).
+pub async fn copy_video_with_audio<R, W>(reader: &mut R, out: &mut W, audio_id: u64) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut demux = crate::audio::TsAudioDemuxer::new();
+    let mut pcm_chunks = Vec::new();
+    let mut was_audible = false;
+    let mut buf = [0u8; 8192];
+
     loop {
         if !read_line(reader).await?.contains(BOUNDARY) {
             continue; // the blank line after a part, or anything unexpected
@@ -227,13 +243,44 @@ where
         if length == 0 {
             continue;
         }
+        let audible = crate::audio::is_active(audio_id);
+        if audible && !was_audible {
+            demux.reset();
+        }
+        was_audible = audible;
+
         let mut part = (&mut *reader).take(length);
-        let copied = timeout(DATA_TIMEOUT, tokio::io::copy_buf(&mut part, out))
-            .await
-            .map_err(|_| anyhow!("The camera stopped sending video"))?
-            .context("Video decoder stopped")?;
-        if copied < length {
-            bail!("The video relay closed the connection");
+        if !audible {
+            let copied = timeout(DATA_TIMEOUT, tokio::io::copy_buf(&mut part, out))
+                .await
+                .map_err(|_| anyhow!("The camera stopped sending video"))?
+                .context("Video decoder stopped")?;
+            if copied < length {
+                bail!("The video relay closed the connection");
+            }
+        } else {
+            let mut copied = 0u64;
+            while copied < length {
+                let n = timeout(DATA_TIMEOUT, part.read(&mut buf))
+                    .await
+                    .map_err(|_| anyhow!("The camera stopped sending video"))?
+                    .context("Lost the connection to the video relay")?;
+                if n == 0 {
+                    bail!("The video relay closed the connection");
+                }
+                copied += n as u64;
+                timeout(DATA_TIMEOUT, out.write_all(&buf[..n]))
+                    .await
+                    .map_err(|_| anyhow!("The camera stopped sending video"))?
+                    .context("Video decoder stopped")?;
+                if crate::audio::is_active(audio_id) {
+                    pcm_chunks.clear();
+                    demux.feed(&buf[..n], &mut pcm_chunks);
+                    for chunk in pcm_chunks.drain(..) {
+                        crate::audio::push_pcm(audio_id, chunk.sample_rate, &chunk.samples);
+                    }
+                }
+            }
         }
     }
 }

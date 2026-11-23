@@ -6,15 +6,23 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
-use crate::cloud::{CloudCamera, CloudClient, CloudError, MAX_MOVE};
+use crate::cloud::{CloudCamera, CloudClient, CloudError, MAX_MOVE, NightVisionMode, PatrolAxis};
 
 pub enum PtzCmd {
     /// Relative move: positive pans right / tilts up.
     Move(i32, i32),
     Goto(String),
     Save(String),
+    DeletePreset(String),
     Privacy(bool),
-    /// Re-reads what the camera supports, its privacy state and presets.
+    Spotlight(bool),
+    NightVision(NightVisionMode),
+    AutoTrack(bool),
+    PatrolStart(PatrolAxis),
+    PatrolStop,
+    Siren(bool),
+    Reboot,
+    /// Re-reads what the camera supports, its toggle states and presets.
     Refresh,
 }
 
@@ -28,6 +36,16 @@ pub struct PtzState {
     pub supported: Option<bool>,
     /// Privacy mode; `None` until known, or if the camera has none.
     pub privacy: Option<bool>,
+    /// White spotlight state; `None` if unsupported/unknown.
+    pub spotlight: Option<bool>,
+    /// Night vision mode; `None` if unsupported/unknown.
+    pub night_vision: Option<NightVisionMode>,
+    /// Motion auto-tracking; `None` if unsupported/unknown.
+    pub auto_track: Option<bool>,
+    /// Manual siren/alarm state; `None` if unsupported/unknown.
+    pub siren_on: Option<bool>,
+    /// Whether the user started patrol from this session.
+    pub patrolling: bool,
 }
 
 pub struct Ptz {
@@ -104,11 +122,15 @@ async fn run(
         // What the camera can do, before the first command (and on refresh).
         let known = state.lock().unwrap().supported.is_some();
         if !known || matches!(cmd, PtzCmd::Refresh) {
-            match client.camera_overview(&camera).await {
-                Ok((ptz, privacy)) => {
+            match client.camera_controls(&camera).await {
+                Ok(ctrl) => {
                     let mut s = state.lock().unwrap();
-                    s.supported = Some(ptz);
-                    s.privacy = privacy;
+                    s.supported = Some(ctrl.ptz);
+                    s.privacy = ctrl.privacy;
+                    s.spotlight = ctrl.spotlight;
+                    s.night_vision = ctrl.night_vision;
+                    s.auto_track = ctrl.auto_track;
+                    s.siren_on = ctrl.siren_on;
                 }
                 Err(e) => {
                     report(&e, &set);
@@ -130,13 +152,73 @@ async fn run(
                 }
                 Err(e) => Err(e),
             },
+            PtzCmd::Spotlight(on) => match client.set_spotlight(&camera, on).await {
+                Ok(now) => {
+                    state.lock().unwrap().spotlight = Some(now);
+                    Ok(if now { "Spotlight turned on." } else { "Spotlight turned off." }.to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::NightVision(mode) => match client.set_night_vision(&camera, mode).await {
+                Ok(now) => {
+                    state.lock().unwrap().night_vision = Some(now);
+                    Ok(format!("Night vision: {}.", now.label()))
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::AutoTrack(on) => match client.set_auto_track(&camera, on).await {
+                Ok(now) => {
+                    state.lock().unwrap().auto_track = Some(now);
+                    Ok(if now { "Auto-tracking is on." } else { "Auto-tracking is off." }.to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::Siren(on) => match client.set_camera_alarm(&camera, on).await {
+                Ok(now) => {
+                    state.lock().unwrap().siren_on = Some(now);
+                    Ok(if now { "Siren triggered." } else { "Siren stopped." }.to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::Reboot => match client.reboot_device(&camera).await {
+                Ok(()) => Ok("Rebooting camera…".to_string()),
+                Err(e) => Err(e),
+            },
             PtzCmd::Refresh if supported => load_presets(&client, &camera, &state).await.map(|_| String::new()),
             PtzCmd::Refresh => Ok(String::new()),
             _ if !supported => Ok("This camera has no pan/tilt.".to_string()),
-            PtzCmd::Move(x, y) => client.move_motor(&camera, x, y).await.map(|_| String::new()),
-            PtzCmd::Goto(id) => client.goto_preset(&camera, &id).await.map(|_| "Moving to preset…".into()),
+            PtzCmd::Move(x, y) => {
+                state.lock().unwrap().patrolling = false;
+                client.move_motor(&camera, x, y).await.map(|_| String::new())
+            }
+            PtzCmd::PatrolStart(axis) => match client.start_patrol(&camera, axis).await {
+                Ok(()) => {
+                    state.lock().unwrap().patrolling = true;
+                    Ok(match axis {
+                        PatrolAxis::Horizontal => "Horizontal patrol started.",
+                        PatrolAxis::Vertical => "Vertical patrol started.",
+                    }
+                    .to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::PatrolStop => match client.stop_patrol(&camera).await {
+                Ok(()) => {
+                    state.lock().unwrap().patrolling = false;
+                    Ok("Patrol stopped.".to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::Goto(id) => {
+                state.lock().unwrap().patrolling = false;
+                client.goto_preset(&camera, &id).await.map(|_| "Moving to preset…".into())
+            }
             PtzCmd::Save(name) => match client.save_preset(&camera, &name).await {
                 Ok(()) => load_presets(&client, &camera, &state).await.map(|_| format!("Saved preset “{name}”.")),
+                Err(e) => Err(e),
+            },
+            PtzCmd::DeletePreset(id) => match client.delete_preset(&camera, &id).await {
+                Ok(()) => load_presets(&client, &camera, &state).await.map(|_| "Preset deleted.".into()),
                 Err(e) => Err(e),
             },
         };

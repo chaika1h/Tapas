@@ -14,8 +14,8 @@ use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 
 use crate::clip::{self, ClipRequest};
 use crate::cloud::{
-    self, Clip, CloudCamera, CloudClient, Detection, Homes, HubCamera, HubInfo, Login, MfaChallenge, MfaMethod,
-    Session,
+    self, Clip, CloudCamera, CloudClient, Detection, EventFilter, Homes, HubCamera, HubInfo, Login, MfaChallenge,
+    MfaMethod, NightVisionMode, PatrolAxis, Session,
 };
 use crate::config::{self, AppConfig, CameraConfig, Quality, Renderer, Theme};
 use crate::playback::{Playback, SPEEDS, Source};
@@ -42,6 +42,7 @@ pub fn on_ui(f: impl FnOnce(&Rc<App>) + Send + 'static) {
 
 /// Stops all streams and background work. Call after the event loop exits.
 pub fn shutdown() {
+    crate::audio::shutdown();
     if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
         app.timer.stop();
         app.stop_event_pictures();
@@ -103,6 +104,11 @@ struct HubSession {
     /// What the camera detected that day, oldest first (empty if the hub
     /// doesn't list detections).
     events: Vec<Detection>,
+    /// Merged detections across all cameras on the hub when "All cameras" is selected.
+    all_events: Vec<(HubCamera, Detection)>,
+    /// When jumping from an "All cameras" event into that camera's recordings,
+    /// start playback at this Unix ms once loaded.
+    pending_play_at: Option<i64>,
     /// The list's rows, newest first, from `events` if there are any, else
     /// from `clips`, under a heading for each hour.
     rows: Vec<ListRow>,
@@ -113,18 +119,18 @@ struct HubSession {
 }
 
 /// A row of the Playback page's list.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum ListRow {
     /// The hour (Unix seconds of its start) the rows below it fall in.
     Hour(i64),
-    /// (start, end, kind)
-    Entry(i64, i64, i64),
+    /// (start, end, kind, optional camera when in "All cameras" view)
+    Entry(i64, i64, i64, Option<HubCamera>),
 }
 
 impl ListRow {
-    fn entry(&self) -> Option<(i64, i64, i64)> {
-        match *self {
-            ListRow::Entry(a, b, k) => Some((a, b, k)),
+    fn entry(&self) -> Option<(i64, i64, i64, Option<&HubCamera>)> {
+        match self {
+            ListRow::Entry(a, b, k, cam) => Some((*a, *b, *k, cam.as_ref())),
             ListRow::Hour(_) => None,
         }
     }
@@ -225,6 +231,16 @@ pub struct App {
     hub_info: RefCell<HashMap<String, HubInfo>>,
     /// Whether the hubs have been asked (whatever they answered).
     hub_info_tried: Cell<bool>,
+    /// Hub device ids currently sounding their alarm (toggled by user).
+    hub_alarms: RefCell<HashSet<String>>,
+    /// Hub device ids with an in-flight control request.
+    hub_busy_ids: RefCell<HashSet<String>>,
+    /// Live-view camera id currently unmuted (if any).
+    tile_audio_cam: Cell<Option<u32>>,
+    /// Whether Single camera view audio is unmuted.
+    single_audio_on: Cell<bool>,
+    /// Whether Playback player audio is unmuted.
+    player_audio_on: Cell<bool>,
     /// When the user last left Playback, so cached recordings and thumbnails
     /// are freed once idle elsewhere.
     playback_left_at: Cell<Option<Instant>>,
@@ -301,6 +317,11 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         homes: RefCell::default(),
         hub_info: RefCell::default(),
         hub_info_tried: Cell::default(),
+        hub_alarms: RefCell::default(),
+        hub_busy_ids: RefCell::default(),
+        tile_audio_cam: Cell::default(),
+        single_audio_on: Cell::default(),
+        player_audio_on: Cell::default(),
         playback_left_at: Cell::default(),
         timer_fast: Cell::new(true),
         rec_rows: Rc::new(VecModel::default()),
@@ -325,9 +346,20 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_toggle_fullscreen(cb!(&app, |a| a.toggle_fullscreen()));
     b.on_escape(cb!(&app, |a| a.escape()));
     b.on_open_camera(cb!(&app, |a, id| a.open_camera(id as u32)));
+    b.on_toggle_tile_audio(cb!(&app, |a, id| a.toggle_tile_audio(id as u32)));
     b.on_open_hub(cb!(&app, |a, i| a.open_hub(i)));
+    b.on_hub_toggle_loop(cb!(&app, |a, i| a.hub_toggle_loop(i as usize)));
+    b.on_hub_toggle_alarm(cb!(&app, |a, i| a.hub_toggle_alarm(i as usize)));
     b.on_single_back(cb!(&app, |a| a.single_back()));
+    b.on_single_toggle_audio(cb!(&app, |a| a.single_toggle_audio()));
     b.on_privacy_toggle(cb!(&app, |a| a.privacy_toggle()));
+    b.on_spotlight_toggle(cb!(&app, |a| a.spotlight_toggle()));
+    b.on_night_vision_changed(cb!(&app, |a, i| a.night_vision_changed(i)));
+    b.on_auto_track_toggle(cb!(&app, |a| a.auto_track_toggle()));
+    b.on_patrol_start(cb!(&app, |a, axis| a.patrol_start(axis)));
+    b.on_patrol_stop(cb!(&app, |a| a.ptz_send(PtzCmd::PatrolStop)));
+    b.on_siren_toggle(cb!(&app, |a| a.siren_toggle()));
+    b.on_camera_reboot(cb!(&app, |a| a.ptz_send(PtzCmd::Reboot)));
     b.on_open_playback(cb!(&app, |a| a.open_playback()));
     b.on_open_camera_playback(cb!(&app, |a, id| a.open_camera_playback(id as u32)));
     b.on_quality_changed(cb!(&app, |a, i| a.quality_changed(i)));
@@ -338,6 +370,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         a.ptz_send(PtzCmd::Save(name.trim().into()));
         a.ui().invoke_focus_keys(); // so the arrow keys pan again
     }));
+    b.on_ptz_delete(cb!(&app, |a, id| a.ptz_send(PtzCmd::DeletePreset(id.into()))));
     b.on_ptz_refresh(cb!(&app, |a| a.ptz_send(PtzCmd::Refresh)));
 
     b.on_save_settings(cb!(&app, |a| a.save_settings()));
@@ -357,6 +390,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_connect_hub(cb!(&app, |a| a.connect_hub()));
     b.on_rec_hub_changed(cb!(&app, |a| a.connect_hub()));
     b.on_rec_camera_changed(cb!(&app, |a| a.camera_picked()));
+    b.on_rec_filter_changed(cb!(&app, |a, _i| a.rec_filter_changed()));
     b.on_change_month(cb!(&app, |a, d| a.change_month(d)));
     b.on_go_today(cb!(&app, |a| a.set_rec_date(Local::now().date_naive())));
     b.on_pick_day(cb!(&app, |a, i| a.pick_day(i)));
@@ -364,6 +398,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_download(cb!(&app, |a, i| a.download(i as usize)));
     b.on_player_stop(cb!(&app, |a| a.player_stop()));
     b.on_player_toggle_pause(cb!(&app, |a| a.player_toggle_pause()));
+    b.on_player_toggle_audio(cb!(&app, |a| a.player_toggle_audio()));
     b.on_player_speed(cb!(&app, |a, i| a.player_speed(i)));
     b.on_player_snapshot(cb!(&app, |a| a.player_snapshot()));
     b.on_player_record(cb!(&app, |a| a.player_record()));
@@ -680,6 +715,64 @@ impl App {
         }
         drop(streams);
         self.sync_timer();
+        self.sync_audio();
+    }
+
+    /// Routes audio to whichever single source should currently be audible
+    /// based on the active page and mute toggles, and syncs the UI icons.
+    fn sync_audio(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let page = b.get_page();
+        let active_id = match page {
+            Page::Live => self.tile_audio_cam.get().and_then(|cam_id| {
+                let quality = self.cfg.borrow().camera(cam_id)?.grid_quality;
+                self.streams.borrow().get(&(cam_id, quality)).map(|l| l.handle.audio_id)
+            }),
+            Page::Single if self.single_audio_on.get() => {
+                let key = *self.single.borrow();
+                key.and_then(|k| self.streams.borrow().get(&k).map(|l| l.handle.audio_id))
+            }
+            Page::Recordings if self.player_audio_on.get() => {
+                self.watching.borrow().as_ref().map(|w| w.playback.audio_id)
+            }
+            _ => None,
+        };
+        crate::audio::set_active(active_id);
+
+        let single_on = page == Page::Single && self.single_audio_on.get();
+        if b.get_single_audio_on() != single_on {
+            b.set_single_audio_on(single_on);
+        }
+        let player_on = page == Page::Recordings && self.player_audio_on.get() && self.watching.borrow().is_some();
+        if b.get_player_audio_on() != player_on {
+            b.set_player_audio_on(player_on);
+        }
+        let tile_cam = if page == Page::Live { self.tile_audio_cam.get() } else { None };
+        for i in 0..self.tiles.row_count() {
+            let Some(mut tile) = self.tiles.row_data(i) else { continue };
+            let want = tile_cam == Some(tile.id as u32);
+            if tile.audio_on != want {
+                tile.audio_on = want;
+                self.tiles.set_row_data(i, tile);
+            }
+        }
+    }
+
+    fn toggle_tile_audio(&self, camera_id: u32) {
+        let next = if self.tile_audio_cam.get() == Some(camera_id) { None } else { Some(camera_id) };
+        self.tile_audio_cam.set(next);
+        self.sync_audio();
+    }
+
+    fn single_toggle_audio(&self) {
+        self.single_audio_on.set(!self.single_audio_on.get());
+        self.sync_audio();
+    }
+
+    fn player_toggle_audio(&self) {
+        self.player_audio_on.set(!self.player_audio_on.get());
+        self.sync_audio();
     }
 
     fn spec(&self, cam: &CameraConfig, quality: Quality) -> Option<StreamSpec> {
@@ -758,6 +851,7 @@ impl App {
         }
         if page != Page::Single {
             *self.single.borrow_mut() = None;
+            b.set_reboot_confirm(false);
             if b.get_single_has_frame() {
                 b.set_single_frame(Image::default());
                 b.set_single_has_frame(false);
@@ -782,6 +876,7 @@ impl App {
             }
         }
         self.sync_timer();
+        self.sync_audio();
     }
 
     fn set_fullscreen(&self, on: bool) {
@@ -837,11 +932,20 @@ impl App {
         b.set_single_stale(true);
         b.set_single_frame(placeholder.map(Image::from_rgba8_premultiplied).unwrap_or_default());
         b.set_single_status(self.tile_status(&cam).into());
-        // The pan/tilt and privacy tiles work once the camera has answered.
+        // The pan/tilt and control tiles update once the camera has answered.
         b.set_single_ptz(false);
         b.set_ptz_open(false);
         b.set_single_privacy(false);
         b.set_single_privacy_known(false);
+        b.set_single_spotlight(false);
+        b.set_single_spotlight_known(false);
+        b.set_single_nv_known(false);
+        b.set_single_nv_index(0);
+        b.set_single_track(false);
+        b.set_single_track_known(false);
+        b.set_single_patrolling(false);
+        b.set_single_siren(false);
+        b.set_reboot_confirm(false);
         b.set_presets(ModelRc::default());
         b.set_ptz_message(SharedString::new());
         b.set_ptz_busy(false);
@@ -1265,6 +1369,16 @@ impl App {
         b.set_single_ptz(state.supported == Some(true));
         b.set_single_privacy_known(state.privacy.is_some());
         b.set_single_privacy(state.privacy == Some(true));
+        b.set_single_spotlight_known(state.spotlight.is_some());
+        b.set_single_spotlight(state.spotlight == Some(true));
+        b.set_single_nv_known(state.night_vision.is_some());
+        if let Some(nv) = state.night_vision {
+            b.set_single_nv_index(nv.index());
+        }
+        b.set_single_track_known(state.auto_track.is_some());
+        b.set_single_track(state.auto_track == Some(true));
+        b.set_single_patrolling(state.patrolling);
+        b.set_single_siren(state.siren_on == Some(true));
         b.set_ptz_busy(state.busy);
         b.set_ptz_message(state.message.as_str().into());
         let rows: Vec<PresetRow> = state
@@ -1273,6 +1387,30 @@ impl App {
             .map(|(id, name)| PresetRow { id: id.into(), name: name.into() })
             .collect();
         b.set_presets(ModelRc::new(VecModel::from(rows)));
+    }
+
+    fn spotlight_toggle(&self) {
+        let on = !self.ui().global::<Bridge>().get_single_spotlight();
+        self.ptz_send(PtzCmd::Spotlight(on));
+    }
+
+    fn night_vision_changed(&self, index: i32) {
+        self.ptz_send(PtzCmd::NightVision(NightVisionMode::from_index(index)));
+    }
+
+    fn auto_track_toggle(&self) {
+        let on = !self.ui().global::<Bridge>().get_single_track();
+        self.ptz_send(PtzCmd::AutoTrack(on));
+    }
+
+    fn patrol_start(&self, axis: i32) {
+        let axis = if axis == 1 { PatrolAxis::Vertical } else { PatrolAxis::Horizontal };
+        self.ptz_send(PtzCmd::PatrolStart(axis));
+    }
+
+    fn siren_toggle(&self) {
+        let on = !self.ui().global::<Bridge>().get_single_siren();
+        self.ptz_send(PtzCmd::Siren(on));
     }
 
     // -------------------------------------------------------------- settings
@@ -1354,6 +1492,7 @@ impl App {
             .collect();
         b.set_cameras(ModelRc::new(VecModel::from(rows)));
 
+        let tile_cam = self.tile_audio_cam.get();
         let tiles: Vec<Tile> = cfg
             .cameras
             .iter()
@@ -1365,6 +1504,7 @@ impl App {
                 status: self.tile_status(c).into(),
                 live: false,
                 stale: true,
+                audio_on: tile_cam == Some(c.id),
             })
             .collect();
         self.tiles.set_vec(tiles);
@@ -1517,6 +1657,22 @@ impl App {
                 // problem, a line under it.
                 let main = info.disks.first();
                 let disk = main.map(|d| disk_name(&d.label)).unwrap_or_default();
+                let health = main
+                    .map(|d| {
+                        let mut parts = Vec::new();
+                        if let Some(t) = d.temperature_c {
+                            parts.push(format!("{t}°C"));
+                        }
+                        if let Some(h) = d.power_on_hours.filter(|&h| h > 0) {
+                            if h >= 48 {
+                                parts.push(format!("{} days on", h / 24));
+                            } else {
+                                parts.push(format!("{h} h on"));
+                            }
+                        }
+                        parts.join(" · ")
+                    })
+                    .unwrap_or_default();
                 let looping = info.loop_recording == Some(true);
                 let full = main.and_then(cloud::Disk::used).is_some_and(|u| u > 0.97);
                 let space = match main {
@@ -1538,12 +1694,11 @@ impl App {
                 if !info.storage_status.is_empty() {
                     note.push(info.storage_status.clone());
                 }
-                if looping && !full {
-                    note.push("Loop recording".into());
-                }
                 if known_none_after_try(loaded, main) {
                     note.push("The hub didn't say how its storage is.".into());
                 }
+                let alarm_on = self.hub_alarms.borrow().contains(&h.device_id);
+                let busy = self.hub_busy_ids.borrow().contains(&h.device_id);
                 HubRow {
                     id: i as i32,
                     name: h.name.as_str().into(),
@@ -1552,10 +1707,15 @@ impl App {
                     room: room.into(),
                     disk: disk.into(),
                     space: space.into(),
+                    health: health.into(),
                     used: main.and_then(cloud::Disk::used).unwrap_or(-1.0),
                     warn: full && !looping,
                     note: note.join("  ·  ").into(),
                     loaded,
+                    loop_known: info.loop_recording.is_some(),
+                    loop_on: looping,
+                    alarm_on,
+                    busy,
                 }
             })
             .collect();
@@ -1564,6 +1724,70 @@ impl App {
         if b.get_rec_hub() < 0 || b.get_rec_hub() as usize >= cfg.hubs.len() {
             b.set_rec_hub(0);
         }
+    }
+
+    fn hub_toggle_loop(&self, index: usize) {
+        let Some(hub) = self.cfg.borrow().hubs.get(index).cloned() else { return };
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        let currently = self.hub_info.borrow().get(&hub.device_id).and_then(|i| i.loop_recording) == Some(true);
+        let want = !currently;
+        let id = hub.device_id.clone();
+        self.hub_busy_ids.borrow_mut().insert(id.clone());
+        self.refresh_hub_lists();
+        self.rt.spawn(async move {
+            let result = client.set_loop_recording(&hub, want).await;
+            on_ui(move |app| {
+                app.hub_busy_ids.borrow_mut().remove(&id);
+                match result {
+                    Ok(now) => {
+                        if let Some(info) = app.hub_info.borrow_mut().get_mut(&id) {
+                            info.loop_recording = Some(now);
+                        }
+                        app.status(if now { "Loop recording turned on." } else { "Loop recording turned off." });
+                    }
+                    Err(e) => {
+                        if e.is_auth() {
+                            app.cloud_auth_failed();
+                        }
+                        app.status(format!("Could not change loop recording: {e}"));
+                    }
+                }
+                app.refresh_hub_lists();
+            });
+        });
+    }
+
+    fn hub_toggle_alarm(&self, index: usize) {
+        let Some(hub) = self.cfg.borrow().hubs.get(index).cloned() else { return };
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        let want = !self.hub_alarms.borrow().contains(&hub.device_id);
+        let id = hub.device_id.clone();
+        self.hub_busy_ids.borrow_mut().insert(id.clone());
+        self.refresh_hub_lists();
+        self.rt.spawn(async move {
+            let result = client.set_hub_alarm(&hub, want).await;
+            on_ui(move |app| {
+                app.hub_busy_ids.borrow_mut().remove(&id);
+                match result {
+                    Ok(now) => {
+                        if now {
+                            app.hub_alarms.borrow_mut().insert(id);
+                            app.status("Hub alarm triggered.");
+                        } else {
+                            app.hub_alarms.borrow_mut().remove(&id);
+                            app.status("Hub alarm stopped.");
+                        }
+                    }
+                    Err(e) => {
+                        if e.is_auth() {
+                            app.cloud_auth_failed();
+                        }
+                        app.status(format!("Could not toggle hub alarm: {e}"));
+                    }
+                }
+                app.refresh_hub_lists();
+            });
+        });
     }
 
     // ------------------------------------------------------------ Tapo cloud
@@ -2137,11 +2361,18 @@ impl App {
             1 => "1 camera".into(),
             n => format!("{n} cameras").into(),
         });
-        b.set_paired_names(string_model(cameras.iter().map(|c| {
+        let mut names = Vec::with_capacity(cameras.len() + 1);
+        if cameras.len() > 1 {
+            names.push("All cameras (events)".to_string());
+        }
+        names.extend(cameras.iter().map(|c| {
             if c.hub_storage { c.name.clone() } else { format!("{} (not recording to the hub)", c.name) }
-        })));
-        // A camera that records to the hub, unless one was asked for.
-        let first = cameras.iter().position(|c| c.hub_storage).unwrap_or(0);
+        }));
+        b.set_paired_names(string_model(names));
+        // Default to the first camera that records to the hub (offset by 1 if
+        // "All cameras" is listed at index 0), unless one was asked for.
+        let offset = usize::from(cameras.len() > 1);
+        let first = cameras.iter().position(|c| c.hub_storage).unwrap_or(0) + offset;
         b.set_rec_camera(first as i32);
         b.set_hub_connected(!cameras.is_empty());
         {
@@ -2198,25 +2429,37 @@ impl App {
         }
     }
 
+    fn rec_camera_combo_index(&self, device_id: &str, name: &str) -> Option<i32> {
+        let hub = self.hub.borrow();
+        let offset = usize::from(hub.cameras.len() > 1);
+        hub.cameras
+            .iter()
+            .position(|c| !device_id.is_empty() && c.device_id == device_id)
+            .or_else(|| hub.cameras.iter().position(|c| same_name(&c.name, name)))
+            .map(|i| (i + offset) as i32)
+    }
+
     fn select_pending_rec_camera(&self) {
         let Some((device_id, name)) = self.pending_rec_camera.borrow_mut().take() else { return };
-        let index = {
-            let hub = self.hub.borrow();
-            hub.cameras
-                .iter()
-                .position(|c| !device_id.is_empty() && c.device_id == device_id)
-                .or_else(|| hub.cameras.iter().position(|c| same_name(&c.name, &name)))
-        };
-        match index {
-            Some(i) => self.ui().global::<Bridge>().set_rec_camera(i as i32),
+        match self.rec_camera_combo_index(&device_id, &name) {
+            Some(i) => self.ui().global::<Bridge>().set_rec_camera(i),
             None => self.status(format!("{name} isn't paired with this hub; pick a camera.")),
         }
         self.camera_picked();
     }
 
+    fn all_cameras_mode(&self) -> bool {
+        self.hub.borrow().cameras.len() > 1 && self.ui().global::<Bridge>().get_rec_camera() == 0
+    }
+
     fn selected_rec_camera(&self) -> Option<HubCamera> {
+        let hub = self.hub.borrow();
         let index = self.ui().global::<Bridge>().get_rec_camera().max(0) as usize;
-        self.hub.borrow().cameras.get(index).cloned()
+        if hub.cameras.len() > 1 {
+            index.checked_sub(1).and_then(|i| hub.cameras.get(i).cloned())
+        } else {
+            hub.cameras.get(index).cloned()
+        }
     }
 
     fn camera_picked(&self) {
@@ -2225,6 +2468,7 @@ impl App {
             let mut session = self.hub.borrow_mut();
             session.days.clear();
             session.months.clear();
+            session.pending_play_at = None;
         }
         self.update_calendar();
         self.load_days(self.rec_month.get());
@@ -2348,7 +2592,8 @@ impl App {
 
     // ------------------------------------------------------------- the list
 
-    /// The day's recordings and detected events.
+    /// The day's recordings and detected events (or merged events across all
+    /// cameras when "All cameras" is selected).
     fn load_recordings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
@@ -2357,6 +2602,7 @@ impl App {
             session.rec_request += 1;
             session.clips.clear();
             session.events.clear();
+            session.all_events.clear();
             session.rows.clear();
             session.rec_request
         };
@@ -2365,15 +2611,33 @@ impl App {
         self.event_pictures.borrow_mut().clear();
         b.set_rec_message(SharedString::new());
         self.reset_timeline();
-        let (Some(client), Some(hub), Some(camera)) = (
-            self.cloud_client(),
-            self.hub.borrow().hub.clone(),
-            self.selected_rec_camera(),
-        ) else {
+        let (Some(client), Some(hub)) = (self.cloud_client(), self.hub.borrow().hub.clone()) else {
             return;
         };
         let date = *self.rec_date.borrow();
         let (start, end) = local_day(date);
+
+        if self.all_cameras_mode() {
+            let cameras = self.hub.borrow().cameras.clone();
+            b.set_rec_loading(true);
+            self.rt.spawn(async move {
+                let mut merged = Vec::new();
+                for cam in cameras {
+                    if let Ok(events) = client.hub_detections(&hub, &cam, start, end).await {
+                        for e in events {
+                            merged.push((cam.clone(), e));
+                        }
+                    }
+                }
+                merged.sort_by_key(|(_, e)| e.start);
+                on_ui(move |app| app.all_events_loaded(request, merged));
+            });
+            return;
+        }
+
+        let Some(camera) = self.selected_rec_camera() else {
+            return;
+        };
         let player_id = self.player_id.clone();
         b.set_rec_loading(true);
         self.rt.spawn(async move {
@@ -2390,6 +2654,29 @@ impl App {
         });
     }
 
+    fn all_events_loaded(&self, request: u64, merged: Vec<(HubCamera, Detection)>) {
+        if self.hub.borrow().rec_request != request {
+            return;
+        }
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_rec_loading(false);
+        let total = merged.len();
+        {
+            let mut session = self.hub.borrow_mut();
+            session.all_events = merged;
+        }
+        b.set_rec_message(
+            if total == 0 {
+                "No detected events across your cameras on this day.".into()
+            } else {
+                "Click any event to jump straight to that camera's recording.".into()
+            },
+        );
+        self.rebuild_rec_rows();
+        self.refresh_rec_rows();
+    }
+
     fn recordings_loaded(&self, request: u64, result: cloud::Result<Vec<Clip>>, events: Vec<Detection>) {
         if self.hub.borrow().rec_request != request {
             return;
@@ -2397,21 +2684,10 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_rec_loading(false);
+        let mut play_at = None;
         match result {
             Ok(clips) => {
                 let total: i64 = clips.iter().map(Clip::seconds).sum();
-                let mut entries: Vec<(i64, i64, i64)> = if events.is_empty() {
-                    clips.iter().map(|c| (c.start, c.end, c.kind)).collect()
-                } else {
-                    events.iter().map(|e| (e.start, e.end, e.kind)).collect()
-                };
-                entries.reverse(); // newest first
-                let rows = with_hours(&entries);
-                b.set_rec_list_title(match (events.len(), clips.len()) {
-                    (0, 0) => SharedString::new(),
-                    (0, n) => format!("Recordings · {n}").into(),
-                    (n, _) => format!("Detected events · {n}").into(),
-                });
                 b.set_rec_message(match clips.len() {
                     0 => SharedString::new(),
                     _ => format!("{} recorded this day", fmt_duration(total as u64)).into(),
@@ -2425,20 +2701,87 @@ impl App {
                 }
                 session.clips = clips;
                 session.events = events;
-                session.rows = rows;
+                play_at = session.pending_play_at.take();
             }
             Err(e) => {
                 if e.is_auth() {
                     self.cloud_auth_failed();
                 }
+                self.hub.borrow_mut().pending_play_at = None;
                 b.set_rec_list_title(SharedString::new());
                 b.set_rec_message(format!("Could not list the recordings: {e}").into());
             }
         }
+        self.rebuild_rec_rows();
         self.update_calendar();
         self.refresh_rec_rows();
         self.refresh_timeline();
-        self.fetch_event_pictures();
+        if let Some(at_ms) = play_at {
+            self.watch_from(at_ms);
+        } else {
+            self.fetch_event_pictures();
+        }
+    }
+
+    fn rec_filter_changed(&self) {
+        self.rebuild_rec_rows();
+        self.refresh_rec_rows();
+    }
+
+    /// Recomputes `session.rows` from `all_events` / `events` / `clips` using
+    /// the active AI event filter chip.
+    fn rebuild_rec_rows(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let filter = EventFilter::from_index(b.get_rec_filter());
+        let all_mode = self.all_cameras_mode();
+        let mut session = self.hub.borrow_mut();
+        if all_mode {
+            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                .all_events
+                .iter()
+                .filter(|(_, e)| filter.matches(e))
+                .map(|(cam, e)| (e.start, e.end, e.kind, Some(cam.clone())))
+                .collect();
+            entries.reverse(); // newest first
+            let shown = entries.len();
+            let total = session.all_events.len();
+            b.set_rec_list_title(match (shown, total) {
+                (0, 0) => SharedString::new(),
+                (s, t) if s == t => format!("All events · {s}").into(),
+                (s, t) => format!("Events · {s} of {t}").into(),
+            });
+            session.rows = with_hours(&entries);
+        } else if !session.events.is_empty() {
+            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                .events
+                .iter()
+                .filter(|e| filter.matches(e))
+                .map(|e| (e.start, e.end, e.kind, None))
+                .collect();
+            entries.reverse(); // newest first
+            let shown = entries.len();
+            let total = session.events.len();
+            b.set_rec_list_title(match (shown, total) {
+                (s, t) if s == t => format!("Detected events · {s}").into(),
+                (s, t) => format!("Events · {s} of {t}").into(),
+            });
+            session.rows = with_hours(&entries);
+        } else {
+            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                .clips
+                .iter()
+                .filter(|c| {
+                    filter == EventFilter::All
+                        || filter.matches(&Detection { start: c.start, end: c.end, kind: c.kind, kinds: vec![c.kind] })
+                })
+                .map(|c| (c.start, c.end, c.kind, None))
+                .collect();
+            entries.reverse();
+            let n = entries.len();
+            b.set_rec_list_title(if n == 0 { SharedString::new() } else { format!("Recordings · {n}").into() });
+            session.rows = with_hours(&entries);
+        }
     }
 
     /// The row that holds the picture being watched, if any.
@@ -2447,40 +2790,47 @@ impl App {
         let w = watching.as_ref()?;
         let position = w.playback.state.lock().unwrap().position_ms / 1000;
         let session = self.hub.borrow();
-        session.rows.iter().position(|r| r.entry().is_some_and(|(start, end, _)| start <= position && position <= end))
+        session.rows.iter().position(|r| r.entry().is_some_and(|(start, end, _, _)| start <= position && position <= end))
     }
 
     fn refresh_rec_rows(&self) {
-        let Some(camera) = self.selected_rec_camera() else { return };
+        let selected = self.selected_rec_camera();
+        let all_mode = self.all_cameras_mode();
+        if selected.is_none() && !all_mode {
+            return;
+        }
         let watched = self.watched_row();
         let session = self.hub.borrow();
-        let detected = !session.events.is_empty();
+        let detected = all_mode || !session.events.is_empty();
         let pictures = self.event_pictures.borrow();
         let rows: Vec<RecRow> = session
             .rows
             .iter()
             .enumerate()
-            .map(|(i, row)| match *row {
+            .map(|(i, row)| match row {
                 ListRow::Hour(hour) => RecRow {
                     header: true,
-                    time: local_time(hour).format("%H:00").to_string().into(),
+                    time: local_time(*hour).format("%H:00").to_string().into(),
                     ..Default::default()
                 },
-                ListRow::Entry(start, end, kind) => {
-                    let picture = pictures.get(&(camera.device_id.clone(), start));
+                ListRow::Entry(start, end, kind, row_cam) => {
+                    let cam = row_cam.as_ref().or(selected.as_ref());
+                    let picture = cam.and_then(|c| pictures.get(&(c.device_id.clone(), *start)));
+                    let saved = cam.is_some_and(|c| is_saved(&clip_path(c, *start)));
                     RecRow {
                         header: false,
                         time: if detected {
-                            local_time(start).format("%H:%M:%S").to_string().into()
+                            local_time(*start).format("%H:%M:%S").to_string().into()
                         } else {
-                            format!("{} – {}", local_time(start).format("%H:%M:%S"), local_time(end).format("%H:%M:%S"))
+                            format!("{} – {}", local_time(*start).format("%H:%M:%S"), local_time(*end).format("%H:%M:%S"))
                                 .into()
                         },
-                        kind: cloud::clip_kind(kind).into(),
-                        icon: kind_icon(kind),
-                        duration: fmt_duration((end - start).max(0) as u64).into(),
+                        camera: row_cam.as_ref().map(|c| c.name.as_str()).unwrap_or("").into(),
+                        kind: cloud::clip_kind(*kind).into(),
+                        icon: kind_icon(*kind),
+                        duration: fmt_duration((*end - *start).max(0) as u64).into(),
                         playing: watched == Some(i),
-                        saved: is_saved(&clip_path(&camera, start)),
+                        saved,
                         has_thumb: picture.is_some(),
                         thumb: picture.cloned().map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                     }
@@ -2493,6 +2843,7 @@ impl App {
                 let old = self.rec_rows.row_data(i);
                 let same = old.as_ref().is_some_and(|o| {
                     o.time == row.time
+                        && o.camera == row.camera
                         && o.playing == row.playing
                         && o.saved == row.saved
                         && o.has_thumb == row.has_thumb
@@ -2509,7 +2860,29 @@ impl App {
 
     /// A row of the list: watch from its start.
     fn play_row(&self, index: usize) {
-        let Some((start, _, _)) = self.hub.borrow().rows.get(index).and_then(ListRow::entry) else { return };
+        let entry = {
+            let session = self.hub.borrow();
+            session.rows.get(index).and_then(ListRow::entry).map(|(s, _, _, c)| (s, c.cloned()))
+        };
+        let Some((start, row_cam)) = entry else { return };
+        if let Some(cam) = row_cam {
+            // Clicked an event in the "All cameras" feed: switch to that
+            // camera and jump directly to the event's timestamp once loaded.
+            if let Some(idx) = self.rec_camera_combo_index(&cam.device_id, &cam.name) {
+                self.player_stop();
+                self.ui().global::<Bridge>().set_rec_camera(idx);
+                {
+                    let mut session = self.hub.borrow_mut();
+                    session.days.clear();
+                    session.months.clear();
+                    session.pending_play_at = Some(start * 1000);
+                }
+                self.update_calendar();
+                self.load_days(self.rec_month.get());
+                self.load_recordings();
+            }
+            return;
+        }
         self.watch_from(start * 1000);
     }
 
@@ -2534,6 +2907,7 @@ impl App {
             w.playback.seek(at_ms);
             w.playback.set_paused(false);
             self.sync_timer();
+            self.sync_audio();
             return;
         }
         let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
@@ -2581,6 +2955,7 @@ impl App {
         b.set_player_paused(false);
         self.timeline.borrow_mut().touched = None;
         self.sync_timer();
+        self.sync_audio();
     }
 
     /// Runs every ~30 ms on the Playback page.
@@ -2662,6 +3037,7 @@ impl App {
             self.fetch_event_pictures();
         }
         self.sync_timer();
+        self.sync_audio();
     }
 
     /// Play/pause; after the day's last recording, play from its first.
@@ -3030,8 +3406,12 @@ impl App {
 
     /// Saves a row's recording to `Videos\Tapas` without playing it.
     fn download(&self, index: usize) {
-        let Some((start, end, kind)) = self.hub.borrow().rows.get(index).and_then(ListRow::entry) else { return };
-        let (Some(hub), Some(camera)) = (self.hub.borrow().hub.clone(), self.selected_rec_camera()) else { return };
+        let entry = {
+            let session = self.hub.borrow();
+            session.rows.get(index).and_then(ListRow::entry).map(|(s, e, k, c)| (s, e, k, c.cloned()))
+        };
+        let Some((start, end, kind, row_cam)) = entry else { return };
+        let (Some(hub), Some(camera)) = (self.hub.borrow().hub.clone(), row_cam.or_else(|| self.selected_rec_camera())) else { return };
         let request = ClipRequest { hub, camera, clip: Clip { start, end, kind }, player_id: self.player_id.clone() };
         let path = clip_path(&request.camera, start);
         let label = format!("{} · {}", request.camera.name, local_time(start).format("%d %b %H:%M:%S"));
@@ -3110,17 +3490,17 @@ fn keep_app_accent(ui: &MainWindow) {
 }
 
 /// Rows newest first, with a heading at each new hour.
-fn with_hours(entries: &[(i64, i64, i64)]) -> Vec<ListRow> {
+fn with_hours(entries: &[(i64, i64, i64, Option<HubCamera>)]) -> Vec<ListRow> {
     let mut rows = Vec::new();
     let mut hour = None;
-    for &(start, end, kind) in entries {
-        let t = local_time(start);
+    for (start, end, kind, cam) in entries {
+        let t = local_time(*start);
         let this = t.timestamp() - (t.minute() as i64 * 60 + t.second() as i64);
         if hour != Some(this) {
             rows.push(ListRow::Hour(this));
             hour = Some(this);
         }
-        rows.push(ListRow::Entry(start, end, kind));
+        rows.push(ListRow::Entry(*start, *end, *kind, cam.clone()));
     }
     rows
 }

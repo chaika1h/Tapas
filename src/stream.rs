@@ -59,6 +59,8 @@ impl Slot {
 
 pub struct StreamHandle {
     pub slot: Arc<Mutex<Slot>>,
+    /// Audio source id for [`crate::audio`]; mute/unmute switches the active id.
+    pub audio_id: u64,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -70,8 +72,9 @@ impl StreamHandle {
             status: Status::Connecting,
             fps: 0.0,
         }));
-        let task = rt.spawn(run(spec, FrameSink::new(slot.clone())));
-        Self { slot, task }
+        let audio_id = crate::audio::next_source_id();
+        let task = rt.spawn(run(spec, FrameSink::with_audio(slot.clone(), audio_id)));
+        Self { slot, audio_id, task }
     }
 
     pub fn latest_frame(&self) -> Option<Frame> {
@@ -81,6 +84,7 @@ impl StreamHandle {
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
+        crate::audio::release(self.audio_id);
         self.task.abort();
     }
 }
@@ -88,6 +92,7 @@ impl Drop for StreamHandle {
 /// Where stream readers deliver decoded frames.
 pub struct FrameSink {
     slot: Arc<Mutex<Slot>>,
+    pub audio_id: u64,
     pub frames: u64,
     window_start: Instant,
     window_frames: u32,
@@ -97,8 +102,13 @@ pub struct FrameSink {
 }
 
 impl FrameSink {
+    #[cfg(test)]
     pub(crate) fn new(slot: Arc<Mutex<Slot>>) -> Self {
-        Self { slot, frames: 0, window_start: Instant::now(), window_frames: 0, first_frame: None }
+        Self::with_audio(slot, 0)
+    }
+
+    pub(crate) fn with_audio(slot: Arc<Mutex<Slot>>, audio_id: u64) -> Self {
+        Self { slot, audio_id, frames: 0, window_start: Instant::now(), window_frames: 0, first_frame: None }
     }
 
     /// Logs how long the next frame takes to come, from `started`.

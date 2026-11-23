@@ -81,6 +81,8 @@ enum Cmd {
 pub struct Playback {
     pub slot: Arc<Mutex<Slot>>,
     pub state: Arc<Mutex<PlayState>>,
+    /// Audio source id for [`crate::audio`]; mute/unmute switches the active id.
+    pub audio_id: u64,
     cmds: mpsc::UnboundedSender<Cmd>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -89,23 +91,31 @@ impl Playback {
     pub fn start(rt: &tokio::runtime::Handle, source: Source, at_ms: i64, speed: u32) -> Self {
         let slot = Arc::new(Mutex::new(Slot { frame: None, version: 0, status: Status::Connecting, fps: 0.0 }));
         let state = Arc::new(Mutex::new(PlayState { position_ms: at_ms, speed, buffering: true, ..Default::default() }));
+        let audio_id = crate::audio::next_source_id();
         let (cmds, rx) = mpsc::unbounded_channel();
         let mut segments = source.segments.clone();
         segments.sort_by_key(|c| c.start);
         let source = Source { segments, ..source };
-        let task = rt.spawn(run(source, FrameSink::new(slot.clone()), state.clone(), rx, at_ms));
-        Self { slot, state, cmds, task }
+        let task = rt.spawn(run(source, FrameSink::with_audio(slot.clone(), audio_id), state.clone(), rx, at_ms));
+        Self { slot, state, audio_id, cmds, task }
     }
 
     pub fn seek(&self, at_ms: i64) {
+        crate::audio::flush_if_active(self.audio_id);
         let _ = self.cmds.send(Cmd::Seek(at_ms));
     }
 
     pub fn set_paused(&self, paused: bool) {
+        if paused {
+            crate::audio::flush_if_active(self.audio_id);
+        }
         let _ = self.cmds.send(Cmd::Pause(paused));
     }
 
     pub fn set_speed(&self, speed: u32) {
+        if speed != 1 {
+            crate::audio::flush_if_active(self.audio_id);
+        }
         let _ = self.cmds.send(Cmd::Speed(speed));
     }
 
@@ -116,6 +126,7 @@ impl Playback {
 
 impl Drop for Playback {
     fn drop(&mut self) {
+        crate::audio::release(self.audio_id);
         // Dropping the task ends any download through its session guard.
         self.task.abort();
     }
@@ -265,6 +276,12 @@ async fn play_segment(
     let reading = tokio::spawn(read_frames(decoder, times, frames_tx));
     let _stop_reading = AbortOnDrop(reading);
 
+    let audio_id = sink.audio_id;
+    let recording = (source.camera.device_id.clone(), segment.start);
+    let mut audio_demux = crate::audio::TsAudioDemuxer::new();
+    let mut pcm_chunks = Vec::new();
+    let mut audio_cursor = from_ms - 1;
+    let mut audio_was_on = false;
     let mut first_time: Option<f64> = None;
     // (when, recorded ms) of the frame the pacing is measured from.
     let mut pace: Option<(Instant, i64)> = None;
@@ -383,6 +400,33 @@ async fn play_segment(
         last_display = Instant::now();
         shown += 1;
         sink.push(frame);
+
+        let (paused, speed) = {
+            let s = state.lock().unwrap();
+            (s.paused, s.speed.max(1))
+        };
+        let audio_on = !paused && speed == 1 && crate::audio::is_active(audio_id);
+        if audio_on {
+            if !audio_was_on {
+                audio_demux.reset();
+                audio_cursor = recorded - 1;
+            }
+            for (pts, data) in cached_pieces_between(&recording, audio_cursor, recorded + 150) {
+                audio_cursor = pts;
+                pcm_chunks.clear();
+                audio_demux.feed(&data, &mut pcm_chunks);
+                for chunk in pcm_chunks.drain(..) {
+                    crate::audio::push_pcm(audio_id, chunk.sample_rate, &chunk.samples);
+                }
+            }
+        } else {
+            if audio_was_on {
+                crate::audio::flush_if_active(audio_id);
+                audio_demux.reset();
+            }
+            audio_cursor = recorded;
+        }
+        audio_was_on = audio_on;
     }
 }
 
@@ -555,6 +599,23 @@ pub fn cached_video(camera_id: &str, recording_start: i64, from_ms: i64, to_ms: 
     let first = run.pieces.iter().rposition(|p| p.key && p.pts <= from_ms)?;
     run.used = std::time::Instant::now();
     Some(run.pieces.range(first..).take_while(|p| p.pts <= to_ms).map(|p| p.data.clone()).collect())
+}
+
+/// Cached MPEG-TS pieces of `recording` whose timestamp falls in `(after_ms, up_to_ms]`.
+fn cached_pieces_between(recording: &(String, i64), after_ms: i64, up_to_ms: i64) -> Vec<(i64, Arc<[u8]>)> {
+    let cache = CACHE.lock().unwrap();
+    let Some(run) = cache
+        .runs
+        .iter()
+        .find(|r| &r.recording == recording && r.pieces.front().is_some_and(|p| p.pts <= up_to_ms) && r.until > after_ms)
+    else {
+        return Vec::new();
+    };
+    run.pieces
+        .iter()
+        .filter(|p| p.pts > after_ms && p.pts <= up_to_ms)
+        .map(|p| (p.pts, p.data.clone()))
+        .collect()
 }
 
 /// Feeds ffmpeg the recording from `from_ms` to its end: what's in memory
