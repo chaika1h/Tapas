@@ -334,14 +334,16 @@ fn playback_request(seq: u32, request: &ClipRequest, client_id: i64) -> Value {
     })
 }
 
-/// Downloads a recording to `path`, through `partial` (see [`partial_path`]),
-/// which is renamed once the hub has sent all of it.
+/// Downloads a recording into `partial` (see [`partial_path`]) and remuxes it
+/// into an `.mp4` at `path` (or renames directly if `ffmpeg` is `None`).
 pub async fn save_clip(
     client: &CloudClient,
     request: &ClipRequest,
     path: &Path,
     partial: &Path,
+    ffmpeg: Option<&Path>,
     progress: &mut (dyn FnMut(Progress) + Send),
+    on_finalize: impl FnOnce() + Send,
 ) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
@@ -353,16 +355,28 @@ pub async fn save_clip(
         Ok(())
     };
     let result = download(client, request, &mut media, progress).await;
-    let result = result.and_then(|_| {
+    let dl = result.and_then(|_| {
         file.flush()?;
-        drop(file);
-        std::fs::rename(partial, path).with_context(|| format!("Could not save {}", path.display()))?;
         Ok(())
     });
-    if result.is_err() {
-        let _ = std::fs::remove_file(partial);
-    }
-    result
+    drop(file);
+    let final_result = match dl {
+        Ok(()) => {
+            if let Some(ff) = ffmpeg {
+                on_finalize();
+                let res = crate::ffmpeg::remux_ts_to_mp4(ff, partial, path).await;
+                let _ = std::fs::remove_file(partial);
+                res
+            } else {
+                std::fs::rename(partial, path).with_context(|| format!("Could not save {}", path.display()))
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(partial);
+            Err(e)
+        }
+    };
+    final_result
 }
 
 /// A download's own file until it's complete, so two downloads of a clip

@@ -8,6 +8,7 @@ mod clip;
 mod cloud;
 mod config;
 mod ffmpeg;
+mod i18n;
 mod pictures;
 mod playback;
 mod ptz;

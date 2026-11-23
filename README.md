@@ -117,8 +117,8 @@ needed, and nothing is saved unless you ask. Leaving the page pauses what's play
 seconds paused, Tapas lets go of the hub (so the Tapo app can play) and picks up where it was when
 you play on. What has arrived stays in memory for a while, so going
 back, or forward into it, starts at once. A jump elsewhere takes a few seconds while the hub
-answers. Days are in this PC's time zone. Saved recordings are `.ts` files, which VLC and Windows'
-media players play.
+answers. Days are in this PC's time zone. Saved recordings are standard `.mp4` files (lossless
+video copy with AAC audio and `+faststart`), ready to play anywhere or share in Slack, Teams, or email.
 
 ### Settings
 
@@ -203,11 +203,12 @@ are encrypted with Windows DPAPI, so only your Windows user can read them.
 | `src/main.rs` | Start-up, renderer choice (OpenGL default, software fallback), logging |
 | `src/app.rs` | The app's state and everything between the UI and the work below |
 | `src/chrome.rs` | Integrated Windows 11 borderless frame (`WM_NCCALCSIZE`, DWM rounded corners/shadow, Snap Layouts) |
+| `src/i18n.rs` | English & Turkish localization (`System` auto-detection + live switching) |
 | `ui/app.slint` | The whole UI |
 | `src/cloud.rs` | The Tapo cloud: sign-in, devices, homes, camera & hub pass-through RPCs, relays |
 | `src/relay.rs` | The relay connection (a long HTTP request carrying multipart parts) |
 | `src/audio.rs` | Pure-Rust MPEG-TS audio demuxer (G.711 & AAC) and Windows `waveOut` output |
-| `src/stream.rs`, `src/ffmpeg.rs` | Live video: relay → ffmpeg → RGBA frames |
+| `src/stream.rs`, `src/ffmpeg.rs` | Live video (relay → ffmpeg → RGBA frames) and lossless `.mp4` clip remuxing |
 | `src/ptz.rs` | Pan/tilt, patrol, presets, privacy, spotlight, night vision, auto-tracking, siren, reboot |
 | `src/clip.rs` | Hub recordings and event pictures over the relay |
 | `src/playback.rs` | Timeline playback: fetching ahead, the in-memory cache, pacing, speeds, 1× audio |
@@ -215,6 +216,7 @@ are encrypted with Windows DPAPI, so only your Windows user can read them.
 | `src/pictures.rs` | Cameras' last pictures and event pictures, kept on disk |
 | `src/config.rs`, `src/secret.rs` | Settings, and DPAPI encryption of secrets |
 | `installer/Tapas.nsi` | The installer (NSIS) |
+| `.github/workflows/release.yml` | Automated GitHub Actions Windows installer build & release on `v*` tags |
 | `tools/` | Build scripts, the icon, the fake cloud |
 | `vendor/` | The built-in ffmpeg (see `vendor/README.md`) |
 | `assets/`, `certs/`, `tests/fixtures/` | Icon, TP-Link's root certificates, test video |
@@ -242,8 +244,8 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 `build.rs` embeds `vendor/ffmpeg.exe` and the icon. `tools/build-ffmpeg.sh` rebuilds that ffmpeg
-(MPEG-TS, H.264 and H.265 in, raw frames out, nothing else), and `tools/make-icon.py` redraws the
-icon from the in-app logo.
+(MPEG-TS, H.264/H.265 decoding, raw frames out, and lossless MP4/AAC clip remuxing), and
+`tools/make-icon.py` redraws the icon from the in-app logo.
 
 ### Installer and releases
 
@@ -254,14 +256,15 @@ tools/build-installer.sh
 This builds `target/installer/Tapas-Setup-<version>.exe` (needs `makensis`) and its SHA-256 sum.
 The installer takes `/S` (silent) and `/RELAUNCH` (start Tapas afterwards), which the updater uses.
 
-To publish a release that installed copies update to, raise `version` in `Cargo.toml`, then:
+To publish a release automatically via GitHub Actions, bump `version` in `Cargo.toml`, commit, and
+push a matching tag:
 
 ```bash
-tools/release.sh chaika1h/tapas "What's new"
+git tag v<version> && git push origin v<version>
 ```
 
-To publish one by hand on GitHub instead, tag it `v<version>` and attach `Tapas-Setup-<version>.exe`
-itself, not zipped: installed copies look for that file.
+The workflow runs `cargo test`, builds `Tapas-Setup-<version>.exe` and `SHA256SUMS.txt`, and
+publishes the GitHub Release so installed copies offer the update on next start.
 
 ### Testing without devices
 

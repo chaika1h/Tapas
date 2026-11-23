@@ -17,7 +17,8 @@ use crate::cloud::{
     self, Clip, CloudCamera, CloudClient, Detection, EventFilter, Homes, HubCamera, HubInfo, Login, MfaChallenge,
     MfaMethod, NightVisionMode, PatrolAxis, Session,
 };
-use crate::config::{self, AppConfig, CameraConfig, Quality, Renderer, Theme};
+use crate::config::{self, AppConfig, CameraConfig, Language, Quality, Renderer, Theme};
+use crate::i18n;
 use crate::playback::{Playback, SPEEDS, Source};
 use crate::ptz::{Ptz, PtzCmd};
 use crate::secret::Secret;
@@ -341,6 +342,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     let theme_index = app.cfg.borrow().theme.index();
     ui.invoke_set_theme(theme_index);
     crate::chrome::install(ui, theme_index);
+    let lang = i18n::set(app.cfg.borrow().language);
+    i18n::apply_to_ui(ui, lang);
     b.set_downloads(app.downloads.clone().into());
     b.set_quality_labels(string_model(Quality::LABELS.iter().copied()));
 
@@ -1019,15 +1022,26 @@ impl App {
         let homes = self.homes.borrow();
         let title = match homes.names.as_slice() {
             [name, ..] => name.clone(),
-            [] => "Home".to_string(),
+            [] => i18n::pick("Home", "Ana sayfa").to_string(),
         };
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_home_title(title.into());
-        let plural = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
-        let mut subtitle = vec![plural(cfg.cameras.len(), "camera")];
+        let mut subtitle = vec![if i18n::is_tr() {
+            format!("{} kamera", cfg.cameras.len())
+        } else if cfg.cameras.len() == 1 {
+            "1 camera".to_string()
+        } else {
+            format!("{} cameras", cfg.cameras.len())
+        }];
         if !cfg.hubs.is_empty() {
-            subtitle.push(plural(cfg.hubs.len(), "hub"));
+            subtitle.push(if i18n::is_tr() {
+                format!("{} hub", cfg.hubs.len())
+            } else if cfg.hubs.len() == 1 {
+                "1 hub".to_string()
+            } else {
+                format!("{} hubs", cfg.hubs.len())
+            });
         }
         b.set_home_subtitle(subtitle.join(" · ").into());
         let has_hub = !cfg.hubs.is_empty();
@@ -1431,14 +1445,20 @@ impl App {
         b.set_ffmpeg_path(cfg.ffmpeg_path.as_str().into());
         b.set_renderer_index(cfg.renderer.index());
         b.set_theme_index(cfg.theme.index());
+        b.set_language_index(cfg.language.index());
         b.set_config_path(config::config_path().display().to_string().into());
         b.set_ffmpeg_found(
             match &*self.ffmpeg.borrow() {
-                Some(p) if crate::ffmpeg::is_bundled(p) => "Using the built-in ffmpeg.".to_string(),
-                Some(p) => format!("Using {}", p.display()),
-                None => "ffmpeg not found: live view needs it. Download ffmpeg (e.g. gyan.dev or BtbN builds) \
-                         and put ffmpeg.exe next to Tapas.exe."
-                    .into(),
+                Some(p) if crate::ffmpeg::is_bundled(p) => {
+                    i18n::pick("Using the built-in ffmpeg.", "Dahili ffmpeg kullanılıyor.").to_string()
+                }
+                Some(p) => format!("{} {}", i18n::pick("Using", "Kullanılan:"), p.display()),
+                None => i18n::pick(
+                    "ffmpeg not found: live view needs it. Download ffmpeg (e.g. gyan.dev or BtbN builds) \
+                     and put ffmpeg.exe next to Tapas.exe.",
+                    "ffmpeg bulunamadı: canlı izleme için gereklidir. ffmpeg.exe dosyasını Tapas.exe yanına koyun.",
+                )
+                .into(),
             }
             .into(),
         );
@@ -1450,29 +1470,46 @@ impl App {
     fn save_settings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let ffmpeg_changed = {
+        let (ffmpeg_changed, lang_changed) = {
             let mut cfg = self.cfg.borrow_mut();
             let renderer = Renderer::from_index(b.get_renderer_index());
             if renderer != cfg.renderer {
                 cfg.renderer = renderer;
-                self.status("The new renderer is used once Tapas restarts.");
+                self.status(i18n::pick(
+                    "The new renderer is used once Tapas restarts.",
+                    "Yeni grafik motoru Tapas yeniden başlatılınca uygulanır.",
+                ));
             }
             cfg.theme = Theme::from_index(b.get_theme_index());
+            let language = Language::from_index(b.get_language_index());
+            let lang_changed = language != cfg.language;
+            cfg.language = language;
             let path = b.get_ffmpeg_path().trim().to_string();
             let changed = path != cfg.ffmpeg_path;
             cfg.ffmpeg_path = path;
-            changed
+            (changed, lang_changed)
         };
         self.persist();
         let theme_index = self.cfg.borrow().theme.index();
         ui.invoke_set_theme(theme_index);
         crate::chrome::set_theme(theme_index);
+        if lang_changed {
+            let lang = i18n::set(self.cfg.borrow().language);
+            i18n::apply_to_ui(&ui, lang);
+            self.refresh_home_cards();
+            self.refresh_camera_lists();
+            self.refresh_hub_lists();
+            self.update_rec_date_label();
+            self.update_calendar();
+            self.rebuild_rec_rows();
+            self.refresh_rec_rows();
+        }
         if ffmpeg_changed {
             *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
             // A different ffmpeg: reconnect the streams.
             self.streams.borrow_mut().clear();
             self.sync_streams();
-            self.status("Video decoder changed.");
+            self.status(i18n::pick("Video decoder changed.", "Video çözücü değiştirildi."));
         }
         self.load_settings_into_ui();
     }
@@ -1492,12 +1529,26 @@ impl App {
                             detail.push(link.model.clone());
                         }
                         if !same_name(&link.name, &c.name) {
-                            detail.push(format!("“{}” in the Tapo app", link.name));
+                            detail.push(if i18n::is_tr() {
+                                format!("Tapo uygulamasında “{}”", link.name)
+                            } else {
+                                format!("“{}” in the Tapo app", link.name)
+                            });
                         }
                     }
-                    None => detail.push("Not linked to a camera on your Tapo account".into()),
+                    None => detail.push(
+                        i18n::pick(
+                            "Not linked to a camera on your Tapo account",
+                            "Tapo hesabındaki bir kameraya bağlı değil",
+                        )
+                        .into(),
+                    ),
                 }
-                detail.push(format!("{} in live view", Quality::LABELS[c.grid_quality.index() as usize]));
+                detail.push(if i18n::is_tr() {
+                    format!("Canlı izlemede {}", Quality::LABELS[c.grid_quality.index() as usize])
+                } else {
+                    format!("{} in live view", Quality::LABELS[c.grid_quality.index() as usize])
+                });
                 CameraRow { id: c.id as i32, name: c.name.as_str().into(), detail: detail.join("  ·  ").into() }
             })
             .collect();
@@ -1676,9 +1727,17 @@ impl App {
                         }
                         if let Some(h) = d.power_on_hours.filter(|&h| h > 0) {
                             if h >= 48 {
-                                parts.push(format!("{} days on", h / 24));
+                                parts.push(if i18n::is_tr() {
+                                    format!("{} gün açık", h / 24)
+                                } else {
+                                    format!("{} days on", h / 24)
+                                });
                             } else {
-                                parts.push(format!("{h} h on"));
+                                parts.push(if i18n::is_tr() {
+                                    format!("{h} saat açık")
+                                } else {
+                                    format!("{h} h on")
+                                });
                             }
                         }
                         parts.join(" · ")
@@ -1688,8 +1747,16 @@ impl App {
                 let full = main.and_then(cloud::Disk::used).is_some_and(|u| u > 0.97);
                 let space = match main {
                     // As the Tapo app: a full disk recording in a loop is fine.
-                    Some(d) if full && looping => format!("{} · full, recording over the oldest", d.total),
-                    Some(d) if !d.free.is_empty() => format!("{} free of {}", d.free, d.total),
+                    Some(d) if full && looping => if i18n::is_tr() {
+                        format!("{} · dolu, en eskinin üzerine yazılıyor", d.total)
+                    } else {
+                        format!("{} · full, recording over the oldest", d.total)
+                    },
+                    Some(d) if !d.free.is_empty() => if i18n::is_tr() {
+                        format!("{} / {} boş", d.free, d.total)
+                    } else {
+                        format!("{} free of {}", d.free, d.total)
+                    },
                     Some(d) => d.total.clone(),
                     None => String::new(),
                 };
@@ -1698,7 +1765,11 @@ impl App {
                     .iter()
                     .skip(1)
                     .map(|d| match d.free.is_empty() {
-                        false => format!("{}: {} free of {}", disk_name(&d.label), d.free, d.total),
+                        false => if i18n::is_tr() {
+                            format!("{}: {} / {} boş", disk_name(&d.label), d.free, d.total)
+                        } else {
+                            format!("{}: {} free of {}", disk_name(&d.label), d.free, d.total)
+                        },
                         true => format!("{}: {}", disk_name(&d.label), d.total),
                     })
                     .collect();
@@ -1706,7 +1777,13 @@ impl App {
                     note.push(info.storage_status.clone());
                 }
                 if known_none_after_try(loaded, main) {
-                    note.push("The hub didn't say how its storage is.".into());
+                    note.push(
+                        i18n::pick(
+                            "The hub didn't say how its storage is.",
+                            "Hub depolama durumunu bildirmedi.",
+                        )
+                        .into(),
+                    );
                 }
                 let alarm_on = self.hub_alarms.borrow().contains(&h.device_id);
                 let busy = self.hub_busy_ids.borrow().contains(&h.device_id);
@@ -2374,10 +2451,16 @@ impl App {
         });
         let mut names = Vec::with_capacity(cameras.len() + 1);
         if cameras.len() > 1 {
-            names.push("All cameras (events)".to_string());
+            names.push(i18n::pick("All cameras (events)", "Tüm kameralar (olaylar)").to_string());
         }
         names.extend(cameras.iter().map(|c| {
-            if c.hub_storage { c.name.clone() } else { format!("{} (not recording to the hub)", c.name) }
+            if c.hub_storage {
+                c.name.clone()
+            } else if i18n::is_tr() {
+                format!("{} (hub'a kaydetmiyor)", c.name)
+            } else {
+                format!("{} (not recording to the hub)", c.name)
+            }
         }));
         b.set_paired_names(string_model(names));
         // Default to the first camera that records to the hub (offset by 1 if
@@ -2528,9 +2611,9 @@ impl App {
     fn update_rec_date_label(&self) {
         let date = *self.rec_date.borrow();
         let label = if date == Local::now().date_naive() {
-            format!("Today, {}", date.format("%d %b"))
+            format!("{}, {:02} {}", i18n::pick("Today", "Bugün"), date.day(), i18n::short_month(date.month()))
         } else {
-            date.format("%a %d %b %Y").to_string()
+            format!("{:02} {} {}", date.day(), i18n::short_month(date.month()), date.year())
         };
         self.ui().global::<Bridge>().set_rec_date(label.into());
     }
@@ -2557,7 +2640,7 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_rec_days(ModelRc::new(VecModel::from(cells)));
-        b.set_rec_month(month.format("%B %Y").to_string().into());
+        b.set_rec_month(format!("{} {}", i18n::month_name(month.month()), month.year()).into());
         b.set_rec_month_is_current(month >= first_of_month(today));
     }
 
@@ -2759,8 +2842,8 @@ impl App {
             let total = session.all_events.len();
             b.set_rec_list_title(match (shown, total) {
                 (0, 0) => SharedString::new(),
-                (s, t) if s == t => format!("All events · {s}").into(),
-                (s, t) => format!("Events · {s} of {t}").into(),
+                (s, t) if s == t => format!("{} · {s}", i18n::pick("All events", "Tüm olaylar")).into(),
+                (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
             });
             session.rows = with_hours(&entries);
         } else if !session.events.is_empty() {
@@ -2774,8 +2857,8 @@ impl App {
             let shown = entries.len();
             let total = session.events.len();
             b.set_rec_list_title(match (shown, total) {
-                (s, t) if s == t => format!("Detected events · {s}").into(),
-                (s, t) => format!("Events · {s} of {t}").into(),
+                (s, t) if s == t => format!("{} · {s}", i18n::pick("Detected events", "Algılanan olaylar")).into(),
+                (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
             });
             session.rows = with_hours(&entries);
         } else {
@@ -2790,7 +2873,11 @@ impl App {
                 .collect();
             entries.reverse();
             let n = entries.len();
-            b.set_rec_list_title(if n == 0 { SharedString::new() } else { format!("Recordings · {n}").into() });
+            b.set_rec_list_title(if n == 0 {
+                SharedString::new()
+            } else {
+                format!("{} · {n}", i18n::pick("Recordings", "Kayıtlar")).into()
+            });
             session.rows = with_hours(&entries);
         }
     }
@@ -2837,7 +2924,7 @@ impl App {
                                 .into()
                         },
                         camera: row_cam.as_ref().map(|c| c.name.as_str()).unwrap_or("").into(),
-                        kind: cloud::clip_kind(*kind).into(),
+                        kind: i18n::detection_label(*kind).into(),
                         icon: kind_icon(*kind),
                         duration: fmt_duration((*end - *start).max(0) as u64).into(),
                         playing: watched == Some(i),
@@ -2855,6 +2942,7 @@ impl App {
                 let same = old.as_ref().is_some_and(|o| {
                     o.time == row.time
                         && o.camera == row.camera
+                        && o.kind == row.kind
                         && o.playing == row.playing
                         && o.saved == row.saved
                         && o.has_thumb == row.has_thumb
@@ -3257,25 +3345,37 @@ impl App {
             self.status("There's no recording in that stretch.");
             return;
         }
+        let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
+            self.status("FFmpeg is missing; cannot export MP4.");
+            return;
+        };
         let first = local_time(start_ms / 1000);
         let path = config::recordings_dir().join(format!(
-            "{}_{}_to_{}.ts",
+            "{}_{}_to_{}.mp4",
             file_safe(&camera.name),
             first.format("%Y-%m-%d_%H-%M-%S"),
             local_time(end_ms / 1000).format("%H-%M-%S")
         ));
         let label = format!("{} · {} – {}", camera.name, first.format("%d %b %H:%M:%S"), local_time(end_ms / 1000).format("%H:%M:%S"));
-        let row = self.push_download(label, "Saving…".into(), &path, false);
+        let row = self.push_download(label, i18n::pick("Saving…", "Kaydediliyor…").into(), &path, false);
         let player_id = self.player_id.clone();
         self.rt.spawn(async move {
-            let result = save_stretch(&client, &hub, &camera, &player_id, &clips, start_ms, end_ms, &path).await;
+            let result = save_stretch(&client, &hub, &camera, &player_id, &clips, start_ms, end_ms, &path, &ffmpeg, move || {
+                let msg = i18n::pick("Converting to MP4…", "MP4'e dönüştürülüyor…").to_string();
+                on_ui(move |app| app.set_download_status(row, msg, false));
+            })
+            .await;
             let (text, done) = match &result {
                 Ok(from_memory) => {
                     let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
-                    let how = if *from_memory { " (from what was watched)" } else { "" };
-                    (format!("Saved · {mb:.1} MB{how}"), true)
+                    let how = if *from_memory {
+                        i18n::pick(" (from what was watched)", " (izlenen bölümden)")
+                    } else {
+                        ""
+                    };
+                    (format!("{} · {mb:.1} MB{how}", i18n::pick("Saved", "Kaydedildi")), true)
                 }
-                Err(e) => (format!("Failed: {e:#}"), false),
+                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false),
             };
             on_ui(move |app| app.set_download_status(row, text, done));
         });
@@ -3427,32 +3527,55 @@ impl App {
         let path = clip_path(&request.camera, start);
         let label = format!("{} · {}", request.camera.name, local_time(start).format("%d %b %H:%M:%S"));
         if is_saved(&path) {
-            self.push_download(label, "Already saved".into(), &path, true);
+            self.push_download(label, i18n::pick("Already saved", "Zaten kaydedildi").into(), &path, true);
             return;
         }
         let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
-            self.status("Sign in to your Tapo account first.");
+            self.status(i18n::pick(
+                "Sign in to your Tapo account first.",
+                "Önce Tapo hesabınızla giriş yapın.",
+            ));
             return;
         };
-        let row = self.push_download(label, "Asking the hub for the recording…".into(), &path, false);
+        let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
+            self.status(i18n::pick(
+                "FFmpeg is missing; cannot export MP4.",
+                "FFmpeg bulunamadı; MP4 dışa aktarılamıyor.",
+            ));
+            return;
+        };
+        let row = self.push_download(
+            label,
+            i18n::pick("Asking the hub for the recording…", "Hub'dan kayıt isteniyor…").into(),
+            &path,
+            false,
+        );
         let total = request.clip.seconds() as u64;
         self.rt.spawn(async move {
             let mut last = Instant::now();
             let mut progress = |p: clip::Progress| {
                 if last.elapsed() >= Duration::from_millis(500) {
                     last = Instant::now();
-                    let text = format!("Downloading… {} of {}", fmt_duration(p.seconds as u64), fmt_duration(total));
+                    let text = if i18n::is_tr() {
+                        format!("İndiriliyor… {} / {}", fmt_duration(p.seconds as u64), fmt_duration(total))
+                    } else {
+                        format!("Downloading… {} of {}", fmt_duration(p.seconds as u64), fmt_duration(total))
+                    };
                     on_ui(move |app| app.set_download_status(row, text, false));
                 }
             };
             let partial = clip::partial_path(&path);
-            let result = clip::save_clip(&client, &request, &path, &partial, &mut progress).await;
+            let result = clip::save_clip(&client, &request, &path, &partial, Some(&ffmpeg), &mut progress, move || {
+                let msg = i18n::pick("Converting to MP4…", "MP4'e dönüştürülüyor…").to_string();
+                on_ui(move |app| app.set_download_status(row, msg, false));
+            })
+            .await;
             let (text, done) = match &result {
                 Ok(()) => {
                     let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
-                    (format!("Saved · {mb:.1} MB"), true)
+                    (format!("{} · {mb:.1} MB", i18n::pick("Saved", "Kaydedildi")), true)
                 }
-                Err(e) => (format!("Failed: {e:#}"), false),
+                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false),
             };
             let auth = result.as_ref().err().and_then(|e| e.downcast_ref::<cloud::CloudError>()).is_some_and(|e| e.is_auth());
             on_ui(move |app| {
@@ -3528,9 +3651,9 @@ fn kind_icon(kind: i64) -> i32 {
     }
 }
 
-/// Writes `start_ms..end_ms` across `clips` to `path`: from memory where all
-/// of a recording's part is there, else fetched from the hub. Returns
-/// whether it all came from memory.
+/// Writes `start_ms..end_ms` across `clips` to `path` as an `.mp4`: from
+/// memory where all of a recording's part is there, else fetched from the hub.
+/// Returns whether it all came from memory.
 #[allow(clippy::too_many_arguments)]
 async fn save_stretch(
     client: &CloudClient,
@@ -3541,6 +3664,8 @@ async fn save_stretch(
     start_ms: i64,
     end_ms: i64,
     path: &Path,
+    ffmpeg: &Path,
+    on_finalize: impl FnOnce() + Send,
 ) -> anyhow::Result<bool> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
@@ -3578,7 +3703,10 @@ async fn save_stretch(
     drop(file);
     match result {
         Ok(()) => {
-            std::fs::rename(&partial, path)?;
+            on_finalize();
+            let remux = crate::ffmpeg::remux_ts_to_mp4(ffmpeg, &partial, path).await;
+            let _ = std::fs::remove_file(&partial);
+            remux?;
             Ok(all_from_memory)
         }
         Err(e) => {
@@ -3687,13 +3815,9 @@ fn file_safe(name: &str) -> String {
 }
 
 /// "H500" for the Home card and the list.
-/// "Hard disk" for "HDD", and so on.
+/// "Hard disk" / "Sabit disk" for "HDD", and so on.
 fn disk_name(label: &str) -> String {
-    match label {
-        "HDD" => "Hard disk".into(),
-        "Internal" => "Built-in storage".into(),
-        other => other.to_string(),
-    }
+    i18n::disk_label(label)
 }
 
 /// When the hub has been asked but gave nothing about its disks.
@@ -3746,10 +3870,10 @@ fn local_time(unix: i64) -> chrono::DateTime<Local> {
     Local.timestamp_opt(unix, 0).single().unwrap_or_else(Local::now)
 }
 
-/// Where a recording is saved: `Videos\Tapas\<camera>_<start>.ts`.
+/// Where a recording is saved: `Videos\Tapas\<camera>_<start>.mp4`.
 fn clip_path(camera: &HubCamera, start: i64) -> PathBuf {
     let start = local_time(start).format("%Y-%m-%d_%H-%M-%S");
-    config::recordings_dir().join(format!("{}_{start}.ts", file_safe(&camera.name)))
+    config::recordings_dir().join(format!("{}_{start}.mp4", file_safe(&camera.name)))
 }
 
 fn is_saved(path: &Path) -> bool {

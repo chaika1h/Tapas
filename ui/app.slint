@@ -170,6 +170,7 @@ export global Bridge {
     in property <string> ffmpeg-found;
     in-out property <int> renderer-index;
     in-out property <int> theme-index; // 0 system, 1 light, 2 dark
+    in-out property <int> language-index; // 0 system, 1 English, 2 Turkish
     in property <string> config-path;
     callback save-settings();
 
@@ -279,6 +280,159 @@ export global Bridge {
     callback install-update();
     callback check-updates-changed();
     callback show-in-folder(string);
+}
+
+// Localised UI strings, populated at start-up and on language change by src/i18n.rs.
+export global Tr {
+    // navigation & window controls
+    in-out property <string> nav-home: "Home";
+    in-out property <string> nav-live: "Live view";
+    in-out property <string> nav-playback: "Playback";
+    in-out property <string> nav-settings: "Settings";
+    in-out property <string> win-minimize: "Minimize";
+    in-out property <string> win-maximize: "Maximize";
+    in-out property <string> win-restore: "Restore";
+    in-out property <string> win-close: "Close";
+
+    // sign-in & welcome
+    in-out property <string> welcome-tagline: "Your Tapo cameras on your desktop, from anywhere.";
+    in-out property <string> log-in: "Log In";
+    in-out property <string> logging-in: "Logging in…";
+    in-out property <string> create-id: "Create a TP-Link ID";
+    in-out property <string> sign-up: "Sign Up";
+    in-out property <string> forgot-password: "Forgot Password?";
+    in-out property <string> remember-me: "Remember me";
+    in-out property <string> login-subtitle: "Use your TP-Link ID: the email and password you use in the Tapo app.";
+    in-out property <string> email-placeholder: "TP-Link ID (email)";
+    in-out property <string> password-placeholder: "Password";
+    in-out property <string> show-password: "Show password";
+    in-out property <string> hide-password: "Hide password";
+    in-out property <string> sign-up-help: "TP-Link IDs are created in the Tapo app: open it on your phone, tap “Create a TP-Link ID” and follow the steps. Then log in here with the same email and password.";
+    in-out property <string> forgot-help: "Reset your password in the Tapo app: on its login screen, tap “Forgot Password?”. Then log in here with the new password.";
+    in-out property <string> mfa-title: "Two-Step Verification";
+    in-out property <string> mfa-resend: "Resend Code";
+    in-out property <string> mfa-verify: "Verify";
+
+    // home & hub
+    in-out property <string> update-camera-list: "Update camera list";
+    in-out property <string> update-available-suffix: " is available.";
+    in-out property <string> update-now: "Update now";
+    in-out property <string> later: "Later";
+    in-out property <string> hub-section: "Hub";
+    in-out property <string> cameras-section: "Cameras";
+    in-out property <string> no-cameras-home: "No cameras yet. The cameras on your Tapo account are added when you sign in; press ⟳ to look again.";
+    in-out property <string> loop-recording: "Loop recording";
+    in-out property <string> ring-hub: "Ring hub";
+    in-out property <string> stop-alarm: "Stop alarm";
+    in-out property <string> asking-storage: "Asking the hub about its storage…";
+
+    // live & single camera
+    in-out property <string> fullscreen: "Fullscreen";
+    in-out property <string> fullscreen-hint: "Fullscreen (F11)";
+    in-out property <string> leave-fullscreen: "Leave full screen";
+    in-out property <string> no-cameras-title: "No cameras yet";
+    in-out property <string> no-cameras-live: "The cameras on your Tapo account appear here once they've been listed: press ⟳ on Home to look again.";
+    in-out property <string> back: "Back";
+    in-out property <string> mute-audio: "Mute audio (M)";
+    in-out property <string> listen-in: "Listen in (M)";
+    in-out property <string> sound-on: "Sound On";
+    in-out property <string> sound-off: "Sound Off";
+    in-out property <string> take-photo: "Take Photo";
+    in-out property <string> pan-tilt: "Pan & Tilt";
+    in-out property <string> privacy-mode: "Privacy Mode";
+    in-out property <string> privacy-on-title: "Privacy mode is on";
+    in-out property <string> privacy-on-desc: "The camera has covered its lens, so there's no video.";
+    in-out property <string> turn-off: "Turn off";
+    in-out property <string> spotlight: "Spotlight";
+    in-out property <string> spotlight-on: "Spotlight On";
+    in-out property <string> auto-track: "Auto-Track";
+    in-out property <string> tracking-on: "Tracking On";
+    in-out property <string> siren: "Siren";
+    in-out property <string> stop-siren: "Stop Siren";
+    in-out property <string> night-vision: "Night Vision";
+    in-out property <string> playback-download: "Playback & Download";
+    in-out property <string> reboot-camera: "Reboot camera";
+    in-out property <string> reboot-confirm-prefix: "Reboot ";
+    in-out property <string> reboot-confirm-suffix: "? Video will pause for ~30 seconds.";
+    in-out property <string> confirm-reboot: "Confirm Reboot";
+    in-out property <string> cancel: "Cancel";
+    in-out property <string> save: "Save";
+    in-out property <string> step-hint-prefix: "Step ";
+    in-out property <string> step-hint-suffix: "  ·  arrow keys work too";
+    in-out property <string> pan-patrol: "Pan patrol";
+    in-out property <string> tilt-patrol: "Tilt patrol";
+    in-out property <string> stop: "Stop";
+    in-out property <string> presets: "Presets";
+    in-out property <string> refresh: "Refresh";
+    in-out property <string> no-presets: "No presets yet: move the camera, name the position and save it.";
+    in-out property <string> preset-placeholder: "Name this position";
+
+    // playback
+    in-out property <string> show-list: "Show the list";
+    in-out property <string> hide-list: "Hide the list";
+    in-out property <string> reload: "Reload";
+    in-out property <string> no-recordings-day: "No recordings on this day.";
+    in-out property <string> click-timeline-hint: "Click the timeline, or a recording on the right, to watch from there.";
+    in-out property <string> play: "Play";
+    in-out property <string> pause: "Pause";
+    in-out property <string> record: "Record";
+    in-out property <string> stop-save-recording: "Stop and save the recording";
+    in-out property <string> close-player: "Close the player";
+    in-out property <string> zoom-in: "Zoom in";
+    in-out property <string> zoom-out: "Zoom out";
+    in-out property <string> saved-to-videos: "Saved to Videos";
+    in-out property <string> open: "Open";
+    in-out property <string> show-in-folder: "Show in folder";
+    in-out property <string> today: "Today";
+    in-out property <string> prev-month: "Previous month";
+    in-out property <string> next-month: "Next month";
+    in-out property <string> saved-tag: "saved";
+    in-out property <string> saved-tooltip: "Saved";
+    in-out property <string> save-to-videos: "Save to Videos";
+    in-out property <[string]> weekdays: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+
+    // settings
+    in-out property <string> sec-account: "Tapo account";
+    in-out property <string> not-signed-in: "Not signed in";
+    in-out property <string> signed-in-prefix: "Signed in to the Tapo cloud · ";
+    in-out property <string> sign-out: "Sign out";
+    in-out property <string> cameras-and-hubs: "Cameras and hubs";
+    in-out property <string> cameras-hubs-desc: "Added by themselves; update after adding one in the Tapo app.";
+    in-out property <string> update-list: "Update list";
+    in-out property <string> cloud-note: "Live video, pan/tilt and the hub's recordings go through TP-Link's cloud, as in the Tapo app, so this PC needn't be on the cameras' network. It's TP-Link's private service, which they can change.";
+    in-out property <string> no-cameras-settings-desc: "Sign in above: the cameras on your Tapo account are added by themselves.";
+    in-out property <string> edit: "Edit";
+    in-out property <string> add-camera: "Add a camera";
+    in-out property <string> edit-camera: "Edit camera";
+    in-out property <string> tapo-camera: "Tapo camera";
+    in-out property <string> name-label: "Name";
+    in-out property <string> name-placeholder: "Same as in the Tapo app";
+    in-out property <string> live-stream-label: "Live view stream";
+    in-out property <string> stream-quality-note: "SD is light on the network and the PC, for the grid; HD is the camera's full picture. A camera opened on its own is always HD to start with.";
+    in-out property <string> add-camera-desc: "Cameras removed here, or ones the list missed, can be added back.";
+    in-out property <string> add: "Add";
+    in-out property <string> sec-appearance: "Appearance and video";
+    in-out property <string> appearance-title: "Appearance";
+    in-out property <string> appearance-desc: "Light, dark, or the same as Windows.";
+    in-out property <string> language-title: "Language";
+    in-out property <string> language-desc: "Display language; applies immediately.";
+    in-out property <string> renderer-title: "Graphics renderer";
+    in-out property <string> renderer-desc: "How the window is drawn, from the next start.";
+    in-out property <string> decoder-title: "Video decoder";
+    in-out property <string> decoder-placeholder: "Built-in ffmpeg";
+    in-out property <string> apply: "Apply";
+    in-out property <string> settings-file: "Settings file";
+    in-out property <string> sec-about: "About and updates";
+    in-out property <string> about-default: "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.";
+    in-out property <string> update-to-prefix: "Update to ";
+    in-out property <string> check-updates: "Check for updates";
+    in-out property <string> auto-update-title: "Check for updates at start-up";
+    in-out property <string> auto-update-desc-prefix: "From ";
+    in-out property <string> auto-update-desc-suffix: ". A new version installs by itself and Tapas restarts.";
+    in-out property <string> credits-note: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
+    in-out property <[string]> appearance-labels: ["Same as Windows", "Light", "Dark"];
+    in-out property <[string]> language-labels: ["System (Auto)", "English", "Türkçe"];
+    in-out property <[string]> renderer-labels: ["OpenGL (recommended)", "Software (CPU)"];
 }
 
 component Heading inherits Text {
@@ -416,7 +570,7 @@ component EyeToggle inherits Rectangle {
     border-radius: 20px;
     background: touch.has-hover ? Palette.control-background : transparent;
     accessible-role: button;
-    accessible-label: root.show ? "Hide password" : "Show password";
+    accessible-label: root.show ? Tr.hide-password : Tr.show-password;
     accessible-action-default => { root.show = !root.show; }
     Path {
         width: 22px;
@@ -517,11 +671,11 @@ component LogInCard inherits SignInCard {
                 }
             }
         }
-        Text { text: "Log in"; font-size: 26px; font-weight: 700; }
-        Muted { text: "Use your TP-Link ID: the email and password you use in the Tapo app."; }
+        Text { text: Tr.log-in; font-size: 26px; font-weight: 700; }
+        Muted { text: Tr.login-subtitle; }
         email := LineEdit {
             height: 44px;
-            placeholder-text: "TP-Link ID (email)";
+            placeholder-text: Tr.email-placeholder;
             text <=> Bridge.login-email;
             enabled: !Bridge.login-busy;
             accepted => { password.focus(); }
@@ -531,7 +685,7 @@ component LogInCard inherits SignInCard {
             password := LineEdit {
                 height: 44px;
                 horizontal-stretch: 1;
-                placeholder-text: "Password";
+                placeholder-text: Tr.password-placeholder;
                 input-type: root.show-password ? InputType.text : InputType.password;
                 text <=> Bridge.login-password;
                 enabled: !Bridge.login-busy;
@@ -545,7 +699,7 @@ component LogInCard inherits SignInCard {
             }
         }
         CheckBox {
-            text: "Remember me";
+            text: Tr.remember-me;
             checked <=> Bridge.login-remember;
             enabled: !Bridge.login-busy;
         }
@@ -560,7 +714,7 @@ component LogInCard inherits SignInCard {
         if Bridge.login-error != "": ErrorText { text: Bridge.login-error; }
         Rectangle { height: 6px; }
         PillButton {
-            text: Bridge.login-busy ? "Logging in…" : "Log In";
+            text: Bridge.login-busy ? Tr.logging-in : Tr.log-in;
             primary: true;
             enabled: Bridge.login-email != "" && Bridge.login-password != "";
             busy: Bridge.login-busy;
@@ -568,17 +722,17 @@ component LogInCard inherits SignInCard {
         }
         HorizontalLayout {
             LinkText {
-                text: "Sign Up";
+                text: Tr.sign-up;
                 clicked => {
-                    Bridge.login-help = "TP-Link IDs are created in the Tapo app: open it on your phone, tap “Create a TP-Link ID” and follow the steps. Then log in here with the same email and password.";
+                    Bridge.login-help = Tr.sign-up-help;
                 }
             }
             Rectangle { horizontal-stretch: 1; }
             LinkText {
-                text: "Forgot Password?";
+                text: Tr.forgot-password;
                 align: right;
                 clicked => {
-                    Bridge.login-help = "Reset your password in the Tapo app: on its login screen, tap “Forgot Password?”. Then log in here with the new password.";
+                    Bridge.login-help = Tr.forgot-help;
                 }
             }
         }
@@ -605,7 +759,7 @@ component VerificationCard inherits SignInCard {
                 clicked => { Bridge.mfa-back(); }
             }
             Text {
-                text: "Two-Step Verification";
+                text: Tr.mfa-title;
                 font-size: 20px;
                 font-weight: 700;
                 horizontal-alignment: center;
@@ -623,7 +777,7 @@ component VerificationCard inherits SignInCard {
             accepted => { if (Bridge.mfa-filled == 6) { Bridge.mfa-verify(); } }
         }
         LinkText {
-            text: Bridge.mfa-resend-seconds > 0 ? "Resend Code (" + Bridge.mfa-resend-seconds + "s)" : "Resend Code";
+            text: Bridge.mfa-resend-seconds > 0 ? Tr.mfa-resend + " (" + Bridge.mfa-resend-seconds + "s)" : Tr.mfa-resend;
             enabled: Bridge.mfa-resend-seconds == 0 && !Bridge.login-busy;
             clicked => { Bridge.mfa-send(Bridge.mfa-method); }
         }
@@ -636,7 +790,7 @@ component VerificationCard inherits SignInCard {
             clicked => { Bridge.mfa-send(Bridge.mfa-switch-method); }
         }
         PillButton {
-            text: "Verify";
+            text: Tr.mfa-verify;
             primary: true;
             enabled: Bridge.mfa-filled == 6;
             busy: Bridge.login-busy;
@@ -666,7 +820,7 @@ component SignInScreens inherits Rectangle {
         }
         Rectangle { height: 8px; }
         Text {
-            text: "Your Tapo cameras on your desktop, from anywhere.";
+            text: Tr.welcome-tagline;
             font-size: 18px;
             color: Palette.foreground.transparentize(0.25);
             horizontal-alignment: center;
@@ -678,7 +832,7 @@ component SignInScreens inherits Rectangle {
                 width: min(380px, root.width - 48px);
                 spacing: 14px;
                 PillButton {
-                    text: "Log In";
+                    text: Tr.log-in;
                     primary: true;
                     clicked => {
                         Bridge.login-help = "";
@@ -686,9 +840,9 @@ component SignInScreens inherits Rectangle {
                     }
                 }
                 PillButton {
-                    text: "Create a TP-Link ID";
+                    text: Tr.create-id;
                     clicked => {
-                        Bridge.login-help = "TP-Link IDs are created in the Tapo app: open it on your phone, tap “Create a TP-Link ID” and follow the steps. Then log in here with the same email and password.";
+                        Bridge.login-help = Tr.sign-up-help;
                         Bridge.onboarding-step = 1;
                     }
                 }
@@ -756,6 +910,7 @@ global Icons {
     out property <string> siren: "M 6 17 H 18 M 7.5 17 V 12 A 4.5 4.5 0 0 1 16.5 12 V 17 M 12 3 V 5 M 5 6 L 6.5 7.5 M 19 6 L 17.5 7.5 M 3 12 H 5 M 19 12 H 21";
     out property <string> power: "M 12 3.5 V 11.5 M 7.5 6.2 A 7 7 0 1 0 16.5 6.2";
     out property <string> trash: "M 4.5 7 H 19.5 M 9.5 7 V 4.5 H 14.5 V 7 M 6.5 7 L 7.5 19.5 H 16.5 L 17.5 7";
+    out property <string> globe: "M 12 3 A 9 9 0 1 0 12.01 3 Z M 3.5 12 H 20.5 M 12 3 C 14.8 6 14.8 18 12 21 C 9.2 18 9.2 6 12 3";
 }
 
 component Icon inherits Path {
@@ -831,25 +986,25 @@ component Sidebar inherits Rectangle {
             }
         }
         SideNavItem {
-            text: "Home";
+            text: Tr.nav-home;
             icon: Icons.home;
             active: Bridge.page == Page.home;
             clicked => { Bridge.navigate(Page.home); }
         }
         SideNavItem {
-            text: "Live view";
+            text: Tr.nav-live;
             icon: Icons.grid;
             active: Bridge.page == Page.live;
             clicked => { Bridge.navigate(Page.live); }
         }
         SideNavItem {
-            text: "Playback";
+            text: Tr.nav-playback;
             icon: Icons.playback;
             active: Bridge.page == Page.recordings;
             clicked => { Bridge.navigate(Page.recordings); }
         }
         SideNavItem {
-            text: "Settings";
+            text: Tr.nav-settings;
             icon: Icons.settings;
             active: Bridge.page == Page.settings;
             clicked => { Bridge.navigate(Page.settings); }
@@ -1208,7 +1363,7 @@ component HubCard inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 AccentChip {
-                    text: "Playback";
+                    text: Tr.nav-playback;
                     icon: Icons.playback;
                     clicked => { root.open(); }
                 }
@@ -1259,7 +1414,7 @@ component HubCard inherits Rectangle {
                 VerticalLayout {
                     alignment: center;
                     Text {
-                        text: "Loop recording";
+                        text: Tr.loop-recording;
                         font-size: 12px;
                         color: Palette.foreground.transparentize(0.25);
                     }
@@ -1296,7 +1451,7 @@ component HubCard inherits Rectangle {
                         }
                     }
                     Text {
-                        text: root.hub.alarm-on ? "Stop alarm" : "Ring hub";
+                        text: root.hub.alarm-on ? Tr.stop-alarm : Tr.ring-hub;
                         font-size: 12px;
                         font-weight: 600;
                         color: root.hub.alarm-on ? white : Palette.foreground;
@@ -1314,7 +1469,7 @@ component HubCard inherits Rectangle {
             spacing: 8px;
             Spinner { width: 14px; height: 14px; indeterminate: true; }
             Text {
-                text: "Asking the hub about its storage…";
+                text: Tr.asking-storage;
                 font-size: 12px;
                 color: Palette.foreground.transparentize(0.45);
                 vertical-alignment: center;
@@ -1349,7 +1504,7 @@ component HomePage inherits Rectangle {
                 alignment: center;
                 RoundIconButton {
                     icon: Icons.refresh;
-                    label: "Update camera list";
+                    label: Tr.update-camera-list;
                     enabled: !Bridge.cloud-busy;
                     clicked => { Bridge.cloud-refresh(); }
                 }
@@ -1358,7 +1513,7 @@ component HomePage inherits Rectangle {
                 alignment: center;
                 horizontal-stretch: 0;
                 AccentChip {
-                    text: "Live view";
+                    text: Tr.nav-live;
                     icon: Icons.grid;
                     clicked => { Bridge.navigate(Page.live); }
                 }
@@ -1386,7 +1541,7 @@ component HomePage inherits Rectangle {
                             alignment: center;
                             horizontal-stretch: 1;
                             Text {
-                                text: Bridge.update-busy || Bridge.update-failed ? Bridge.update-status : "Tapas " + Bridge.update-version + " is available.";
+                                text: Bridge.update-busy || Bridge.update-failed ? Bridge.update-status : "Tapas " + Bridge.update-version + Tr.update-available-suffix;
                                 font-weight: 600;
                                 overflow: elide;
                             }
@@ -1398,7 +1553,7 @@ component HomePage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Update now";
+                                text: Tr.update-now;
                                 primary: true;
                                 enabled: !Bridge.update-busy;
                                 clicked => { Bridge.install-update(); }
@@ -1407,14 +1562,14 @@ component HomePage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Later";
+                                text: Tr.later;
                                 enabled: !Bridge.update-busy;
                                 clicked => { Bridge.update-dismissed = true; }
                             }
                         }
                     }
                 }
-                if Bridge.hubs.length > 0: SectionTitle { text: "Hub"; }
+                if Bridge.hubs.length > 0: SectionTitle { text: Tr.hub-section; }
                 if Bridge.hubs.length > 0: HorizontalLayout {
                     spacing: root.gap;
                     alignment: start;
@@ -1428,10 +1583,10 @@ component HomePage inherits Rectangle {
                 }
                 if Bridge.hubs.length > 0: Rectangle { height: 6px; }
                 SectionTitle {
-                    text: Bridge.home-cameras.length == 0 ? "Cameras" : "Cameras  ·  " + Bridge.home-cameras.length;
+                    text: Bridge.home-cameras.length == 0 ? Tr.cameras-section : Tr.cameras-section + "  ·  " + Bridge.home-cameras.length;
                 }
                 if Bridge.home-cameras.length == 0: Muted {
-                    text: "No cameras yet. The cameras on your Tapo account are added when you sign in; press ⟳ to look again.";
+                    text: Tr.no-cameras-home;
                 }
                 Rectangle {
                     height: root.rows * (root.card-h + root.gap) - (root.rows > 0 ? root.gap : 0px);
@@ -1453,12 +1608,12 @@ component HomePage inherits Rectangle {
 component LivePage inherits Rectangle {
     VerticalLayout {
         if !Bridge.fullscreen: PageHeader {
-            title: "Live view";
+            title: Tr.nav-live;
             VerticalLayout {
                 alignment: center;
                 RoundIconButton {
                     icon: Icons.fullscreen;
-                    label: "Fullscreen (F11)";
+                    label: Tr.fullscreen-hint;
                     clicked => { Bridge.toggle-fullscreen(); }
                 }
             }
@@ -1469,10 +1624,10 @@ component LivePage inherits Rectangle {
                 alignment: center;
                 spacing: 12px;
                 padding: 40px;
-                Text { text: "No cameras yet"; font-size: 22px; font-weight: 600; horizontal-alignment: center; }
+                Text { text: Tr.no-cameras-title; font-size: 22px; font-weight: 600; horizontal-alignment: center; }
                 Muted {
                     horizontal-alignment: center;
-                    text: "The cameras on your Tapo account appear here once they've been listed: press ⟳ on Home to look again.";
+                    text: Tr.no-cameras-live;
                 }
             }
             Rectangle {
@@ -1613,7 +1768,7 @@ component PtzSection inherits VerticalLayout {
         PtzPad { }
     }
     Text {
-        text: "Step " + Bridge.ptz-step + "  ·  arrow keys work too";
+        text: Tr.step-hint-prefix + Bridge.ptz-step + Tr.step-hint-suffix;
         font-size: 12px;
         horizontal-alignment: center;
         color: Palette.foreground.transparentize(0.4);
@@ -1627,31 +1782,31 @@ component PtzSection inherits VerticalLayout {
     HorizontalLayout {
         spacing: 6px;
         Button {
-            text: "Pan patrol";
+            text: Tr.pan-patrol;
             horizontal-stretch: 1;
             enabled: !Bridge.ptz-busy;
             clicked => { Bridge.patrol-start(0); }
         }
         Button {
-            text: "Tilt patrol";
+            text: Tr.tilt-patrol;
             horizontal-stretch: 1;
             enabled: !Bridge.ptz-busy;
             clicked => { Bridge.patrol-start(1); }
         }
         if Bridge.single-patrolling: Button {
-            text: "Stop";
+            text: Tr.stop;
             primary: true;
             enabled: !Bridge.ptz-busy;
             clicked => { Bridge.patrol-stop(); }
         }
     }
     HorizontalLayout {
-        Text { text: "Presets"; font-size: 15px; font-weight: 600; vertical-alignment: center; }
+        Text { text: Tr.presets; font-size: 15px; font-weight: 600; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
-        LinkText { text: "Refresh"; clicked => { Bridge.ptz-refresh(); } }
+        LinkText { text: Tr.refresh; clicked => { Bridge.ptz-refresh(); } }
     }
     if Bridge.presets.length == 0: Text {
-        text: "No presets yet: move the camera, name the position and save it.";
+        text: Tr.no-presets;
         font-size: 12px;
         wrap: word-wrap;
         color: Palette.foreground.transparentize(0.4);
@@ -1661,7 +1816,7 @@ component PtzSection inherits VerticalLayout {
         border-radius: 10px;
         background: pt.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
         accessible-role: button;
-        accessible-label: "Go to " + p.name;
+        accessible-label: p.name;
         accessible-action-default => { Bridge.ptz-goto(p.id); }
         pt := TouchArea {
             mouse-cursor: pointer;
@@ -1695,9 +1850,9 @@ component PtzSection inherits VerticalLayout {
     }
     HorizontalLayout {
         spacing: 6px;
-        preset-name := LineEdit { placeholder-text: "Name this position"; }
+        preset-name := LineEdit { placeholder-text: Tr.preset-placeholder; }
         Button {
-            text: "Save";
+            text: Tr.save;
             enabled: preset-name.text != "";
             clicked => {
                 Bridge.ptz-save(preset-name.text);
@@ -1740,9 +1895,9 @@ component SinglePage inherits Rectangle {
                         alignment: center;
                         Icon { commands: Icons.privacy; width: 54px; height: 54px; color: #ffffffb0; }
                     }
-                    Text { text: "Privacy mode is on"; color: white; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
+                    Text { text: Tr.privacy-on-title; color: white; font-size: 20px; font-weight: 600; horizontal-alignment: center; }
                     Text {
-                        text: "The camera has covered its lens, so there's no video.";
+                        text: Tr.privacy-on-desc;
                         color: #a8a8a8;
                         horizontal-alignment: center;
                     }
@@ -1752,7 +1907,7 @@ component SinglePage inherits Rectangle {
                         PillButton {
                             width: 200px;
                             primary: true;
-                            text: "Turn off";
+                            text: Tr.turn-off;
                             busy: Bridge.ptz-busy;
                             clicked => { Bridge.privacy-toggle(); }
                         }
@@ -1761,9 +1916,10 @@ component SinglePage inherits Rectangle {
             }
             if !Bridge.fullscreen: Rectangle {
                 y: 0;
-                height: 68px;
+                height: Bridge.custom-chrome ? 92px : 68px;
                 background: @linear-gradient(180deg, #000000c8 0%, #00000000 100%);
                 HorizontalLayout {
+                    padding-top: Bridge.custom-chrome ? 28px : 0px;
                     padding-left: 10px;
                     padding-right: 16px;
                     padding-bottom: 8px;
@@ -1772,7 +1928,7 @@ component SinglePage inherits Rectangle {
                         alignment: center;
                         RoundIconButton {
                             icon: Icons.back;
-                            label: "Back";
+                            label: Tr.back;
                             icon-color: white;
                             base: #ffffff1a;
                             clicked => { Bridge.single-back(); }
@@ -1788,7 +1944,7 @@ component SinglePage inherits Rectangle {
                         alignment: center;
                         RoundIconButton {
                             icon: Bridge.single-audio-on ? Icons.volume-on : Icons.volume-off;
-                            label: Bridge.single-audio-on ? "Mute audio (M)" : "Listen in (M)";
+                            label: Bridge.single-audio-on ? Tr.mute-audio : Tr.listen-in;
                             icon-color: Bridge.single-audio-on ? Palette.accent-foreground : white;
                             base: Bridge.single-audio-on ? Palette.accent-background : #ffffff1a;
                             clicked => { Bridge.single-toggle-audio(); }
@@ -1836,7 +1992,7 @@ component SinglePage inherits Rectangle {
                         alignment: center;
                         RoundIconButton {
                             icon: Icons.fullscreen;
-                            label: "Fullscreen (F11)";
+                            label: Tr.fullscreen-hint;
                             icon-color: white;
                             base: #ffffff1a;
                             clicked => { Bridge.toggle-fullscreen(); }
@@ -1859,13 +2015,13 @@ component SinglePage inherits Rectangle {
                         Row {
                             ActionTile {
                                 icon: Bridge.single-audio-on ? Icons.volume-on : Icons.volume-off;
-                                text: Bridge.single-audio-on ? "Sound On" : "Sound Off";
+                                text: Bridge.single-audio-on ? Tr.sound-on : Tr.sound-off;
                                 active: Bridge.single-audio-on;
                                 clicked => { Bridge.single-toggle-audio(); }
                             }
                             ActionTile {
                                 icon: Icons.photo;
-                                text: "Take Photo";
+                                text: Tr.take-photo;
                                 enabled: Bridge.single-has-frame && !Bridge.single-stale;
                                 clicked => { Bridge.snapshot(); }
                             }
@@ -1873,14 +2029,14 @@ component SinglePage inherits Rectangle {
                         Row {
                             ActionTile {
                                 icon: Icons.move;
-                                text: "Pan & Tilt";
+                                text: Tr.pan-tilt;
                                 active: Bridge.ptz-open && Bridge.single-ptz && !Bridge.single-privacy;
                                 enabled: Bridge.single-ptz && !Bridge.single-privacy;
                                 clicked => { Bridge.ptz-open = !Bridge.ptz-open; }
                             }
                             ActionTile {
                                 icon: Icons.privacy;
-                                text: "Privacy Mode";
+                                text: Tr.privacy-mode;
                                 active: Bridge.single-privacy;
                                 enabled: Bridge.single-privacy-known && !Bridge.ptz-busy;
                                 clicked => { Bridge.privacy-toggle(); }
@@ -1889,14 +2045,14 @@ component SinglePage inherits Rectangle {
                         Row {
                             ActionTile {
                                 icon: Icons.spotlight;
-                                text: Bridge.single-spotlight ? "Spotlight On" : "Spotlight";
+                                text: Bridge.single-spotlight ? Tr.spotlight-on : Tr.spotlight;
                                 active: Bridge.single-spotlight;
                                 enabled: !Bridge.single-privacy && !Bridge.ptz-busy;
                                 clicked => { Bridge.spotlight-toggle(); }
                             }
                             ActionTile {
                                 icon: Icons.track;
-                                text: Bridge.single-track ? "Tracking On" : "Auto-Track";
+                                text: Bridge.single-track ? Tr.tracking-on : Tr.auto-track;
                                 active: Bridge.single-track;
                                 enabled: Bridge.single-ptz && !Bridge.single-privacy && !Bridge.ptz-busy;
                                 clicked => { Bridge.auto-track-toggle(); }
@@ -1905,14 +2061,14 @@ component SinglePage inherits Rectangle {
                         Row {
                             ActionTile {
                                 icon: Icons.siren;
-                                text: Bridge.single-siren ? "Stop Siren" : "Siren";
+                                text: Bridge.single-siren ? Tr.stop-siren : Tr.siren;
                                 active: Bridge.single-siren;
                                 enabled: !Bridge.ptz-busy;
                                 clicked => { Bridge.siren-toggle(); }
                             }
                             ActionTile {
                                 icon: Icons.fullscreen;
-                                text: "Fullscreen";
+                                text: Tr.fullscreen;
                                 clicked => { Bridge.toggle-fullscreen(); }
                             }
                         }
@@ -1932,7 +2088,7 @@ component SinglePage inherits Rectangle {
                                 Icon { commands: Icons.moon; width: 20px; height: 20px; }
                             }
                             Text {
-                                text: "Night Vision";
+                                text: Tr.night-vision;
                                 font-size: 14px;
                                 vertical-alignment: center;
                                 horizontal-stretch: 1;
@@ -1955,7 +2111,7 @@ component SinglePage inherits Rectangle {
                         border-radius: 14px;
                         background: pb.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
                         accessible-role: button;
-                        accessible-label: "Playback & Download";
+                        accessible-label: Tr.playback-download;
                         accessible-action-default => { Bridge.open-playback(); }
                         HorizontalLayout {
                             padding-left: 16px;
@@ -1965,7 +2121,7 @@ component SinglePage inherits Rectangle {
                                 alignment: center;
                                 Icon { commands: Icons.playback; width: 24px; height: 24px; }
                             }
-                            Text { text: "Playback & Download"; font-size: 15px; vertical-alignment: center; horizontal-stretch: 1; }
+                            Text { text: Tr.playback-download; font-size: 15px; vertical-alignment: center; horizontal-stretch: 1; }
                             VerticalLayout {
                                 alignment: center;
                                 Icon { commands: Icons.chevron-right; width: 18px; height: 18px; color: Palette.foreground.transparentize(0.4); }
@@ -1979,7 +2135,7 @@ component SinglePage inherits Rectangle {
                     // Reboot camera with 2-step confirmation.
                     if !Bridge.reboot-confirm: HorizontalLayout {
                         Button {
-                            text: "Reboot camera";
+                            text: Tr.reboot-camera;
                             horizontal-stretch: 1;
                             enabled: !Bridge.ptz-busy;
                             clicked => { Bridge.reboot-confirm = true; }
@@ -1994,19 +2150,19 @@ component SinglePage inherits Rectangle {
                             padding: 12px;
                             spacing: 8px;
                             Text {
-                                text: "Reboot " + Bridge.single-name + "? Video will pause for ~30 seconds.";
+                                text: Tr.reboot-confirm-prefix + Bridge.single-name + Tr.reboot-confirm-suffix;
                                 font-size: 12px;
                                 wrap: word-wrap;
                             }
                             HorizontalLayout {
                                 spacing: 8px;
                                 Button {
-                                    text: "Cancel";
+                                    text: Tr.cancel;
                                     horizontal-stretch: 1;
                                     clicked => { Bridge.reboot-confirm = false; }
                                 }
                                 Button {
-                                    text: "Confirm Reboot";
+                                    text: Tr.confirm-reboot;
                                     primary: true;
                                     horizontal-stretch: 1;
                                     clicked => {
@@ -2148,7 +2304,7 @@ component ClipRow inherits Rectangle {
                     color: root.rec.icon == 4 ? #e8a317 : root.rec.icon == 3 ? #3aa757 : #4f86e8;
                 }
                 Text {
-                    text: root.rec.kind + (root.rec.has-thumb ? "" : "  ·  " + root.rec.duration) + (root.rec.saved ? "  ·  saved" : "");
+                    text: root.rec.kind + (root.rec.has-thumb ? "" : "  ·  " + root.rec.duration) + (root.rec.saved ? "  ·  " + Tr.saved-tag : "");
                     font-size: 12px;
                     color: Palette.foreground.transparentize(0.4);
                     overflow: elide;
@@ -2162,7 +2318,7 @@ component ClipRow inherits Rectangle {
                 width: 32px;
                 height: 32px;
                 icon: root.rec.saved ? Icons.check : Icons.download;
-                label: root.rec.saved ? "Saved" : "Save to Videos";
+                label: root.rec.saved ? Tr.saved-tooltip : Tr.save-to-videos;
                 base: transparent;
                 clicked => { root.save(); }
             }
@@ -2332,12 +2488,12 @@ component SpeedChip inherits Rectangle {
 component PlaybackPage inherits Rectangle {
     VerticalLayout {
         if !Bridge.fullscreen: PageHeader {
-            title: "Playback";
+            title: Tr.nav-playback;
             VerticalLayout {
                 alignment: center;
                 RoundIconButton {
                     icon: Icons.side-panel;
-                    label: Bridge.rec-side-hidden ? "Show the list" : "Hide the list";
+                    label: Bridge.rec-side-hidden ? Tr.show-list : Tr.hide-list;
                     clicked => { Bridge.rec-side-hidden = !Bridge.rec-side-hidden; }
                 }
             }
@@ -2358,7 +2514,7 @@ component PlaybackPage inherits Rectangle {
                 alignment: center;
                 RoundIconButton {
                     icon: Icons.refresh;
-                    label: "Reload";
+                    label: Tr.reload;
                     enabled: !Bridge.hub-busy;
                     clicked => { Bridge.connect-hub(); }
                 }
@@ -2401,8 +2557,8 @@ component PlaybackPage inherits Rectangle {
                         }
                         Text {
                             text: !Bridge.hub-connected ? Bridge.hub-message
-                                : Bridge.tl-segments.length == 0 ? "No recordings on this day."
-                                : "Click the timeline, or a recording on the right, to watch from there.";
+                                : Bridge.tl-segments.length == 0 ? Tr.no-recordings-day
+                                : Tr.click-timeline-hint;
                             color: #9a9a9a;
                             horizontal-alignment: center;
                             wrap: word-wrap;
@@ -2489,7 +2645,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Bridge.player-paused || Bridge.player-ended ? Icons.play : Icons.pause;
-                                    label: Bridge.player-paused ? "Play" : "Pause";
+                                    label: Bridge.player-paused ? Tr.play : Tr.pause;
                                     icon-color: white;
                                     base: #ffffff26;
                                     clicked => { Bridge.player-toggle-pause(); }
@@ -2518,7 +2674,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Bridge.player-audio-on ? Icons.volume-on : Icons.volume-off;
-                                    label: Bridge.player-audio-on ? "Mute audio (M)" : "Listen in (M)";
+                                    label: Bridge.player-audio-on ? Tr.mute-audio : Tr.listen-in;
                                     icon-color: Bridge.player-audio-on ? Palette.accent-foreground : white;
                                     base: Bridge.player-audio-on ? Palette.accent-background : #ffffff26;
                                     clicked => { Bridge.player-toggle-audio(); }
@@ -2530,7 +2686,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Icons.record;
-                                    label: Bridge.player-recording ? "Stop and save the recording" : "Record";
+                                    label: Bridge.player-recording ? Tr.stop-save-recording : Tr.record;
                                     icon-color: Bridge.player-recording ? #ff6b6b : white;
                                     base: Bridge.player-recording ? #e5484d50 : #ffffff26;
                                     clicked => { Bridge.player-record(); }
@@ -2542,7 +2698,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Icons.photo;
-                                    label: "Take photo";
+                                    label: Tr.take-photo;
                                     icon-color: white;
                                     base: #ffffff26;
                                     clicked => { Bridge.player-snapshot(); }
@@ -2554,7 +2710,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Bridge.fullscreen ? Icons.exit-fullscreen : Icons.fullscreen;
-                                    label: Bridge.fullscreen ? "Leave full screen" : "Full screen";
+                                    label: Bridge.fullscreen ? Tr.leave-fullscreen : Tr.fullscreen;
                                     icon-color: white;
                                     base: #ffffff26;
                                     clicked => { Bridge.toggle-fullscreen(); }
@@ -2566,7 +2722,7 @@ component PlaybackPage inherits Rectangle {
                                     width: 36px;
                                     height: 36px;
                                     icon: Icons.close;
-                                    label: "Close the player";
+                                    label: Tr.close-player;
                                     icon-color: white;
                                     base: #ffffff26;
                                     clicked => { Bridge.player-stop(); }
@@ -2585,14 +2741,14 @@ component PlaybackPage inherits Rectangle {
                             width: 32px;
                             height: 32px;
                             icon: Icons.zoom-in;
-                            label: "Zoom in";
+                            label: Tr.zoom-in;
                             clicked => { Bridge.tl-zoom(0.5, Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1 ? Bridge.tl-playhead : 0.5); }
                         }
                         RoundIconButton {
                             width: 32px;
                             height: 32px;
                             icon: Icons.zoom-out;
-                            label: "Zoom out";
+                            label: Tr.zoom-out;
                             enabled: Bridge.tl-zoomed;
                             clicked => { Bridge.tl-zoom(2.0, Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1 ? Bridge.tl-playhead : 0.5); }
                         }
@@ -2605,7 +2761,7 @@ component PlaybackPage inherits Rectangle {
                 }
                 if Bridge.downloads.length > 0 && !Bridge.fullscreen: VerticalLayout {
                     spacing: 4px;
-                    Heading { text: "Saved to Videos"; }
+                    Heading { text: Tr.saved-to-videos; }
                     for d in Bridge.downloads: HorizontalLayout {
                         spacing: 8px;
                         VerticalLayout { alignment: center; Text { text: d.label; width: 230px; overflow: elide; } }
@@ -2614,8 +2770,8 @@ component PlaybackPage inherits Rectangle {
                             horizontal-stretch: 1;
                             Muted { text: d.status; wrap: no-wrap; overflow: elide; }
                         }
-                        if d.done: Button { text: "Open"; clicked => { Bridge.open-file(d.path); } }
-                        if d.done: Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(d.path); } }
+                        if d.done: Button { text: Tr.open; clicked => { Bridge.open-file(d.path); } }
+                        if d.done: Button { text: Tr.show-in-folder; clicked => { Bridge.show-in-folder(d.path); } }
                     }
                 }
                 // Takes what's left under the player, not a share of its room.
@@ -2648,7 +2804,7 @@ component PlaybackPage inherits Rectangle {
                             width: 32px;
                             height: 32px;
                             icon: Icons.chevron-left;
-                            label: "Previous month";
+                            label: Tr.prev-month;
                             base: transparent;
                             clicked => { Bridge.change-month(-1); }
                         }
@@ -2663,15 +2819,15 @@ component PlaybackPage inherits Rectangle {
                             width: 32px;
                             height: 32px;
                             icon: Icons.chevron-right;
-                            label: "Next month";
+                            label: Tr.next-month;
                             base: transparent;
                             enabled: !Bridge.rec-month-is-current;
                             clicked => { Bridge.change-month(1); }
                         }
-                        Button { text: "Today"; clicked => { Bridge.go-today(); } }
+                        Button { text: Tr.today; clicked => { Bridge.go-today(); } }
                     }
                     if Bridge.hub-connected: HorizontalLayout {
-                        for name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]: Text {
+                        for name in Tr.weekdays: Text {
                             horizontal-stretch: 1;
                             text: name;
                             font-size: 11px;
@@ -2745,7 +2901,7 @@ component PlaybackPage inherits Rectangle {
                         if !Bridge.rec-loading && Bridge.recordings.length == 0: Muted {
                             width: parent.width;
                             height: parent.height;
-                            text: Bridge.rec-message != "" ? Bridge.rec-message : "No recordings on this day.";
+                            text: Bridge.rec-message != "" ? Bridge.rec-message : Tr.no-recordings-day;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             wrap: word-wrap;
@@ -2847,20 +3003,20 @@ component SettingsPage inherits Rectangle {
                 width: root.column;
                 spacing: 8px;
                 alignment: start;
-                PageHeader { title: "Settings"; padding-left: 0px; padding-right: 0px; }
+                PageHeader { title: Tr.nav-settings; padding-left: 0px; padding-right: 0px; }
 
-                SettingsHeading { text: "Tapo account"; }
+                SettingsHeading { text: Tr.sec-account; }
                 SettingsCard {
                     SettingRow {
                         divider: false;
-                        title: Bridge.cloud-signed-in ? Bridge.account-name : "Not signed in";
-                        description: Bridge.cloud-signed-in ? "Signed in to the Tapo cloud · " + Bridge.account-server : Bridge.cloud-status;
+                        title: Bridge.cloud-signed-in ? Bridge.account-name : Tr.not-signed-in;
+                        description: Bridge.cloud-signed-in ? Tr.signed-in-prefix + Bridge.account-server : Bridge.cloud-status;
                         avatar: Bridge.cloud-signed-in ? Bridge.account-initial : "";
                         icon: Bridge.cloud-signed-in ? "" : Icons.person;
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Sign out";
+                                text: Tr.sign-out;
                                 enabled: Bridge.cloud-signed-in && !Bridge.cloud-busy;
                                 clicked => { Bridge.cloud-sign-out(); }
                             }
@@ -2868,8 +3024,8 @@ component SettingsPage inherits Rectangle {
                     }
                     SettingRow {
                         icon: Icons.refresh;
-                        title: "Cameras and hubs";
-                        description: Bridge.cloud-message != "" ? Bridge.cloud-message : "Added by themselves; update after adding one in the Tapo app.";
+                        title: Tr.cameras-and-hubs;
+                        description: Bridge.cloud-message != "" ? Bridge.cloud-message : Tr.cameras-hubs-desc;
                         if Bridge.cloud-busy: VerticalLayout {
                             alignment: center;
                             Spinner { width: 20px; height: 20px; indeterminate: true; }
@@ -2877,7 +3033,7 @@ component SettingsPage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Update list";
+                                text: Tr.update-list;
                                 enabled: Bridge.cloud-signed-in && !Bridge.cloud-busy;
                                 clicked => { Bridge.cloud-refresh(); }
                             }
@@ -2885,19 +3041,19 @@ component SettingsPage inherits Rectangle {
                     }
                 }
                 Muted {
-                    text: "Live video, pan/tilt and the hub's recordings go through TP-Link's cloud, as in the Tapo app, so this PC needn't be on the cameras' network. It's TP-Link's private service, which they can change.";
+                    text: Tr.cloud-note;
                     font-size: 12px;
                     wrap: word-wrap;
                 }
                 Rectangle { height: 8px; }
 
-                SettingsHeading { text: "Cameras"; }
+                SettingsHeading { text: Tr.cameras-section; }
                 SettingsCard {
                     if Bridge.cameras.length == 0: SettingRow {
                         divider: false;
                         icon: Icons.video;
-                        title: "No cameras yet";
-                        description: "Sign in above: the cameras on your Tapo account are added by themselves.";
+                        title: Tr.no-cameras-title;
+                        description: Tr.no-cameras-settings-desc;
                     }
                     for c[i] in Bridge.cameras: SettingRow {
                         divider: i > 0;
@@ -2908,7 +3064,7 @@ component SettingsPage inherits Rectangle {
                             alignment: center;
                             RoundIconButton {
                                 icon: Icons.chevron-up;
-                                label: "Move " + c.name + " up";
+                                label: c.name;
                                 enabled: i > 0;
                                 clicked => { Bridge.move-camera(c.id, -1); }
                             }
@@ -2917,20 +3073,20 @@ component SettingsPage inherits Rectangle {
                             alignment: center;
                             RoundIconButton {
                                 icon: Icons.chevron-down;
-                                label: "Move " + c.name + " down";
+                                label: c.name;
                                 enabled: i < Bridge.cameras.length - 1;
                                 clicked => { Bridge.move-camera(c.id, 1); }
                             }
                         }
                         VerticalLayout {
                             alignment: center;
-                            Button { text: "Edit"; clicked => { Bridge.edit-camera(c.id); } }
+                            Button { text: Tr.edit; clicked => { Bridge.edit-camera(c.id); } }
                         }
                         VerticalLayout {
                             alignment: center;
                             RoundIconButton {
                                 icon: Icons.close;
-                                label: "Remove " + c.name;
+                                label: c.name;
                                 clicked => { Bridge.delete-camera(c.id); }
                             }
                         }
@@ -2941,27 +3097,27 @@ component SettingsPage inherits Rectangle {
                             padding: 18px;
                             spacing: 10px;
                             Text {
-                                text: Bridge.cam-editing == 0 ? "Add a camera" : "Edit camera";
+                                text: Bridge.cam-editing == 0 ? Tr.add-camera : Tr.edit-camera;
                                 font-size: 14px;
                                 font-weight: 600;
                             }
                             Field {
-                                label: "Tapo camera";
+                                label: Tr.tapo-camera;
                                 ComboBox { width: 280px; model: Bridge.cloud-camera-labels; current-index <=> Bridge.cam-cloud; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             Field {
-                                label: "Name";
-                                LineEdit { text <=> Bridge.cam-name; placeholder-text: "Same as in the Tapo app"; width: 280px; }
+                                label: Tr.name-label;
+                                LineEdit { text <=> Bridge.cam-name; placeholder-text: Tr.name-placeholder; width: 280px; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             Field {
-                                label: "Live view stream";
+                                label: Tr.live-stream-label;
                                 ComboBox { width: 280px; model: Bridge.quality-labels; current-index <=> Bridge.cam-quality; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             Muted {
-                                text: "SD is light on the network and the PC, for the grid; HD is the camera's full picture. A camera opened on its own is always HD to start with.";
+                                text: Tr.stream-quality-note;
                                 font-size: 12px;
                                 wrap: word-wrap;
                             }
@@ -2969,48 +3125,62 @@ component SettingsPage inherits Rectangle {
                             HorizontalLayout {
                                 spacing: 8px;
                                 alignment: end;
-                                Button { text: "Cancel"; clicked => { Bridge.cam-editing = -1; } }
-                                Button { text: "Save"; primary: true; clicked => { Bridge.save-camera(); } }
+                                Button { text: Tr.cancel; clicked => { Bridge.cam-editing = -1; } }
+                                Button { text: Tr.save; primary: true; clicked => { Bridge.save-camera(); } }
                             }
                         }
                     }
                     if Bridge.cam-editing < 0 && Bridge.cameras.length > 0: SettingRow {
-                        title: "Add a camera";
-                        description: "Cameras removed here, or ones the list missed, can be added back.";
+                        title: Tr.add-camera;
+                        description: Tr.add-camera-desc;
                         VerticalLayout {
                             alignment: center;
-                            Button { text: "Add"; clicked => { Bridge.new-camera(); } }
+                            Button { text: Tr.add; clicked => { Bridge.new-camera(); } }
                         }
                     }
                 }
                 Rectangle { height: 8px; }
 
-                SettingsHeading { text: "Appearance and video"; }
+                SettingsHeading { text: Tr.sec-appearance; }
                 SettingsCard {
                     SettingRow {
                         divider: false;
                         icon: Icons.settings;
-                        title: "Appearance";
-                        description: "Light, dark, or the same as Windows.";
+                        title: Tr.appearance-title;
+                        description: Tr.appearance-desc;
                         VerticalLayout {
                             alignment: center;
                             ComboBox {
                                 width: 220px;
-                                model: ["Same as Windows", "Light", "Dark"];
+                                model: Tr.appearance-labels;
                                 current-index <=> Bridge.theme-index;
                                 selected => { Bridge.save-settings(); }
                             }
                         }
                     }
                     SettingRow {
-                        icon: Icons.grid;
-                        title: "Graphics renderer";
-                        description: "How the window is drawn, from the next start.";
+                        icon: Icons.globe;
+                        title: Tr.language-title;
+                        description: Tr.language-desc;
                         VerticalLayout {
                             alignment: center;
                             ComboBox {
                                 width: 220px;
-                                model: ["OpenGL (recommended)", "Software (CPU)"];
+                                model: Tr.language-labels;
+                                current-index <=> Bridge.language-index;
+                                selected => { Bridge.save-settings(); }
+                            }
+                        }
+                    }
+                    SettingRow {
+                        icon: Icons.grid;
+                        title: Tr.renderer-title;
+                        description: Tr.renderer-desc;
+                        VerticalLayout {
+                            alignment: center;
+                            ComboBox {
+                                width: 220px;
+                                model: Tr.renderer-labels;
                                 current-index <=> Bridge.renderer-index;
                                 selected => { Bridge.save-settings(); }
                             }
@@ -3018,40 +3188,40 @@ component SettingsPage inherits Rectangle {
                     }
                     SettingRow {
                         icon: Icons.video;
-                        title: "Video decoder";
+                        title: Tr.decoder-title;
                         description: Bridge.ffmpeg-found;
                         VerticalLayout {
                             alignment: center;
                             LineEdit {
                                 width: 220px;
                                 text <=> Bridge.ffmpeg-path;
-                                placeholder-text: "Built-in ffmpeg";
+                                placeholder-text: Tr.decoder-placeholder;
                                 accepted => { Bridge.save-settings(); }
                             }
                         }
                         VerticalLayout {
                             alignment: center;
-                            Button { text: "Apply"; clicked => { Bridge.save-settings(); } }
+                            Button { text: Tr.apply; clicked => { Bridge.save-settings(); } }
                         }
                     }
                     SettingRow {
                         icon: Icons.folder;
-                        title: "Settings file";
+                        title: Tr.settings-file;
                         description: Bridge.config-path;
                         VerticalLayout {
                             alignment: center;
-                            Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(Bridge.config-path); } }
+                            Button { text: Tr.show-in-folder; clicked => { Bridge.show-in-folder(Bridge.config-path); } }
                         }
                     }
                 }
                 Rectangle { height: 8px; }
 
-                SettingsHeading { text: "About and updates"; }
+                SettingsHeading { text: Tr.sec-about; }
                 SettingsCard {
                     SettingRow {
                         divider: false;
                         title: "Tapas " + Bridge.app-version;
-                        description: Bridge.update-status != "" ? Bridge.update-status : "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.";
+                        description: Bridge.update-status != "" ? Bridge.update-status : Tr.about-default;
                         if Bridge.update-busy: VerticalLayout {
                             alignment: center;
                             Spinner { width: 20px; height: 20px; indeterminate: true; }
@@ -3059,7 +3229,7 @@ component SettingsPage inherits Rectangle {
                         if Bridge.update-available: VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Update to " + Bridge.update-version;
+                                text: Tr.update-to-prefix + Bridge.update-version;
                                 primary: true;
                                 enabled: !Bridge.update-busy;
                                 clicked => { Bridge.install-update(); }
@@ -3068,7 +3238,7 @@ component SettingsPage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             Button {
-                                text: "Check for updates";
+                                text: Tr.check-updates;
                                 enabled: !Bridge.update-busy;
                                 clicked => { Bridge.check-update(); }
                             }
@@ -3076,8 +3246,8 @@ component SettingsPage inherits Rectangle {
                     }
                     SettingRow {
                         icon: Icons.download;
-                        title: "Check for updates at start-up";
-                        description: "From " + Bridge.update-source + ". A new version installs by itself and Tapas restarts.";
+                        title: Tr.auto-update-title;
+                        description: Tr.auto-update-desc-prefix + Bridge.update-source + Tr.auto-update-desc-suffix;
                         VerticalLayout {
                             alignment: center;
                             Switch {
@@ -3089,7 +3259,7 @@ component SettingsPage inherits Rectangle {
                 }
                 // Long text wraps well only outside the cards' rows.
                 Muted {
-                    text: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
+                    text: Tr.credits-note;
                     font-size: 12px;
                     wrap: word-wrap;
                 }
@@ -3123,7 +3293,7 @@ component WindowControls inherits Rectangle {
                 : min-ta.has-hover ? Palette.foreground.transparentize(0.91) : transparent;
             animate background { duration: 90ms; }
             accessible-role: button;
-            accessible-label: "Minimize";
+            accessible-label: Tr.win-minimize;
             accessible-action-default => { Bridge.window-minimize(); }
 
             Path {
@@ -3153,7 +3323,7 @@ component WindowControls inherits Rectangle {
                 : self.hot ? Palette.foreground.transparentize(0.91) : transparent;
             animate background { duration: 90ms; }
             accessible-role: button;
-            accessible-label: Bridge.window-maximized ? "Restore" : "Maximize";
+            accessible-label: Bridge.window-maximized ? Tr.win-restore : Tr.win-maximize;
             accessible-action-default => { Bridge.window-toggle-maximize(); }
 
             Path {
@@ -3183,7 +3353,7 @@ component WindowControls inherits Rectangle {
                 : close-ta.has-hover ? #c42b1c : transparent;
             animate background { duration: 90ms; }
             accessible-role: button;
-            accessible-label: "Close";
+            accessible-label: Tr.win-close;
             accessible-action-default => { Bridge.window-close(); }
 
             Path {

@@ -303,6 +303,192 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> to
     cmd
 }
 
+/// Remuxes a Tapo MPEG-TS recording at `ts_path` into a standard `.mp4` at
+/// `mp4_path` with lossless video copy (`-c:v copy`) and `+faststart`.
+///
+/// - Standard MPEG-TS AAC (`0x0f`) is copied losslessly (`aac_adtstoasc`).
+/// - Tapo's proprietary G.711 A-law/u-law tracks (`0x90`/`0x91`, which FFmpeg's
+///   MPEG-TS demuxer does not recognize as audio) are decoded to PCM by
+///   [`crate::audio::TsAudioDemuxer`] and encoded to AAC (`64 kbps`).
+/// - If audio remuxing fails for any reason, falls back to video-only MP4 so
+///   the recording is still saved.
+pub async fn remux_ts_to_mp4(ffmpeg: &Path, ts_path: &Path, mp4_path: &Path) -> Result<()> {
+    let ts_owned = ts_path.to_path_buf();
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    let pcm_tmp = mp4_path.with_extension(format!("pcm.{tag}.part"));
+    let pcm_for_task = pcm_tmp.clone();
+
+    let (hevc, audio_mode) = tokio::task::spawn_blocking(move || prepare_ts_audio(&ts_owned, &pcm_for_task))
+        .await
+        .context("Audio inspection task failed")??;
+
+    let mp4_tmp = mp4_path.with_extension(format!("mp4.{tag}.part"));
+    let run_result = async {
+        match audio_mode {
+            RemuxAudio::Aac => {
+                if let Err(e) = run_remux(ffmpeg, ts_path, None, &mp4_tmp, hevc, RemuxAudio::Aac).await {
+                    log::warn!("mp4: AAC copy failed ({e:#}); retrying video-only");
+                    let _ = std::fs::remove_file(&mp4_tmp);
+                    run_remux(ffmpeg, ts_path, None, &mp4_tmp, hevc, RemuxAudio::None).await?;
+                }
+            }
+            RemuxAudio::Pcm(rate) => {
+                if let Err(e) = run_remux(ffmpeg, ts_path, Some(&pcm_tmp), &mp4_tmp, hevc, RemuxAudio::Pcm(rate)).await {
+                    log::warn!("mp4: G.711->AAC remux failed ({e:#}); retrying video-only");
+                    let _ = std::fs::remove_file(&mp4_tmp);
+                    run_remux(ffmpeg, ts_path, None, &mp4_tmp, hevc, RemuxAudio::None).await?;
+                }
+            }
+            RemuxAudio::None => {
+                run_remux(ffmpeg, ts_path, None, &mp4_tmp, hevc, RemuxAudio::None).await?;
+            }
+        }
+        if std::fs::metadata(&mp4_tmp).map(|m| m.len()).unwrap_or(0) == 0 {
+            bail!("ffmpeg produced an empty MP4 file");
+        }
+        std::fs::rename(&mp4_tmp, mp4_path)
+            .with_context(|| format!("Could not save {}", mp4_path.display()))?;
+        Ok(())
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&pcm_tmp);
+    if run_result.is_err() {
+        let _ = std::fs::remove_file(&mp4_tmp);
+    }
+    run_result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemuxAudio {
+    None,
+    Aac,
+    Pcm(u32),
+}
+
+fn prepare_ts_audio(ts_path: &Path, pcm_path: &Path) -> Result<(bool, RemuxAudio)> {
+    use std::io::{Read, Write};
+    use crate::audio::{AudioCodec, TsAudioDemuxer};
+
+    let mut file = std::fs::File::open(ts_path).with_context(|| format!("Could not open {}", ts_path.display()))?;
+    let mut probe = vec![0u8; 128 * 1024];
+    let n = file.read(&mut probe)?;
+    probe.truncate(n);
+
+    let mut demux = TsAudioDemuxer::new();
+    let mut chunks = Vec::new();
+    demux.feed(&probe, &mut chunks);
+    let hevc = demux.video_is_hevc();
+
+    match demux.codec() {
+        Some(AudioCodec::Aac) => Ok((hevc, RemuxAudio::Aac)),
+        Some(AudioCodec::Pcma | AudioCodec::Pcmu) => {
+            let mut pcm_out = std::io::BufWriter::new(
+                std::fs::File::create(pcm_path).with_context(|| format!("Could not create {}", pcm_path.display()))?,
+            );
+            let mut sample_rate = 8_000u32;
+            let mut wrote_samples = 0usize;
+            let write_chunks = |chunks: &mut Vec<crate::audio::PcmChunk>,
+                                out: &mut std::io::BufWriter<std::fs::File>,
+                                rate: &mut u32,
+                                wrote: &mut usize|
+             -> Result<()> {
+                for c in chunks.drain(..) {
+                    *rate = c.sample_rate;
+                    *wrote += c.samples.len();
+                    for s in c.samples {
+                        out.write_all(&s.to_le_bytes())?;
+                    }
+                }
+                Ok(())
+            };
+            write_chunks(&mut chunks, &mut pcm_out, &mut sample_rate, &mut wrote_samples)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let got = file.read(&mut buf)?;
+                if got == 0 {
+                    break;
+                }
+                demux.feed(&buf[..got], &mut chunks);
+                write_chunks(&mut chunks, &mut pcm_out, &mut sample_rate, &mut wrote_samples)?;
+            }
+            demux.finish(&mut chunks);
+            write_chunks(&mut chunks, &mut pcm_out, &mut sample_rate, &mut wrote_samples)?;
+            pcm_out.flush()?;
+            if wrote_samples == 0 {
+                let _ = std::fs::remove_file(pcm_path);
+                Ok((hevc, RemuxAudio::None))
+            } else {
+                Ok((hevc, RemuxAudio::Pcm(sample_rate)))
+            }
+        }
+        None => Ok((hevc, RemuxAudio::None)),
+    }
+}
+
+async fn run_remux(
+    ffmpeg: &Path,
+    ts_path: &Path,
+    pcm_path: Option<&Path>,
+    mp4_tmp: &Path,
+    hevc: bool,
+    audio: RemuxAudio,
+) -> Result<()> {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-nostats", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
+        .arg(ts_path);
+    if let (RemuxAudio::Pcm(rate), Some(pcm)) = (audio, pcm_path) {
+        cmd.args(["-f", "s16le", "-ar", &rate.to_string(), "-ac", "1", "-i"]).arg(pcm);
+    }
+    cmd.args(["-map", "0:v:0"]);
+    match audio {
+        RemuxAudio::Aac => {
+            cmd.args(["-map", "0:a:0"]);
+        }
+        RemuxAudio::Pcm(_) => {
+            cmd.args(["-map", "1:a:0"]);
+        }
+        RemuxAudio::None => {}
+    }
+    cmd.args(["-c:v", "copy"]);
+    if hevc {
+        cmd.args(["-tag:v", "hvc1"]);
+    }
+    match audio {
+        RemuxAudio::Aac => {
+            cmd.args(["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]);
+        }
+        RemuxAudio::Pcm(_) => {
+            cmd.args(["-c:a", "aac", "-b:a", "64k", "-shortest"]);
+        }
+        RemuxAudio::None => {
+            cmd.arg("-an");
+        }
+    }
+    cmd.args(["-avoid_negative_ts", "make_zero", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(mp4_tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().await.context("Could not start ffmpeg for MP4 export")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            bail!("ffmpeg exited with {}", output.status);
+        } else {
+            bail!("ffmpeg failed: {detail}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +548,62 @@ mod tests {
         let distinct: std::collections::HashSet<_> = bytes.chunks(4).step_by(97).collect();
         assert!(distinct.len() > 20, "frame looks blank");
         drop(relay_tx);
+    }
+
+    #[tokio::test]
+    async fn remuxes_ts_to_mp4() {
+        let Some(ffmpeg) = find("") else {
+            eprintln!("skipped: no ffmpeg (build one with tools/build-ffmpeg.sh native)");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("tapas-mp4-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts_path = dir.join("sample.ts");
+        let mp4_path = dir.join("sample.mp4");
+        std::fs::write(&ts_path, include_bytes!("../tests/fixtures/relay-sample.ts")).unwrap();
+
+        remux_ts_to_mp4(&ffmpeg, &ts_path, &mp4_path).await.unwrap();
+        let bytes = std::fs::read(&mp4_path).unwrap();
+        assert!(bytes.len() > 10_000, "mp4 unexpectedly small: {} bytes", bytes.len());
+        assert_eq!(&bytes[4..8], b"ftyp", "missing ISO BMFF ftyp box");
+        let moov = bytes.windows(4).position(|w| w == b"moov").expect("missing moov box");
+        let mdat = bytes.windows(4).position(|w| w == b"mdat").expect("missing mdat box");
+        assert!(moov < mdat, "expected +faststart (moov before mdat)");
+        assert!(bytes.windows(4).any(|w| w == b"mp4a"), "expected preserved AAC audio track");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn remuxes_g711_pcm_to_aac_mp4() {
+        let Some(ffmpeg) = find("") else {
+            eprintln!("skipped: no ffmpeg (build one with tools/build-ffmpeg.sh native)");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("tapas-mp4-pcm-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ts_path = dir.join("sample.ts");
+        let pcm_path = dir.join("audio.pcm");
+        let mp4_path = dir.join("sample_g711.mp4");
+        std::fs::write(&ts_path, include_bytes!("../tests/fixtures/relay-sample.ts")).unwrap();
+        // 2 seconds of 8 kHz mono 16-bit PCM sine-ish tone (tests pcm_s16le -> aac + swresample)
+        let mut pcm = Vec::with_capacity(8_000 * 2 * 2);
+        for i in 0..(8_000 * 2) {
+            let s: i16 = if (i / 10) % 2 == 0 { 4000 } else { -4000 };
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&pcm_path, &pcm).unwrap();
+
+        run_remux(&ffmpeg, &ts_path, Some(&pcm_path), &mp4_path, false, RemuxAudio::Pcm(8_000))
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&mp4_path).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp", "missing ISO BMFF ftyp box");
+        let moov = bytes.windows(4).position(|w| w == b"moov").expect("missing moov box");
+        let mdat = bytes.windows(4).position(|w| w == b"mdat").expect("missing mdat box");
+        assert!(moov < mdat, "expected +faststart (moov before mdat)");
+        assert!(bytes.windows(4).any(|w| w == b"mp4a"), "expected encoded AAC audio track");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

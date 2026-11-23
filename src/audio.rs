@@ -114,6 +114,7 @@ pub struct TsAudioDemuxer {
     pmt_pid: Option<u16>,
     audio_pid: Option<u16>,
     codec: Option<AudioCodec>,
+    video_hevc: bool,
     pes: Vec<u8>,
     pes_expected: Option<usize>,
     pes_pts: Option<u64>,
@@ -143,6 +144,7 @@ impl TsAudioDemuxer {
             pmt_pid: None,
             audio_pid: None,
             codec: None,
+            video_hevc: false,
             pes: Vec::new(),
             pes_expected: None,
             pes_pts: None,
@@ -152,6 +154,19 @@ impl TsAudioDemuxer {
             aac_buf: Vec::new(),
             aac: None,
         }
+    }
+
+    pub fn codec(&self) -> Option<AudioCodec> {
+        self.codec
+    }
+
+    pub fn video_is_hevc(&self) -> bool {
+        self.video_hevc
+    }
+
+    /// Flushes any final buffered PES audio packet at end-of-stream.
+    pub fn finish(&mut self, out: &mut Vec<PcmChunk>) {
+        self.flush_pes(out);
     }
 
     /// Resets stream buffers (e.g. after a seek or unmuting mid-stream).
@@ -280,16 +295,21 @@ impl TsAudioDemuxer {
             let stype = sec[i];
             let epid = (((sec[i + 1] & 0x1F) as u16) << 8) | sec[i + 2] as u16;
             let es_len = (((sec[i + 3] & 0x0F) as usize) << 8) | sec[i + 4] as usize;
-            let codec = match stype {
-                0x90 => Some(AudioCodec::Pcma),
-                0x91 => Some(AudioCodec::Pcmu),
-                0x0F => Some(AudioCodec::Aac),
-                _ => None,
-            };
-            if let Some(codec) = codec {
-                self.audio_pid = Some(epid);
-                self.codec = Some(codec);
-                break;
+            match stype {
+                0x24 => self.video_hevc = true,
+                0x90 => {
+                    self.audio_pid = Some(epid);
+                    self.codec = Some(AudioCodec::Pcma);
+                }
+                0x91 => {
+                    self.audio_pid = Some(epid);
+                    self.codec = Some(AudioCodec::Pcmu);
+                }
+                0x0F => {
+                    self.audio_pid = Some(epid);
+                    self.codec = Some(AudioCodec::Aac);
+                }
+                _ => {}
             }
             i += 5 + es_len;
         }

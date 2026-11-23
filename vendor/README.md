@@ -12,10 +12,13 @@ cloud.
   <https://ffmpeg.org/releases/>.
 - **Build:** `tools/build-ffmpeg.sh windows`, cross-compiled with mingw-w64. The script lists the
   exact `configure` options. Only these are enabled:
-  - the pipe protocol: video is read from stdin; networking is disabled;
-  - the MPEG-TS, H.264 and HEVC demuxers, parsers and decoders;
-  - the scale, pad, format, null and showinfo filters (showinfo gives each frame's time, for
-    playback at a chosen speed);
-  - the rawvideo encoder and muxer, for frames out.
+  - the pipe and file protocols: video is read from stdin or a temporary recording file; networking
+    is disabled;
+  - the MPEG-TS, H.264, HEVC and PCM (`pcm_s16le`) demuxers, parsers and decoders (plus AAC decoding
+    and `aac_adtstoasc` bitstream filtering);
+  - the scale, pad, format, null, showinfo, aresample, aformat and anull filters (`showinfo` gives
+    each frame's time, for playback at a chosen speed);
+  - the rawvideo encoder/muxer (for live frames out) and the LGPL AAC encoder + MP4 muxer (for
+    lossless-video `.mp4` clip exports with `+faststart`).
 
 To use a different ffmpeg, set its path in the app under *Settings › Appearance and video*.

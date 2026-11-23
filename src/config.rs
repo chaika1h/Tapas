@@ -105,6 +105,34 @@ impl Renderer {
     }
 }
 
+/// UI language preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Language {
+    English,
+    Turkish,
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+impl Language {
+    pub fn index(self) -> i32 {
+        match self {
+            Language::System => 0,
+            Language::English => 1,
+            Language::Turkish => 2,
+        }
+    }
+
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Language::English,
+            2 => Language::Turkish,
+            _ => Language::System,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraConfig {
@@ -131,6 +159,7 @@ pub struct AppConfig {
     pub ffmpeg_path: String,
     pub renderer: Renderer,
     pub theme: Theme,
+    pub language: Language,
     pub cloud: CloudConfig,
     /// Don't look for a new version at start-up.
     pub skip_update_checks: bool,

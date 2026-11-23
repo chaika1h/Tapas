@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds a minimal, LGPL-only ffmpeg with just what Tapas needs:
-# MPEG-TS input from stdin (the Tapo cloud video relay), H.264/H.265
-# decoding, scaling and raw video output. No network or other formats.
+# MPEG-TS input from stdin/file (the Tapo cloud video relay), H.264/H.265
+# decoding, scaling and raw video output, plus lossless MP4 remuxing (with
+# AAC copy or PCM->AAC encoding for Tapo G.711 audio). No network.
 # The result is a few MB instead of ~100 MB for a full build, and LGPL means
 # it can be bundled with the app (see vendor/README.md).
 #
@@ -45,15 +46,18 @@ cd "$SRC"
 
 flags=(
   --disable-everything --disable-autodetect --disable-doc --disable-debug
-  --disable-ffplay --disable-ffprobe --disable-avdevice --disable-swresample
+  --disable-ffplay --disable-ffprobe --disable-avdevice
   --enable-static --disable-shared --enable-small
-  --enable-ffmpeg --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale
-  --disable-network --enable-protocol=pipe
-  --enable-demuxer=mpegts,h264,hevc
-  --enable-decoder=h264,hevc
-  --enable-parser=h264,hevc
-  --enable-filter=scale,pad,format,null,showinfo
-  --enable-encoder=rawvideo --enable-muxer=rawvideo
+  --enable-ffmpeg --enable-avcodec --enable-avformat --enable-avfilter
+  --enable-swscale --enable-swresample
+  --disable-network --enable-protocol=pipe,file
+  --enable-demuxer=mpegts,h264,hevc,pcm_s16le
+  --enable-decoder=h264,hevc,aac,pcm_s16le
+  --enable-parser=h264,hevc,aac
+  --enable-bsf=aac_adtstoasc
+  --enable-filter=scale,pad,format,null,showinfo,aresample,aformat,anull
+  --enable-encoder=rawvideo,aac
+  --enable-muxer=rawvideo,mp4
 )
 if [ "$TARGET" = windows ]; then
   flags+=(
