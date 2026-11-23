@@ -62,13 +62,21 @@ export struct DownloadRow { label: string, status: string, path: string, done: b
 
 // Everything the Rust side reads, writes or handles.
 export global Bridge {
-    // navigation
+    // navigation & window chrome
     in-out property <Page> page: Page.home;
     in-out property <bool> fullscreen;
+    in-out property <bool> custom-chrome: false;
+    in-out property <bool> window-maximized: false;
+    in-out property <bool> window-active: true;
+    in-out property <bool> max-btn-hovered: false;
+    in-out property <bool> max-btn-pressed: false;
     in property <string> status-text;
     callback navigate(Page);
     callback toggle-fullscreen();
     callback escape();
+    callback window-minimize();
+    callback window-toggle-maximize();
+    callback window-close();
 
     // home
     in property <[HomeCard]> home-cameras;
@@ -804,7 +812,7 @@ component Sidebar inherits Rectangle {
     background: Palette.alternate-background;
     VerticalLayout {
         padding: 14px;
-        padding-top: 20px;
+        padding-top: Bridge.custom-chrome ? 28px : 20px;
         spacing: 6px;
         HorizontalLayout {
             padding-left: 8px;
@@ -853,10 +861,10 @@ component Sidebar inherits Rectangle {
 component PageHeader inherits HorizontalLayout {
     in property <string> title;
     in property <string> subtitle;
-    height: 76px;
+    height: Bridge.custom-chrome ? 90px : 76px;
     padding-left: 28px;
     padding-right: 24px;
-    padding-top: 12px;
+    padding-top: Bridge.custom-chrome ? 32px : 12px;
     spacing: 10px;
     VerticalLayout {
         alignment: center;
@@ -1843,6 +1851,7 @@ component SinglePage inherits Rectangle {
             ScrollView {
                 VerticalLayout {
                     padding: 16px;
+                    padding-top: Bridge.custom-chrome ? 40px : 16px;
                     spacing: 12px;
                     alignment: start;
                     GridLayout {
@@ -3094,6 +3103,109 @@ component SettingsPage inherits Rectangle {
     }
 }
 
+component WindowControls inherits Rectangle {
+    width: 138px;
+    height: 32px;
+    background: transparent;
+
+    property <brush> glyph: Bridge.window-active
+        ? Palette.foreground.transparentize(0.08)
+        : Palette.foreground.transparentize(0.55);
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        // Minimize
+        Rectangle {
+            width: 46px;
+            height: 32px;
+            background: min-ta.pressed ? Palette.foreground.transparentize(0.84)
+                : min-ta.has-hover ? Palette.foreground.transparentize(0.91) : transparent;
+            animate background { duration: 90ms; }
+            accessible-role: button;
+            accessible-label: "Minimize";
+            accessible-action-default => { Bridge.window-minimize(); }
+
+            Path {
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                stroke: root.glyph;
+                stroke-width: 1px;
+                fill: transparent;
+                commands: "M 0.5 5 H 9.5";
+            }
+            min-ta := TouchArea {
+                clicked => { Bridge.window-minimize(); }
+            }
+        }
+
+        // Maximize / Restore (WM_NCHITTEST returns HTMAXBUTTON here so Windows 11 Snap Layouts work)
+        Rectangle {
+            width: 46px;
+            height: 32px;
+            property <bool> hot: Bridge.max-btn-hovered || max-ta.has-hover;
+            property <bool> down: Bridge.max-btn-pressed || max-ta.pressed;
+            background: self.down ? Palette.foreground.transparentize(0.84)
+                : self.hot ? Palette.foreground.transparentize(0.91) : transparent;
+            animate background { duration: 90ms; }
+            accessible-role: button;
+            accessible-label: Bridge.window-maximized ? "Restore" : "Maximize";
+            accessible-action-default => { Bridge.window-toggle-maximize(); }
+
+            Path {
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                stroke: root.glyph;
+                stroke-width: 1px;
+                fill: transparent;
+                commands: Bridge.window-maximized
+                    ? "M 0.5 3.5 A 1 1 0 0 1 1.5 2.5 H 6.5 A 1 1 0 0 1 7.5 3.5 V 8.5 A 1 1 0 0 1 6.5 9.5 H 1.5 A 1 1 0 0 1 0.5 8.5 Z M 2.5 2.5 V 1.5 A 1 1 0 0 1 3.5 0.5 H 8.5 A 1 1 0 0 1 9.5 1.5 V 6.5 A 1 1 0 0 1 8.5 7.5 H 7.5"
+                    : "M 0.5 1.5 A 1 1 0 0 1 1.5 0.5 H 8.5 A 1 1 0 0 1 9.5 1.5 V 8.5 A 1 1 0 0 1 8.5 9.5 H 1.5 A 1 1 0 0 1 0.5 8.5 Z";
+            }
+            max-ta := TouchArea {
+                clicked => { Bridge.window-toggle-maximize(); }
+            }
+        }
+
+        // Close
+        Rectangle {
+            width: 46px;
+            height: 32px;
+            background: close-ta.pressed ? #b3261a
+                : close-ta.has-hover ? #c42b1c : transparent;
+            animate background { duration: 90ms; }
+            accessible-role: button;
+            accessible-label: "Close";
+            accessible-action-default => { Bridge.window-close(); }
+
+            Path {
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                stroke: close-ta.has-hover || close-ta.pressed ? white : root.glyph;
+                stroke-width: 1px;
+                stroke-line-cap: round;
+                fill: transparent;
+                commands: "M 0.5 0.5 L 9.5 9.5 M 9.5 0.5 L 0.5 9.5";
+            }
+            close-ta := TouchArea {
+                clicked => { Bridge.window-close(); }
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     title: "Tapas";
     icon: @image-url("../assets/app-icon.png");
@@ -3173,5 +3285,10 @@ export component MainWindow inherits Window {
                 if !Bridge.fullscreen && Bridge.page != Page.single: StatusBar { }
             }
         }
+    }
+
+    if Bridge.custom-chrome && !Bridge.fullscreen: WindowControls {
+        x: parent.width - self.width;
+        y: 0;
     }
 }

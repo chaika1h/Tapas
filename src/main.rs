@@ -3,6 +3,7 @@
 
 mod app;
 mod audio;
+mod chrome;
 mod clip;
 mod cloud;
 mod config;
