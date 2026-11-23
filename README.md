@@ -13,7 +13,6 @@ works from anywhere with internet: no VPN, port forwarding or camera passwords.
 - **Light or dark**, an **installer** and **automatic updates**.
 
 Tapas is written in Rust with [Slint](https://slint.dev). It isn't made or supported by TP-Link.
-It was called Tapo Viewer before version 0.3.
 
 ## Installing
 
@@ -24,9 +23,6 @@ optional desktop shortcut and an uninstaller under *Settings › Apps*.
 The installer isn't code-signed, so Windows may say *Windows protected your PC*; choose
 *More info › Run anyway*. The portable zip has the same `Tapas.exe`, to run without installing.
 
-Coming from **Tapo Viewer**: the installer removes it, and Tapas picks up its settings and
-sign-in. Recordings and snapshots it saved stay in `Videos\TapoViewer` and
-`Pictures\TapoViewer`.
 
 Windows 10 or 11, 64-bit.
 
@@ -110,9 +106,6 @@ At start-up, and with *Check for updates*, Tapas looks for a newer release on Gi
 is one, Home shows **Update now**: Tapas downloads the new installer, checks it against the
 checksum GitHub publishes, closes, installs it and starts again. Settings and the sign-in stay.
 
-Updates come from [github.com/chaika1h/tapas/releases](https://github.com/chaika1h/tapas/releases),
-which must be public, as Tapas has no GitHub sign-in. `update_repo` in the settings file points it
-at another repository.
 
 ## Where things are
 
@@ -161,8 +154,7 @@ TP-Link can change it.
 - Each frame's recorded time comes from ffmpeg, so playback runs at the chosen speed, and the hub
   stamps every piece of video with its time, which lines up the timeline.
 
-**Limitations**: no sound yet; cameras that send encrypted video through the cloud can't be shown;
-the Tapo app's cloud recordings (Tapo Care) aren't supported.
+**Limitations**: no sound yet; cameras that send encrypted video through the cloud can't be shown.
 
 **Privacy**: Tapas talks to TP-Link's cloud (sign-in, devices, video) and to GitHub (the update
 check, which sends only the app's version). The password, when remembered, and the cloud session
