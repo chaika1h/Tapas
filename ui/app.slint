@@ -191,6 +191,20 @@ export global Bridge {
     callback tl-zoom(float, float);
     callback tl-whole-day();
     callback open-file(string);
+    // updates
+    in property <string> app-version;
+    in property <string> update-status;
+    in property <bool> update-available;
+    in property <string> update-version;
+    in property <bool> update-busy;
+    // The last update attempt failed; `update-status` says why.
+    in property <bool> update-failed;
+    in property <string> update-source;
+    in-out property <bool> check-updates: true;
+    in-out property <bool> update-dismissed;
+    callback check-update();
+    callback install-update();
+    callback check-updates-changed();
     callback show-in-folder(string);
 }
 
@@ -1075,6 +1089,47 @@ component HomePage inherits Rectangle {
                 padding-bottom: 28px;
                 spacing: 14px;
                 alignment: start;
+                if Bridge.update-available && !Bridge.update-dismissed: Rectangle {
+                    border-radius: 12px;
+                    background: Palette.accent-background.transparentize(0.85);
+                    border-width: 1px;
+                    border-color: Palette.accent-background.transparentize(0.5);
+                    HorizontalLayout {
+                        padding: 10px;
+                        padding-left: 16px;
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: Bridge.update-busy || Bridge.update-failed ? Bridge.update-status : "Tapo Viewer " + Bridge.update-version + " is available.";
+                                font-weight: 600;
+                                overflow: elide;
+                            }
+                        }
+                        if Bridge.update-busy: VerticalLayout {
+                            alignment: center;
+                            Spinner { width: 20px; height: 20px; indeterminate: true; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Update now";
+                                primary: true;
+                                enabled: !Bridge.update-busy;
+                                clicked => { Bridge.install-update(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Later";
+                                enabled: !Bridge.update-busy;
+                                clicked => { Bridge.update-dismissed = true; }
+                            }
+                        }
+                    }
+                }
                 if Bridge.hubs.length > 0: SectionTitle { text: "Hub"; }
                 if Bridge.hubs.length > 0: HorizontalLayout {
                     spacing: root.gap;
@@ -2306,13 +2361,52 @@ component SettingsPage inherits Rectangle {
             }
 
             GroupBox {
-                title: "About";
-                HorizontalLayout {
-                    spacing: 16px;
-                    AboutSlint { max-width: 200px; }
-                    Muted {
-                        horizontal-stretch: 1;
-                        text: "Tapo Viewer: local viewer for TP-Link Tapo cameras and the H500 HomeBase. Device access via the open-source tapo crate by Mihai Dinculescu.";
+                title: "About & updates";
+                VerticalLayout {
+                    spacing: 10px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: "Tapo Viewer " + Bridge.app-version; font-weight: 600; }
+                            Muted { text: Bridge.update-status; wrap: word-wrap; }
+                        }
+                        if Bridge.update-busy: VerticalLayout {
+                            alignment: center;
+                            Spinner { width: 22px; height: 22px; indeterminate: true; }
+                        }
+                        if Bridge.update-available: VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Update to " + Bridge.update-version;
+                                primary: true;
+                                enabled: !Bridge.update-busy;
+                                clicked => { Bridge.install-update(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Check for updates";
+                                enabled: !Bridge.update-busy;
+                                clicked => { Bridge.check-update(); }
+                            }
+                        }
+                    }
+                    CheckBox {
+                        text: "Check for updates when the app starts";
+                        checked <=> Bridge.check-updates;
+                        toggled => { Bridge.check-updates-changed(); }
+                    }
+                    Muted { text: "Updates come from " + Bridge.update-source + ". The new version installs by itself and the app restarts."; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 16px;
+                        AboutSlint { max-width: 200px; }
+                        Muted {
+                            horizontal-stretch: 1;
+                            text: "Tapo Viewer: TP-Link Tapo cameras and the H500 HomeBase through the Tapo cloud. Its cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu.";
+                        }
                     }
                 }
             }

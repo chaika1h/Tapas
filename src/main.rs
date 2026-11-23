@@ -11,6 +11,7 @@ mod ptz;
 mod relay;
 mod secret;
 mod stream;
+mod update;
 
 use std::time::Duration;
 

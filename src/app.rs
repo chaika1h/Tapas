@@ -177,6 +177,8 @@ pub struct App {
     picture_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     /// Recording what's watched: from when (ms), in the day being watched.
     recording_from: Cell<Option<i64>>,
+    /// A newer version, once found.
+    update: RefCell<Option<crate::update::Release>>,
     /// The Tapo app's homes and rooms, from the account.
     homes: RefCell<Homes>,
     /// What each hub (by device id) says about itself.
@@ -252,6 +254,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         event_pictures: RefCell::default(),
         picture_task: RefCell::default(),
         recording_from: Cell::default(),
+        update: RefCell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     if new_terminal {
@@ -310,6 +313,16 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_player_speed(cb!(&app, |a, i| a.player_speed(i)));
     b.on_player_snapshot(cb!(&app, |a| a.player_snapshot()));
     b.on_player_record(cb!(&app, |a| a.player_record()));
+    b.on_check_update(cb!(&app, |a| a.check_update(true)));
+    b.on_install_update(cb!(&app, |a| a.install_update()));
+    b.on_check_updates_changed(cb!(&app, |a| {
+        let on = a.ui().global::<Bridge>().get_check_updates();
+        a.cfg.borrow_mut().skip_update_checks = !on;
+        a.persist();
+    }));
+    b.set_app_version(crate::update::CURRENT.into());
+    b.set_check_updates(!app.cfg.borrow().skip_update_checks);
+    b.set_update_source(format!("github.com/{}/releases", app.update_repo()).into());
     b.set_recordings(app.rec_rows.clone().into());
     b.on_tl_click(cb!(&app, |a, f| a.tl_click(f)));
     b.on_tl_drag(cb!(&app, |a, f| a.tl_drag(f)));
@@ -353,6 +366,9 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     }
 
     app.timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), cb!(&app, |a| a.pump()));
+    if !app.cfg.borrow().skip_update_checks {
+        slint::Timer::single_shot(Duration::from_secs(4), cb!(&app, |a| a.check_update(false)));
+    }
 }
 
 impl App {
@@ -807,6 +823,113 @@ impl App {
             b.set_single_frame(Image::default());
         }
         self.sync_streams();
+    }
+
+    // -------------------------------------------------------------- updates
+
+    fn update_repo(&self) -> String {
+        match self.cfg.borrow().update_repo.trim() {
+            "" => crate::update::DEFAULT_REPO.to_string(),
+            repo => repo.to_string(),
+        }
+    }
+
+    /// Looks for a newer version. `asked`: from the button, so the answer is
+    /// shown however it turns out.
+    fn check_update(&self, asked: bool) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_update_busy() {
+            return;
+        }
+        b.set_update_busy(asked);
+        if asked {
+            b.set_update_status("Checking for updates…".into());
+        }
+        let repo = self.update_repo();
+        self.rt.spawn(async move {
+            let result = crate::update::check(&repo).await;
+            on_ui(move |app| app.update_checked(asked, result));
+        });
+    }
+
+    fn update_checked(&self, asked: bool, result: anyhow::Result<Option<crate::update::Release>>) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_update_busy(false);
+        match result {
+            Ok(Some(release)) => {
+                log::info!("update: version {} is available", release.version);
+                b.set_update_available(true);
+                b.set_update_version(release.version.as_str().into());
+                let notes = release.notes.lines().next().unwrap_or("").to_string();
+                b.set_update_status(
+                    if notes.is_empty() {
+                        format!("Version {} is available.", release.version)
+                    } else {
+                        format!("Version {} is available: {notes}", release.version)
+                    }
+                    .into(),
+                );
+                *self.update.borrow_mut() = Some(release);
+            }
+            Ok(None) => {
+                b.set_update_available(false);
+                b.set_update_status("This is the newest version.".into());
+            }
+            Err(e) => {
+                log::info!("update check: {e:#}");
+                if asked {
+                    b.set_update_status(format!("Couldn't check for updates: {e:#}").into());
+                }
+            }
+        }
+    }
+
+    /// Downloads the new version's installer and runs it; the app closes so
+    /// it can be replaced, and the installer starts the new version.
+    fn install_update(&self) {
+        let Some(release) = self.update.borrow().clone() else { return };
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_update_busy(true);
+        b.set_update_failed(false);
+        b.set_update_status(format!("Downloading version {}…", release.version).into());
+        self.rt.spawn(async move {
+            let mut last = Instant::now();
+            let mut progress = |got: u64, total: u64| {
+                if last.elapsed() >= Duration::from_millis(300) {
+                    last = Instant::now();
+                    let text = match (got * 100).checked_div(total) {
+                        Some(percent) => format!("Downloading the update… {percent}%"),
+                        None => format!("Downloading the update… {:.1} MB", got as f64 / 1_048_576.0),
+                    };
+                    on_ui(move |app| app.ui().global::<Bridge>().set_update_status(text.into()));
+                }
+            };
+            let result = crate::update::download(&release, &mut progress).await;
+            on_ui(move |app| app.update_downloaded(result));
+        });
+    }
+
+    fn update_downloaded(&self, result: anyhow::Result<PathBuf>) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let started = result.and_then(|path| crate::update::install(&path));
+        match started {
+            Ok(()) => {
+                b.set_update_status("Installing the update; the app will start again…".into());
+                // Let the installer start, then make way for it.
+                slint::Timer::single_shot(Duration::from_millis(600), || {
+                    let _ = slint::quit_event_loop();
+                });
+            }
+            Err(e) => {
+                b.set_update_busy(false);
+                b.set_update_failed(true);
+                b.set_update_status(format!("Couldn't update: {e:#}").into());
+            }
+        }
     }
 
     // ------------------------------------------------------------------- PTZ

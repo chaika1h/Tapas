@@ -24,6 +24,26 @@ app login, like the Tapo app.
 - The password (with *Remember me*) and the cloud session are encrypted with Windows DPAPI, so
   they only work for your Windows user.
 
+## Installing and updating
+
+Run **`TapoViewer-Setup-<version>.exe`**. It installs Tapo Viewer for your Windows user (no
+administrator rights) into `%LOCALAPPDATA%\Programs\TapoViewer`, with a Start menu shortcut, an
+optional desktop shortcut and an uninstaller in *Settings › Apps*. The installer isn't code-signed,
+so Windows SmartScreen may say "Windows protected your PC": choose *More info › Run anyway*.
+The portable zip has the same `TapoViewer.exe` to run from anywhere instead.
+
+**Updates**: at start-up (and with *Check for updates* in *Settings › About & updates*) the app
+looks at the newest release on GitHub. When there's a newer version, Home shows **Update now**:
+it downloads the new installer, checks it against the SHA-256 GitHub publishes, closes the app,
+installs the update silently and starts the new version. Settings, the sign-in and saved
+recordings are kept, also when uninstalling. *Check for updates when the app starts* turns the
+automatic check off.
+
+Releases come from `github.com/chaika1h/tapas/releases` (`update_repo` in the settings file
+chooses another repository). The app has no GitHub sign-in, so **the releases must be public**:
+make the repository public, or publish releases to a separate public repository and set
+`update_repo` to it.
+
 ## How it talks to the devices
 
 Everything uses your **Tapo app login** (email and password).
@@ -190,6 +210,14 @@ To rebuild the embedded ffmpeg (on Linux or WSL, with mingw-w64 installed):
 tools/build-ffmpeg.sh windows
 ```
 
+### Installer and releases
+
+`tools/build-installer.sh` builds `target/installer/TapoViewer-Setup-<version>.exe` (NSIS,
+`installer/TapoViewer.nsi`; needs `makensis`), the portable zip and their SHA-256 sums.
+`tools/release.sh [owner/repo] ["notes"]` builds them and publishes release `v<version>` with the
+GitHub CLI; raise `version` in `Cargo.toml` first. The installer takes `/S` (silent) and
+`/RELAUNCH` (start the app when done), which the app's updater uses.
+
 ### Testing without cameras
 
 `tools/fake_cloud.py` is a fake Tapo cloud and video relay for testing cloud live view without
@@ -214,7 +242,8 @@ detected events) and "Garage" (today); the recorded time is written on the pictu
 at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
 open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output. Like an H500
 it sends nothing for the "cover" download; `--clip-path video|playback|none` picks which other way
-works. Like an H500 it serves one download at a time (the relay answers HTTP 500 to a second), and
+works. Debug builds read updates from `TAPO_VIEWER_UPDATE_URL`, and the fake cloud serves a
+release 9.9.9 at `<base>/github/releases/latest`. Like an H500 it serves one download at a time (the relay answers HTTP 500 to a second), and
 the account has a home ("Office") with rooms, and the hub reports its firmware and storage.
 
 ## Troubleshooting
