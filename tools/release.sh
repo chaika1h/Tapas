@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Publishes the version in Cargo.toml as a GitHub release, which is where the
-# app looks for updates: builds the installer and the portable zip
-# (tools/build-installer.sh) and uploads them as release v<version>.
+# app looks for updates: builds the installer (tools/build-installer.sh) and
+# uploads it as release v<version>.
 #
 # Usage: tools/release.sh [owner/repo] ["release notes"]
 #   The repository defaults to the app's (src/update.rs). Its releases must be
@@ -25,6 +25,6 @@ OUT="$ROOT/target/installer"
 # the same installer under that name lets it update to Tapas.
 cp "$OUT/Tapas-Setup-$VERSION.exe" "$OUT/TapoViewer-Setup-$VERSION.exe"
 gh release create "v$VERSION" --repo "$REPO" --title "Tapas $VERSION" --notes "$NOTES" \
-  "$OUT/Tapas-Setup-$VERSION.exe" "$OUT/Tapas-$VERSION-portable.zip" "$OUT/SHA256SUMS.txt" \
+  "$OUT/Tapas-Setup-$VERSION.exe" "$OUT/SHA256SUMS.txt" \
   "$OUT/TapoViewer-Setup-$VERSION.exe"
 echo "Released v$VERSION on $REPO; the app offers it at its next start."

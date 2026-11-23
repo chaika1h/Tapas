@@ -21,7 +21,7 @@ administrator rights, into `%LOCALAPPDATA%\Programs\Tapas`, with a Start menu sh
 optional desktop shortcut and an uninstaller under *Settings › Apps*.
 
 The installer isn't code-signed, so Windows may say *Windows protected your PC*; choose
-*More info › Run anyway*. The portable zip has the same `Tapas.exe`, to run without installing.
+*More info › Run anyway*.
 
 
 Windows 10 or 11, 64-bit.
@@ -233,15 +233,17 @@ icon from the in-app logo.
 tools/build-installer.sh
 ```
 
-This builds `target/installer/Tapas-Setup-<version>.exe` (needs `makensis`), the portable zip and
-their SHA-256 sums. The installer takes `/S` (silent) and `/RELAUNCH` (start Tapas afterwards),
-which the updater uses.
+This builds `target/installer/Tapas-Setup-<version>.exe` (needs `makensis`) and its SHA-256 sum.
+The installer takes `/S` (silent) and `/RELAUNCH` (start Tapas afterwards), which the updater uses.
 
 To publish a release that installed copies update to, raise `version` in `Cargo.toml`, then:
 
 ```bash
 tools/release.sh chaika1h/tapas "What's new"
 ```
+
+To publish one by hand on GitHub instead, tag it `v<version>` and attach `Tapas-Setup-<version>.exe`
+itself, not zipped: installed copies look for that file.
 
 ### Testing without devices
 
