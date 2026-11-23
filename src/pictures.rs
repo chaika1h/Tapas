@@ -78,6 +78,19 @@ pub fn prune_events() {
     }
 }
 
+/// An event picture the hub sent as an image (an H500 sends JPEGs), at most
+/// `width` wide.
+pub fn decode_still(data: &[u8], width: u32) -> Result<Frame> {
+    let image = image::load_from_memory(data).context("Could not read the picture")?.to_rgb8();
+    let image = if image.width() > width {
+        let height = (image.height() as u64 * width as u64 / image.width() as u64).max(1) as u32;
+        image::imageops::resize(&image, width, height, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+    Ok(SharedPixelBuffer::clone_from_slice(image.as_raw(), image.width(), image.height()))
+}
+
 fn load(path: &std::path::Path) -> Option<Frame> {
     let bytes = std::fs::read(path).ok()?;
     let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg).ok()?.to_rgb8();
