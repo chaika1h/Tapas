@@ -196,6 +196,11 @@ impl std::fmt::Display for RelayBusy {
 
 impl std::error::Error for RelayBusy {}
 
+/// Optional live MPEG-TS recorder shared with [`copy_video_with_audio_and_recorder`].
+/// When `Some(writer)`, exact MPEG-TS bytes from the relay are teed to disk with
+/// zero re-encoding overhead.
+pub type LiveRecorder = Arc<std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>>>;
+
 /// Copies the MPEG-TS carried in the multipart body to `out` until the relay
 /// stops, which is always an error for a live stream.
 #[cfg(test)]
@@ -204,16 +209,24 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    copy_video_with_audio(reader, out, 0).await
+    copy_video_with_audio_and_recorder(reader, out, 0, None).await
 }
 
 /// Like [`copy_video`], also demuxing and playing embedded MPEG-TS audio when
-/// `audio_id` is currently the active audio source (zero overhead while muted).
-pub async fn copy_video_with_audio<R, W>(reader: &mut R, out: &mut W, audio_id: u64) -> Result<()>
+/// `audio_id` is currently the active audio source, and optionally teeing the
+/// raw MPEG-TS stream into `recorder` for live MP4 recording (zero overhead
+/// while muted and not recording).
+pub async fn copy_video_with_audio_and_recorder<R, W>(
+    reader: &mut R,
+    out: &mut W,
+    audio_id: u64,
+    recorder: Option<&LiveRecorder>,
+) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    use std::io::Write;
     let mut demux = crate::audio::TsAudioDemuxer::new();
     let mut pcm_chunks = Vec::new();
     let mut was_audible = false;
@@ -244,13 +257,14 @@ where
             continue;
         }
         let audible = crate::audio::is_active(audio_id);
+        let recording = recorder.is_some_and(|r| r.lock().unwrap().is_some());
         if audible && !was_audible {
             demux.reset();
         }
         was_audible = audible;
 
         let mut part = (&mut *reader).take(length);
-        if !audible {
+        if !audible && !recording {
             let copied = timeout(DATA_TIMEOUT, tokio::io::copy_buf(&mut part, out))
                 .await
                 .map_err(|_| anyhow!("The camera stopped sending video"))?
@@ -273,6 +287,15 @@ where
                     .await
                     .map_err(|_| anyhow!("The camera stopped sending video"))?
                     .context("Video decoder stopped")?;
+                if let Some(rec) = recorder {
+                    let mut guard = rec.lock().unwrap();
+                    if let Some(writer) = guard.as_mut()
+                        && let Err(e) = writer.write_all(&buf[..n])
+                    {
+                        log::warn!("live recording write failed: {e}");
+                        *guard = None;
+                    }
+                }
                 if crate::audio::is_active(audio_id) {
                     pcm_chunks.clear();
                     demux.feed(&buf[..n], &mut pcm_chunks);
@@ -441,5 +464,28 @@ mod tests {
         }
         assert!(head.contains(&format!("Content-Length: {}\r\n", i64::MAX)));
         assert!(head.ends_with("\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn live_recorder_tees_mpegts_bytes() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("tapas-live-rec-{}.ts", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let recorder: LiveRecorder = Arc::new(std::sync::Mutex::new(Some(std::io::BufWriter::new(file))));
+
+        let mut input = OK_HEAD.to_vec();
+        input.extend(part(b"\x47chunk1", ""));
+        input.extend(part(b"\x47chunk2", ""));
+        let mut reader = BufReader::new(&input[..]);
+        read_response_head(&mut reader).await.unwrap();
+        let mut out = Vec::new();
+        let _ = copy_video_with_audio_and_recorder(&mut reader, &mut out, 0, Some(&recorder)).await;
+        if let Some(mut w) = recorder.lock().unwrap().take() {
+            w.flush().unwrap();
+        }
+        let recorded = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(out, b"\x47chunk1\x47chunk2");
+        assert_eq!(recorded, out);
     }
 }

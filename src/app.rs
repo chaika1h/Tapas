@@ -48,6 +48,8 @@ pub fn shutdown() {
     if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
         app.timer.stop();
         app.batch_cancel();
+        app.stop_live_recording(true);
+        app.stop_face_photos();
         app.stop_event_pictures();
         app.watching.borrow_mut().take();
         app.streams.borrow_mut().clear();
@@ -57,6 +59,15 @@ pub fn shutdown() {
 }
 
 type StreamKey = (u32, Quality);
+
+struct LiveRecording {
+    key: StreamKey,
+    camera_name: String,
+    partial: PathBuf,
+    target: PathBuf,
+    started: Instant,
+    shown_secs: u64,
+}
 
 struct Live {
     handle: StreamHandle,
@@ -265,6 +276,12 @@ pub struct App {
     face_track_date: Cell<NaiveDate>,
     face_track_request: Cell<u64>,
     face_tracks: RefCell<Vec<FaceTrackingEntry>>,
+    /// Decoded H500 face avatars in memory, keyed by (hub_id, face_id).
+    face_photos: RefCell<HashMap<(String, i64), Frame>>,
+    /// Background task fetching missing H500 face photos.
+    face_photo_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Active live MP4 recording on the Single camera view.
+    live_recording: RefCell<Option<LiveRecording>>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -340,6 +357,9 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         face_track_date: Cell::new(today),
         face_track_request: Cell::new(0),
         face_tracks: RefCell::default(),
+        face_photos: RefCell::default(),
+        face_photo_task: RefCell::default(),
+        live_recording: RefCell::default(),
         homes: RefCell::default(),
         hub_info: RefCell::default(),
         hub_info_tried: Cell::default(),
@@ -379,12 +399,17 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_window_toggle_maximize(|| crate::chrome::toggle_maximize());
     b.on_window_close(|| crate::chrome::close());
     b.on_open_camera(cb!(&app, |a, id| a.open_camera(id as u32)));
+    b.on_open_camera_slot(cb!(&app, |a, slot| a.open_camera_slot(slot as usize)));
     b.on_toggle_tile_audio(cb!(&app, |a, id| a.toggle_tile_audio(id as u32)));
     b.on_open_hub(cb!(&app, |a, i| a.open_hub(i)));
     b.on_hub_toggle_loop(cb!(&app, |a, i| a.hub_toggle_loop(i as usize)));
     b.on_hub_toggle_alarm(cb!(&app, |a, i| a.hub_toggle_alarm(i as usize)));
     b.on_single_back(cb!(&app, |a| a.single_back()));
+    b.on_single_record(cb!(&app, |a| a.single_record()));
     b.on_single_toggle_audio(cb!(&app, |a| a.single_toggle_audio()));
+    b.on_reset_zoom(cb!(&app, |a| a.reset_zoom()));
+    b.on_player_skip(cb!(&app, |a, secs| a.player_skip(secs)));
+    b.on_player_step_speed(cb!(&app, |a, delta| a.player_step_speed(delta)));
     b.on_privacy_toggle(cb!(&app, |a| a.privacy_toggle()));
     b.on_spotlight_toggle(cb!(&app, |a| a.spotlight_toggle()));
     b.on_night_vision_changed(cb!(&app, |a, i| a.night_vision_changed(i)));
@@ -682,6 +707,16 @@ impl App {
             b.set_single_status(status.as_str().into());
             shown.1 = status;
         }
+        drop(slot);
+        drop(shown);
+        drop(streams);
+        if let Some(rec) = self.live_recording.borrow_mut().as_mut() {
+            let secs = rec.started.elapsed().as_secs();
+            if secs != rec.shown_secs {
+                rec.shown_secs = secs;
+                b.set_single_rec_time(format!("{}:{:02}", secs / 60, secs % 60).into());
+            }
+        }
     }
 
     /// Picks the column count that gives the biggest 16:9 tiles.
@@ -883,6 +918,15 @@ impl App {
         if from == Page::Live && page != Page::Live {
             self.clear_tile_frames();
         }
+        if from == Page::Single && page != Page::Single {
+            self.stop_live_recording(false);
+        }
+        if from == Page::People && page != Page::People {
+            self.stop_face_photos();
+        }
+        if page != from {
+            self.reset_zoom();
+        }
         // Leaving Playback pauses the recording and starts the linger timer
         // so its cache and thumbnails are freed once idle elsewhere.
         if from == Page::Recordings && page != Page::Recordings {
@@ -929,10 +973,28 @@ impl App {
                 self.update_face_track_date_label();
                 self.refresh_faces_ui();
                 self.refresh_face_tracks_ui();
+                self.fetch_face_photos();
             }
         }
         self.sync_timer();
         self.sync_audio();
+    }
+
+    fn reset_zoom(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if (b.get_video_zoom() - 1.0).abs() > 0.001 || b.get_video_pan_x() != 0.0 || b.get_video_pan_y() != 0.0 {
+            b.set_video_zoom(1.0);
+            b.set_video_pan_x(0.0);
+            b.set_video_pan_y(0.0);
+        }
+    }
+
+    fn open_camera_slot(&self, slot: usize) {
+        let id = self.cfg.borrow().cameras.get(slot).map(|c| c.id);
+        if let Some(id) = id {
+            self.open_camera(id);
+        }
     }
 
     fn set_fullscreen(&self, on: bool) {
@@ -970,6 +1032,8 @@ impl App {
     }
 
     fn open_camera(&self, id: u32) {
+        self.stop_live_recording(false);
+        self.reset_zoom();
         let Some(cam) = self.cfg.borrow().camera(id).cloned() else { return };
         let quality = Quality::Hd;
         let ui = self.ui();
@@ -1021,6 +1085,8 @@ impl App {
     }
 
     fn quality_changed(&self, index: i32) {
+        self.stop_live_recording(false);
+        self.reset_zoom();
         let Some((id, _)) = *self.single.borrow() else { return };
         let quality = Quality::from_index(index);
         *self.single.borrow_mut() = Some((id, quality));
@@ -1028,6 +1094,132 @@ impl App {
         // The current picture stays, dimmed, until the other stream's comes.
         self.ui().global::<Bridge>().set_single_stale(true);
         self.sync_streams();
+    }
+
+    fn single_record(&self) {
+        if self.live_recording.borrow().is_some() {
+            self.stop_live_recording(false);
+            return;
+        }
+        let Some(key) = *self.single.borrow() else { return };
+        let Some(ffmpeg_exists) = self.ffmpeg.borrow().as_ref().map(|_| ()) else {
+            self.status(i18n::pick(
+                "FFmpeg is missing; cannot record MP4.",
+                "FFmpeg bulunamadı; MP4 kaydedilemiyor.",
+            ));
+            return;
+        };
+        let _ = ffmpeg_exists;
+        let name = self.cfg.borrow().camera(key.0).map(|c| c.name.clone()).unwrap_or_else(|| "camera".into());
+        let when = Local::now();
+        let target = config::recordings_dir().join(format!(
+            "{}_live_{}.mp4",
+            file_safe(&name),
+            when.format("%Y-%m-%d_%H-%M-%S")
+        ));
+        let partial = clip::partial_path(&target);
+        let started = {
+            let streams = self.streams.borrow();
+            let Some(live) = streams.get(&key) else {
+                self.status(i18n::pick("Camera is not streaming yet.", "Kamera henüz yayın yapmıyor."));
+                return;
+            };
+            live.handle.start_recording(&partial)
+        };
+        match started {
+            Ok(()) => {
+                *self.live_recording.borrow_mut() = Some(LiveRecording {
+                    key,
+                    camera_name: name,
+                    partial,
+                    target,
+                    started: Instant::now(),
+                    shown_secs: 0,
+                });
+                let ui = self.ui();
+                let b = ui.global::<Bridge>();
+                b.set_single_recording(true);
+                b.set_single_rec_time("0:00".into());
+                self.status(i18n::pick("Recording live video…", "Canlı video kaydediliyor…"));
+            }
+            Err(e) => {
+                self.status(if i18n::is_tr() {
+                    format!("Canlı kayıt başlatılamadı: {e}")
+                } else {
+                    format!("Could not start live recording: {e}")
+                });
+            }
+        }
+    }
+
+    fn stop_live_recording(&self, shutting_down: bool) {
+        let Some(rec) = self.live_recording.borrow_mut().take() else { return };
+        if let Some(live) = self.streams.borrow().get(&rec.key) {
+            live.handle.stop_recording();
+        }
+        if let Some(ui) = self.ui.upgrade() {
+            let b = ui.global::<Bridge>();
+            b.set_single_recording(false);
+            b.set_single_rec_time(SharedString::new());
+        }
+        let bytes = std::fs::metadata(&rec.partial).map(|m| m.len()).unwrap_or(0);
+        if bytes == 0 {
+            let _ = std::fs::remove_file(&rec.partial);
+            if !shutting_down {
+                self.status(i18n::pick(
+                    "Live recording stopped: no video data received yet.",
+                    "Canlı kayıt durduruldu: henüz video verisi gelmedi.",
+                ));
+            }
+            return;
+        }
+        if shutting_down {
+            // Runtime is exiting; keep the raw MPEG-TS beside the target so nothing is lost.
+            let fallback = rec.target.with_extension("ts");
+            let _ = std::fs::rename(&rec.partial, &fallback);
+            return;
+        }
+        let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
+            let _ = std::fs::remove_file(&rec.partial);
+            return;
+        };
+        let label = format!("{} · {}", rec.camera_name, i18n::pick("Live", "Canlı"));
+        let row = self.push_download(
+            label,
+            i18n::pick("Converting to MP4…", "MP4'e dönüştürülüyor…").into(),
+            &rec.target,
+            false,
+        );
+        self.status(i18n::pick("Finalizing live MP4 recording…", "Canlı MP4 kaydı hazırlanıyor…"));
+        let partial = rec.partial;
+        let target = rec.target;
+        self.rt.spawn(async move {
+            let res = crate::ffmpeg::remux_ts_to_mp4(&ffmpeg, &partial, &target).await;
+            let _ = std::fs::remove_file(&partial);
+            let (row_text, done, toast) = match res {
+                Ok(()) => {
+                    let mb = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+                    let toast = if i18n::is_tr() {
+                        format!("Canlı kayıt kaydedildi · {mb:.1} MB (Videolar\\Tapas)")
+                    } else {
+                        format!("Saved live recording · {mb:.1} MB (Videos\\Tapas)")
+                    };
+                    (format!("{} · {mb:.1} MB", i18n::pick("Saved", "Kaydedildi")), true, toast)
+                }
+                Err(e) => {
+                    let toast = if i18n::is_tr() {
+                        format!("Canlı kayıt kaydedilemedi: {e:#}")
+                    } else {
+                        format!("Could not save live recording: {e:#}")
+                    };
+                    (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false, toast)
+                }
+            };
+            on_ui(move |app| {
+                app.set_download_status(row, row_text, done);
+                app.status(toast);
+            });
+        });
     }
 
     fn snapshot(&self) {
@@ -2231,6 +2423,9 @@ impl App {
         }
         self.persist();
         *self.pending_mfa.borrow_mut() = None;
+        self.stop_live_recording(false);
+        self.stop_face_photos();
+        self.reset_zoom();
         self.streams.borrow_mut().clear();
         self.ptz.borrow_mut().clear();
         self.batch_cancel();
@@ -2238,6 +2433,7 @@ impl App {
         self.faces.borrow_mut().clear();
         *self.faces_loaded_hub.borrow_mut() = None;
         self.face_tracks.borrow_mut().clear();
+        self.face_photos.borrow_mut().clear();
         self.selected_face.set(None);
         let ui = self.ui();
         let b = ui.global::<Bridge>();
@@ -3405,6 +3601,7 @@ impl App {
         };
         let req = self.faces_request.get() + 1;
         self.faces_request.set(req);
+        self.stop_face_photos();
         let hub_id = hub.device_id.clone();
         let need_cameras = {
             let session = self.hub.borrow();
@@ -3420,6 +3617,102 @@ impl App {
             let faces = client.hub_faces(&hub).await;
             on_ui(move |app| app.faces_loaded(req, hub, cams, faces));
         });
+    }
+
+    fn stop_face_photos(&self) {
+        if let Some(task) = self.face_photo_task.borrow_mut().take() {
+            task.abort();
+        }
+    }
+
+    fn fetch_face_photos(&self) {
+        self.stop_face_photos();
+        if self.ui().global::<Bridge>().get_page() != Page::People {
+            return;
+        }
+        let (Some(client), Some(hub)) = (self.cloud_client().filter(|c| c.session().is_some()), self.selected_hub()) else {
+            return;
+        };
+        let hub_id = hub.device_id.clone();
+        let wanted: Vec<i64> = {
+            let photos = self.face_photos.borrow();
+            self.faces
+                .borrow()
+                .iter()
+                .map(|f| f.face_id)
+                .filter(|id| !photos.contains_key(&(hub_id.clone(), *id)))
+                .collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let player_id = self.player_id.clone();
+        let task = self.rt.spawn(async move {
+            // 1. Load any face photos already cached on disk first so avatars pop in immediately.
+            let mut missing = Vec::new();
+            let mut from_disk = Vec::new();
+            for face_id in wanted {
+                let hid = hub_id.clone();
+                let cached = tokio::task::spawn_blocking(move || crate::pictures::load_face(&hid, face_id)).await;
+                if let Ok(Some(frame)) = cached {
+                    from_disk.push((face_id, frame));
+                } else {
+                    missing.push(face_id);
+                }
+            }
+            if !from_disk.is_empty() {
+                let hid = hub_id.clone();
+                on_ui(move |app| {
+                    {
+                        let mut map = app.face_photos.borrow_mut();
+                        for (id, frame) in from_disk {
+                            map.insert((hid.clone(), id), frame);
+                        }
+                    }
+                    app.refresh_faces_ui();
+                    app.refresh_face_tracks_ui();
+                });
+            }
+            if missing.is_empty() {
+                return;
+            }
+            // 2. Fetch remaining face JPEGs from the H500 over STREAM_TYPE_IMAGE in small batches.
+            for chunk in missing.chunks(12) {
+                match clip::face_images(&client, &hub, &player_id, chunk).await {
+                    Ok(images) if !images.is_empty() => {
+                        let mut decoded = Vec::new();
+                        for (face_id, bytes) in images {
+                            let res = tokio::task::spawn_blocking(move || crate::pictures::decode_still(&bytes, 128)).await;
+                            if let Ok(Ok(frame)) = res {
+                                let hid = hub_id.clone();
+                                let keep = frame.clone();
+                                tokio::task::spawn_blocking(move || crate::pictures::save_face(&hid, face_id, &keep));
+                                decoded.push((face_id, frame));
+                            }
+                        }
+                        if !decoded.is_empty() {
+                            let hid = hub_id.clone();
+                            on_ui(move |app| {
+                                {
+                                    let mut map = app.face_photos.borrow_mut();
+                                    for (id, frame) in decoded {
+                                        map.insert((hid.clone(), id), frame);
+                                    }
+                                }
+                                app.refresh_faces_ui();
+                                app.refresh_face_tracks_ui();
+                            });
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::info!("face_images batch failed: {e:#}");
+                        break;
+                    }
+                }
+            }
+        });
+        *self.face_photo_task.borrow_mut() = Some(task);
     }
 
     fn faces_loaded(
@@ -3454,6 +3747,7 @@ impl App {
                 }
                 self.refresh_faces_ui();
                 self.load_face_tracks();
+                self.fetch_face_photos();
             }
             Err(e) => {
                 if e.is_auth() {
@@ -3492,6 +3786,8 @@ impl App {
         let b = ui.global::<Bridge>();
         let filter = FaceFilter::from_index(b.get_face_filter());
         let selected_id = self.selected_face.get();
+        let hub_id = self.faces_loaded_hub.borrow().clone().unwrap_or_default();
+        let photos = self.face_photos.borrow();
         let faces = self.faces.borrow();
         let rows: Vec<FaceRow> = faces
             .iter()
@@ -3510,6 +3806,7 @@ impl App {
                 } else {
                     String::new()
                 };
+                let photo = photos.get(&(hub_id.clone(), f.face_id)).cloned();
                 FaceRow {
                     face_id: f.face_id.to_string().into(),
                     name: name.into(),
@@ -3517,6 +3814,8 @@ impl App {
                     familiar: f.tag.is_familiar(),
                     last_seen: last_seen.into(),
                     selected: selected_id == Some(f.face_id),
+                    has_photo: photo.is_some(),
+                    photo: photo.map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                 }
             })
             .collect();
@@ -3716,6 +4015,8 @@ impl App {
         let b = ui.global::<Bridge>();
         let tracks = self.face_tracks.borrow();
         let faces = self.faces.borrow();
+        let hub_id = self.faces_loaded_hub.borrow().clone().unwrap_or_default();
+        let photos = self.face_photos.borrow();
         let show_face_name = self.selected_face.get().is_none();
         let rows: Vec<FaceTrackRow> = tracks
             .iter()
@@ -3763,6 +4064,7 @@ impl App {
                 } else {
                     String::new()
                 };
+                let photo = photos.get(&(hub_id.clone(), t.face_id)).cloned();
                 FaceTrackRow {
                     time: time.into(),
                     camera: camera.into(),
@@ -3770,6 +4072,8 @@ impl App {
                     face_name: face_name.into(),
                     familiar,
                     playable: resolved.is_some(),
+                    has_photo: photo.is_some(),
+                    photo: photo.map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                 }
             })
             .collect();
@@ -3991,6 +4295,7 @@ impl App {
         if b.get_fullscreen() {
             self.set_fullscreen(false);
         }
+        self.reset_zoom();
         self.refresh_rec_rows();
         if b.get_page() == Page::Recordings {
             self.fetch_event_pictures();
@@ -4026,6 +4331,27 @@ impl App {
         if let Some(w) = self.watching.borrow().as_ref() {
             w.playback.set_speed(speed);
         }
+    }
+
+    /// Steps playback speed down (`-1`) or up (`+1`) through `SPEEDS`.
+    fn player_step_speed(&self, delta: i32) {
+        let current = self.ui().global::<Bridge>().get_player_speed_index();
+        let next = step_speed_index(current, delta, SPEEDS.len());
+        if next != current {
+            self.player_speed(next);
+        }
+    }
+
+    /// Skips playback forward or backward by `delta_secs` within the current day.
+    fn player_skip(&self, delta_secs: i32) {
+        let pos_ms = {
+            let watching = self.watching.borrow();
+            let Some(w) = watching.as_ref() else { return };
+            w.playback.state.lock().unwrap().position_ms
+        };
+        let (day_start, day_end) = local_day(*self.rec_date.borrow());
+        let target = skip_target_ms(pos_ms, delta_secs, day_start * 1000, day_end * 1000);
+        self.watch_from(target);
     }
 
     /// Take Photo in the player: the picture shown, as a PNG.
@@ -4903,4 +5229,26 @@ mod tests {
         let (linked, added) = link_cloud_cameras(&mut cameras, &account);
         assert!(linked.is_empty() && added == 0);
     }
+
+    #[test]
+    fn nvr_shortcut_helpers_clamp_bounds() {
+        assert_eq!(step_speed_index(0, -1, 4), 0);
+        assert_eq!(step_speed_index(0, 1, 4), 1);
+        assert_eq!(step_speed_index(3, 1, 4), 3);
+        assert_eq!(step_speed_index(2, -1, 4), 1);
+        assert_eq!(skip_target_ms(10_000, -30, 5_000, 50_000), 5_000);
+        assert_eq!(skip_target_ms(10_000, 10, 5_000, 50_000), 20_000);
+        assert_eq!(skip_target_ms(45_000, 30, 5_000, 50_000), 50_000);
+    }
+}
+
+fn step_speed_index(current: i32, delta: i32, len: usize) -> i32 {
+    if len == 0 {
+        return 0;
+    }
+    current.saturating_add(delta).clamp(0, len as i32 - 1)
+}
+
+fn skip_target_ms(position_ms: i64, delta_secs: i32, day_start_ms: i64, day_end_ms: i64) -> i64 {
+    position_ms.saturating_add(delta_secs as i64 * 1000).clamp(day_start_ms, day_end_ms)
 }

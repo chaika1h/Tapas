@@ -141,8 +141,9 @@ where
     let mut decoder = Decoder::spawn(ffmpeg, &input, w, h)?;
     let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
     let audio_id = sink.audio_id;
+    let recorder = sink.recorder.clone();
     tokio::select! {
-        result = relay::copy_video_with_audio(relay, &mut stdin, audio_id) => result,
+        result = relay::copy_video_with_audio_and_recorder(relay, &mut stdin, audio_id, Some(&recorder)) => result,
         stopped = decoder.push_frames(sink) => match stopped {
             Stopped::NoVideo => bail!("No video for {}s", FRAME_TIMEOUT.as_secs()),
             Stopped::Exited(line) if line.is_empty() => bail!("ffmpeg stopped"),

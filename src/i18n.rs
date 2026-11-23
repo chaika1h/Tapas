@@ -279,6 +279,9 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
     tr.set_sound_on(t("Sound On", "Ses Açık"));
     tr.set_sound_off(t("Sound Off", "Ses Kapalı"));
     tr.set_take_photo(t("Take Photo", "Fotoğraf Çek"));
+    tr.set_record_live(t("Record Video", "Video Kaydet"));
+    tr.set_stop_recording(t("Stop Rec", "Kaydı Durdur"));
+    tr.set_reset_zoom(t("Reset zoom (0)", "Yakınlaştırmayı sıfırla (0)"));
     tr.set_pan_tilt(t("Pan & Tilt", "Yönlendirme"));
     tr.set_privacy_mode(t("Privacy Mode", "Gizlilik Modu"));
     tr.set_privacy_on_title(t("Privacy mode is on", "Gizlilik modu açık"));
