@@ -162,15 +162,28 @@ pub(crate) enum Stopped {
 pub(crate) struct Decoder {
     child: tokio::process::Child,
     pub stdin: Option<tokio::process::ChildStdin>,
-    stdout: tokio::process::ChildStdout,
-    last_error: Arc<Mutex<String>>,
-    width: usize,
-    height: usize,
+    pub stdout: tokio::process::ChildStdout,
+    pub last_error: Arc<Mutex<String>>,
+    pub width: usize,
+    pub height: usize,
+    /// From [`Decoder::spawn_timed`]: each frame's time in seconds from the
+    /// start of the input, in output order.
+    pub times: Option<tokio::sync::mpsc::UnboundedReceiver<f64>>,
 }
 
 impl Decoder {
     pub fn spawn(ffmpeg: &Path, input: &[&str], width: usize, height: usize) -> Result<Self> {
-        let mut child = command(ffmpeg, input, width, height)
+        Self::start(ffmpeg, input, width, height, false)
+    }
+
+    /// Like [`Decoder::spawn`], also reporting each frame's time (from
+    /// ffmpeg's `showinfo` filter) on [`Decoder::times`].
+    pub fn spawn_timed(ffmpeg: &Path, input: &[&str], width: usize, height: usize) -> Result<Self> {
+        Self::start(ffmpeg, input, width, height, true)
+    }
+
+    fn start(ffmpeg: &Path, input: &[&str], width: usize, height: usize, timed: bool) -> Result<Self> {
+        let mut child = command(ffmpeg, input, width, height, timed)
             .spawn()
             .with_context(|| format!("Could not start {}", ffmpeg.display()))?;
         let stdin = child.stdin.take();
@@ -180,15 +193,24 @@ impl Decoder {
         // Keep ffmpeg's last error line for the status text.
         let last_error = Arc::new(Mutex::new(String::new()));
         let sink_line = last_error.clone();
+        let (times_tx, times) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if !line.trim().is_empty() {
+                if !timed {
+                    if !line.trim().is_empty() {
+                        *sink_line.lock().unwrap() = line;
+                    }
+                } else if let Some(t) = showinfo_time(&line) {
+                    let _ = times_tx.send(t);
+                } else if line.contains("rror") {
+                    // At this log level, only lines that say so are errors.
                     *sink_line.lock().unwrap() = line;
                 }
             }
         });
-        Ok(Self { child, stdin, stdout, last_error, width, height })
+        let times = timed.then_some(times);
+        Ok(Self { child, stdin, stdout, last_error, width, height, times })
     }
 
     /// Pushes frames into `sink` until ffmpeg stops or goes quiet.
@@ -214,13 +236,25 @@ impl Decoder {
     }
 }
 
-fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize) -> tokio::process::Command {
+/// The frame time in a `showinfo` line: `... n:  12 pts: 108000 pts_time:1.2 ...`.
+fn showinfo_time(line: &str) -> Option<f64> {
+    if !line.contains("Parsed_showinfo") {
+        return None;
+    }
+    let rest = line.split(" pts_time:").nth(1)?;
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> tokio::process::Command {
     // Letterbox into a fixed size so every frame has a known byte length.
-    let vf = format!(
+    let mut vf = format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
     );
+    if timed {
+        vf = format!("showinfo=checksum=0,{vf}");
+    }
     let mut cmd = tokio::process::Command::new(ffmpeg);
-    cmd.args(["-hide_banner", "-loglevel", "error"])
+    cmd.args(["-hide_banner", "-nostats", "-loglevel", if timed { "info" } else { "error" }])
         .args(input)
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
@@ -243,6 +277,14 @@ mod tests {
     use super::*;
     use crate::stream::{Slot, Status};
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn reads_frame_times() {
+        let line = "[Parsed_showinfo_0 @ 0x7f] n:   1 pts:   6000 pts_time:0.0666667 duration:   6000 iskey:0 type:P";
+        assert_eq!(showinfo_time(line), Some(0.0666667));
+        assert_eq!(showinfo_time("[Parsed_showinfo_0 @ 0x7f] config in time_base: 1/90000"), None);
+        assert_eq!(showinfo_time("Input #0, mpegts, from 'pipe:0': pts_time:1"), None);
+    }
 
     /// The cloud path end to end from the relay's multipart body: real H.264
     /// MPEG-TS with an audio track the minimal ffmpeg can't decode (as the

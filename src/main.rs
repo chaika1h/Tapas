@@ -6,7 +6,7 @@ mod clip;
 mod cloud;
 mod config;
 mod ffmpeg;
-mod player;
+mod playback;
 mod ptz;
 mod relay;
 mod secret;

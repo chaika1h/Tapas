@@ -52,7 +52,7 @@ flags=(
   --enable-demuxer=mpegts
   --enable-decoder=h264,hevc
   --enable-parser=h264,hevc
-  --enable-filter=scale,pad,format,null
+  --enable-filter=scale,pad,format,null,showinfo
   --enable-encoder=rawvideo --enable-muxer=rawvideo
 )
 if [ "$TARGET" = windows ]; then

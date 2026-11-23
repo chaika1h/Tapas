@@ -44,6 +44,11 @@ strip = true
 [profile.dev.package."*"]
 opt-level = 2
 
+# Frame copies are generic code compiled into this crate; unoptimised they
+# cap video at ~20 fps, which hides how release builds play.
+[profile.dev]
+opt-level = 1
+
 # Only for building and testing on Linux; the Windows build doesn't need it.
 [target.'cfg(target_os = "linux")'.dependencies]
 slint = { version = "1.19.0", default-features = false, features = ["backend-winit-x11"] }

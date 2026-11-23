@@ -16,7 +16,9 @@ export struct CameraRow { id: int, name: string, detail: string }
 export struct HubRow { id: int, name: string, detail: string }
 export struct PresetRow { id: string, name: string }
 export struct RecRow { time: string, kind: string, duration: string, playing: bool, saved: bool }
-export struct DayChip { weekday: string, day: string, has-video: bool, selected: bool, future: bool }
+export struct DayChip { day: string, has-video: bool, selected: bool, future: bool, in-month: bool }
+export struct TlSeg { x: float, w: float, event: bool }
+export struct TlTick { x: float, label: string }
 export struct DownloadRow { label: string, status: string, path: string, done: bool }
 
 // Everything the Rust side reads, writes or handles.
@@ -127,7 +129,10 @@ export global Bridge {
     in property <[string]> paired-names;
     in-out property <int> rec-camera;
     in property <string> rec-date;
+    in property <string> rec-month;
+    in property <bool> rec-month-is-current;
     in property <[DayChip]> rec-days;
+    in property <string> rec-list-title;
     in property <bool> rec-loading;
     in property <string> rec-message;
     in property <[RecRow]> recordings;
@@ -135,7 +140,8 @@ export global Bridge {
     callback connect-hub();
     callback rec-hub-changed();
     callback rec-camera-changed();
-    callback change-day(int);
+    callback change-month(int);
+    callback go-today();
     callback pick-day(int);
     callback play-clip(int);
     callback download(int);
@@ -145,13 +151,26 @@ export global Bridge {
     in property <bool> player-has-frame;
     in property <string> player-title;
     in property <string> player-status;
-    in property <string> player-position;
+    in property <string> player-time;
     in property <bool> player-busy;
+    in property <bool> player-paused;
     in property <bool> player-ended;
-    // The saved recording, once complete.
-    in property <string> player-file;
+    in property <[string]> speed-labels: ["1×"];
+    in-out property <int> player-speed-index;
     callback player-stop();
-    callback player-replay();
+    callback player-toggle-pause();
+    callback player-speed(int);
+    callback player-snapshot();
+    // the timeline: positions are parts of its width
+    in property <[TlSeg]> tl-segments;
+    in property <[TlTick]> tl-ticks;
+    in property <float> tl-playhead: -1;
+    in property <bool> tl-zoomed;
+    callback tl-click(float);
+    callback tl-drag(float);
+    callback tl-drag-end();
+    callback tl-zoom(float, float);
+    callback tl-whole-day();
     callback open-file(string);
     callback show-in-folder(string);
 }
@@ -613,6 +632,10 @@ global Icons {
     out property <string> folder: "M 3.5 6.5 H 9.5 L 11.5 8.5 H 20.5 V 18.5 H 3.5 Z";
     out property <string> stop: "M 6.5 6.5 H 17.5 V 17.5 H 6.5 Z";
     out property <string> check: "M 5 12.5 L 10 17 L 19 7.5";
+    out property <string> pause: "M 8.5 5.5 V 18.5 M 15.5 5.5 V 18.5";
+    out property <string> close: "M 6 6 L 18 18 M 18 6 L 6 18";
+    out property <string> zoom-in: "M 10.5 4 A 6.5 6.5 0 1 0 10.51 4 Z M 15.5 15.5 L 20.5 20.5 M 8 10.5 H 13 M 10.5 8 V 13";
+    out property <string> zoom-out: "M 10.5 4 A 6.5 6.5 0 1 0 10.51 4 Z M 15.5 15.5 L 20.5 20.5 M 8 10.5 H 13";
 }
 
 component Icon inherits Path {
@@ -1480,42 +1503,34 @@ component SinglePage inherits Rectangle {
     }
 }
 
-// One day of the week strip on the Playback page.
+// A day in the Playback page's month calendar.
 component DayButton inherits Rectangle {
     in property <DayChip> chip;
     callback clicked();
-    width: 46px;
-    height: 58px;
-    border-radius: 12px;
+    height: 38px;
+    border-radius: 19px;
     background: root.chip.selected ? Palette.accent-background
         : ta.has-hover && !root.chip.future ? Palette.foreground.transparentize(0.92) : transparent;
-    opacity: root.chip.future ? 0.35 : 1;
+    opacity: root.chip.future ? 0.3 : root.chip.in-month ? 1 : 0.45;
     accessible-role: button;
-    accessible-label: root.chip.weekday + " " + root.chip.day;
+    accessible-label: root.chip.day;
     accessible-action-default => { root.clicked(); }
     VerticalLayout {
-        padding-top: 6px;
-        padding-bottom: 6px;
-        spacing: 2px;
-        Text {
-            text: root.chip.weekday;
-            font-size: 11px;
-            horizontal-alignment: center;
-            color: root.chip.selected ? Palette.accent-foreground : Palette.foreground.transparentize(0.4);
-        }
+        alignment: center;
+        spacing: 1px;
         Text {
             text: root.chip.day;
-            font-size: 16px;
-            font-weight: 600;
+            font-size: 14px;
+            font-weight: root.chip.selected ? 700 : 500;
             horizontal-alignment: center;
             color: root.chip.selected ? Palette.accent-foreground : Palette.foreground;
         }
         HorizontalLayout {
             alignment: center;
             Rectangle {
-                width: 5px;
-                height: 5px;
-                border-radius: 2.5px;
+                width: 4px;
+                height: 4px;
+                border-radius: 2px;
                 background: !root.chip.has-video ? transparent
                     : root.chip.selected ? Palette.accent-foreground : Palette.accent-background;
             }
@@ -1528,12 +1543,13 @@ component DayButton inherits Rectangle {
     }
 }
 
-// A recording in the list: click to play; the arrow saves it.
+// A recording or detected event in the list: click to watch from it; the
+// arrow saves it.
 component ClipRow inherits Rectangle {
     in property <RecRow> rec;
     callback play();
     callback save();
-    height: 58px;
+    height: 54px;
     border-radius: 10px;
     background: root.rec.playing ? Palette.accent-background.transparentize(0.85)
         : ta.has-hover ? Palette.foreground.transparentize(0.94) : transparent;
@@ -1542,19 +1558,19 @@ component ClipRow inherits Rectangle {
         clicked => { root.play(); }
     }
     HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 6px;
-        spacing: 12px;
+        padding-left: 8px;
+        padding-right: 4px;
+        spacing: 10px;
         Rectangle {
-            width: 36px;
-            height: 36px;
+            width: 34px;
+            height: 34px;
             y: (parent.height - self.height) / 2;
-            border-radius: 18px;
+            border-radius: 17px;
             background: root.rec.playing ? Palette.accent-background : Palette.foreground.transparentize(0.92);
             Icon {
                 commands: Icons.play;
-                width: 18px;
-                height: 18px;
+                width: 16px;
+                height: 16px;
                 color: root.rec.playing ? Palette.accent-foreground : Palette.foreground;
             }
         }
@@ -1573,14 +1589,123 @@ component ClipRow inherits Rectangle {
         VerticalLayout {
             alignment: center;
             RoundIconButton {
-                width: 34px;
-                height: 34px;
+                width: 32px;
+                height: 32px;
                 icon: root.rec.saved ? Icons.check : Icons.download;
                 label: root.rec.saved ? "Saved" : "Save to Videos";
                 base: transparent;
                 clicked => { root.save(); }
             }
         }
+    }
+}
+
+// The day under the video: recordings (blue) and events (amber); click to
+// watch from a moment, drag to move along, scroll to zoom.
+component Timeline inherits Rectangle {
+    property <bool> dragging;
+    height: 70px;
+    border-radius: 10px;
+    background: #121418;
+    clip: true;
+    for t in Bridge.tl-ticks: Rectangle {
+        x: t.x * root.width;
+        y: 0;
+        width: 1px;
+        height: 7px;
+        background: #ffffff50;
+    }
+    for t in Bridge.tl-ticks: Text {
+        // Kept inside at the ends.
+        x: max(0px, min(root.width - 48px, t.x * root.width - 24px));
+        y: 8px;
+        width: 48px;
+        text: t.label;
+        color: #ffffffa0;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+    Rectangle {
+        y: 28px;
+        height: root.height - 34px;
+        background: #1c2027;
+        for seg in Bridge.tl-segments: Rectangle {
+            x: seg.x * root.width;
+            width: max(seg.event ? 2px : 1px, seg.w * root.width);
+            y: seg.event ? parent.height * 0.15 : 0;
+            height: seg.event ? parent.height * 0.7 : parent.height;
+            background: seg.event ? #f2b134 : #2d6db4;
+        }
+    }
+    if Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1: Rectangle {
+        x: Bridge.tl-playhead * root.width - 1px;
+        y: 20px;
+        width: 2px;
+        height: root.height - 20px;
+        background: white;
+        Rectangle {
+            x: -3px;
+            y: 0;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: white;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.dragging = false;
+            } else if (e.kind == PointerEventKind.up && root.dragging) {
+                Bridge.tl-drag-end();
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                if (!root.dragging && abs(self.mouse-x - self.pressed-x) > 4px) {
+                    root.dragging = true;
+                }
+                if (root.dragging) {
+                    Bridge.tl-drag((self.mouse-x - self.pressed-x) / root.width);
+                }
+            }
+        }
+        clicked => {
+            if (!root.dragging) {
+                Bridge.tl-click(self.mouse-x / root.width);
+            }
+        }
+        scroll-event(e) => {
+            if (e.delta-y > 0) {
+                Bridge.tl-zoom(0.8, self.mouse-x / root.width);
+            } else if (e.delta-y < 0) {
+                Bridge.tl-zoom(1.25, self.mouse-x / root.width);
+            }
+            accept
+        }
+    }
+}
+
+component SpeedChip inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+    width: label.preferred-width + 16px;
+    height: 26px;
+    border-radius: 13px;
+    background: root.active ? #ffffff : ta.has-hover ? #ffffff30 : transparent;
+    label := Text {
+        text: root.text;
+        color: root.active ? #000000 : #ffffff;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
     }
 }
 
@@ -1618,11 +1743,11 @@ component PlaybackPage inherits Rectangle {
             padding-bottom: 20px;
             spacing: 20px;
 
-            // The player.
+            // The player and the timeline.
             VerticalLayout {
                 horizontal-stretch: 1;
                 spacing: 10px;
-                Rectangle {
+                video := Rectangle {
                     vertical-stretch: 1;
                     min-height: 200px;
                     // 16:9 when there's room.
@@ -1645,76 +1770,134 @@ component PlaybackPage inherits Rectangle {
                             Icon { commands: Icons.playback; width: 48px; height: 48px; color: #ffffff60; }
                         }
                         Text {
-                            text: Bridge.hub-connected ? "Pick a recording to play it." : Bridge.hub-message;
+                            text: !Bridge.hub-connected ? Bridge.hub-message
+                                : Bridge.tl-segments.length == 0 ? "No recordings on this day."
+                                : "Click the timeline, or a recording on the right, to watch from there.";
                             color: #9a9a9a;
                             horizontal-alignment: center;
                             wrap: word-wrap;
                         }
                     }
-                    if Bridge.player-open && !Bridge.player-has-frame: VerticalLayout {
+                    if Bridge.player-open && (!Bridge.player-has-frame || Bridge.player-status != ""): VerticalLayout {
                         alignment: center;
                         spacing: 14px;
-                        if !Bridge.player-ended: HorizontalLayout {
+                        if Bridge.player-busy: HorizontalLayout {
                             alignment: center;
                             Spinner { width: 36px; height: 36px; indeterminate: true; }
                         }
-                        Text {
-                            x: 20px;
-                            width: parent.width - 40px;
-                            text: Bridge.player-status;
-                            color: #b0b0b0;
-                            horizontal-alignment: center;
-                            wrap: word-wrap;
+                        if Bridge.player-status != "": HorizontalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: min(status-text.preferred-width + 28px, video.width - 40px);
+                                height: status-text.preferred-height + 14px;
+                                border-radius: 10px;
+                                background: #000000b0;
+                                status-text := Text {
+                                    width: parent.width - 28px;
+                                    text: Bridge.player-status;
+                                    color: #e0e0e0;
+                                    horizontal-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
                     }
-                    if Bridge.player-open && Bridge.player-position != "": Rectangle {
-                        x: parent.width - self.width - 12px;
-                        y: parent.height - self.height - 12px;
-                        width: pos.preferred-width + 20px;
-                        height: 28px;
-                        border-radius: 14px;
-                        background: #000000a0;
-                        pos := Text {
-                            text: Bridge.player-position;
-                            color: white;
-                            font-size: 13px;
-                            vertical-alignment: center;
+                    TouchArea {
+                        enabled: Bridge.player-open;
+                        clicked => { Bridge.player-toggle-pause(); }
+                    }
+                    if Bridge.player-open: Rectangle {
+                        y: parent.height - self.height;
+                        height: 54px;
+                        background: @linear-gradient(0deg, #000000c0 0%, #00000000 100%);
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                RoundIconButton {
+                                    width: 36px;
+                                    height: 36px;
+                                    icon: Bridge.player-paused || Bridge.player-ended ? Icons.play : Icons.pause;
+                                    label: Bridge.player-paused ? "Play" : "Pause";
+                                    icon-color: white;
+                                    base: #ffffff26;
+                                    clicked => { Bridge.player-toggle-pause(); }
+                                }
+                            }
+                            Text {
+                                text: Bridge.player-time;
+                                color: white;
+                                font-size: 15px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            for label[i] in Bridge.speed-labels: VerticalLayout {
+                                alignment: center;
+                                SpeedChip {
+                                    text: label;
+                                    active: Bridge.player-speed-index == i;
+                                    clicked => { Bridge.player-speed(i); }
+                                }
+                            }
+                            Rectangle { width: 6px; }
+                            VerticalLayout {
+                                alignment: center;
+                                RoundIconButton {
+                                    width: 36px;
+                                    height: 36px;
+                                    icon: Icons.photo;
+                                    label: "Take photo";
+                                    icon-color: white;
+                                    base: #ffffff26;
+                                    clicked => { Bridge.player-snapshot(); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                RoundIconButton {
+                                    width: 36px;
+                                    height: 36px;
+                                    icon: Icons.close;
+                                    label: "Close the player";
+                                    icon-color: white;
+                                    base: #ffffff26;
+                                    clicked => { Bridge.player-stop(); }
+                                }
+                            }
+                        }
+                    }
+                }
+                if Bridge.hub-connected: HorizontalLayout {
+                    spacing: 8px;
+                    Timeline { horizontal-stretch: 1; }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 4px;
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.zoom-in;
+                            label: "Zoom in";
+                            clicked => { Bridge.tl-zoom(0.5, Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1 ? Bridge.tl-playhead : 0.5); }
+                        }
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.zoom-out;
+                            label: "Zoom out";
+                            enabled: Bridge.tl-zoomed;
+                            clicked => { Bridge.tl-zoom(2.0, Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1 ? Bridge.tl-playhead : 0.5); }
                         }
                     }
                 }
                 if Bridge.player-open: HorizontalLayout {
                     spacing: 10px;
-                    VerticalLayout {
-                        alignment: center;
-                        horizontal-stretch: 1;
-                        spacing: 2px;
-                        Text { text: Bridge.player-title; font-size: 16px; font-weight: 600; overflow: elide; }
-                        Muted { text: Bridge.player-status; wrap: no-wrap; overflow: elide; }
-                    }
-                    if Bridge.player-busy: VerticalLayout {
-                        alignment: center;
-                        Spinner { width: 20px; height: 20px; indeterminate: true; }
-                    }
-                    if Bridge.player-ended: VerticalLayout {
-                        alignment: center;
-                        Button { text: "Play again"; clicked => { Bridge.player-replay(); } }
-                    }
-                    if Bridge.player-file != "": VerticalLayout {
-                        alignment: center;
-                        Button { text: "Open file"; clicked => { Bridge.open-file(Bridge.player-file); } }
-                    }
-                    if Bridge.player-file != "": VerticalLayout {
-                        alignment: center;
-                        Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(Bridge.player-file); } }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        RoundIconButton {
-                            icon: Icons.stop;
-                            label: "Close the player";
-                            clicked => { Bridge.player-stop(); }
-                        }
-                    }
+                    Text { text: Bridge.player-title; font-size: 15px; font-weight: 600; overflow: elide; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
                 }
                 if Bridge.downloads.length > 0: VerticalLayout {
                     spacing: 4px;
@@ -1734,16 +1917,16 @@ component PlaybackPage inherits Rectangle {
                 Rectangle { vertical-stretch: 1; }
             }
 
-            // Camera, day and the day's recordings.
+            // Camera, calendar and the day's recordings.
             Rectangle {
-                width: 390px;
+                width: 380px;
                 border-radius: 14px;
                 background: Palette.control-background;
                 border-width: 1px;
                 border-color: Palette.border;
                 VerticalLayout {
                     padding: 14px;
-                    spacing: 12px;
+                    spacing: 8px;
                     if !Bridge.hub-connected: VerticalLayout {
                         vertical-stretch: 1;
                         alignment: center;
@@ -1760,12 +1943,12 @@ component PlaybackPage inherits Rectangle {
                             width: 32px;
                             height: 32px;
                             icon: Icons.chevron-left;
-                            label: "Previous day";
+                            label: "Previous month";
                             base: transparent;
-                            clicked => { Bridge.change-day(-1); }
+                            clicked => { Bridge.change-month(-1); }
                         }
                         Text {
-                            text: Bridge.rec-date;
+                            text: Bridge.rec-month;
                             font-weight: 600;
                             horizontal-stretch: 1;
                             horizontal-alignment: center;
@@ -1775,20 +1958,39 @@ component PlaybackPage inherits Rectangle {
                             width: 32px;
                             height: 32px;
                             icon: Icons.chevron-right;
-                            label: "Next day";
+                            label: "Next month";
                             base: transparent;
-                            clicked => { Bridge.change-day(1); }
+                            enabled: !Bridge.rec-month-is-current;
+                            clicked => { Bridge.change-month(1); }
                         }
-                        Button { text: "Today"; clicked => { Bridge.change-day(0); } }
+                        Button { text: "Today"; clicked => { Bridge.go-today(); } }
                     }
                     if Bridge.hub-connected: HorizontalLayout {
-                        alignment: space-between;
-                        for chip[i] in Bridge.rec-days: DayButton {
-                            chip: chip;
-                            clicked => { Bridge.pick-day(i); }
+                        for name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]: Text {
+                            horizontal-stretch: 1;
+                            text: name;
+                            font-size: 11px;
+                            color: Palette.foreground.transparentize(0.45);
+                            horizontal-alignment: center;
+                        }
+                    }
+                    if Bridge.hub-connected: VerticalLayout {
+                        spacing: 2px;
+                        for week in 6: HorizontalLayout {
+                            spacing: 2px;
+                            for day in 7: DayButton {
+                                horizontal-stretch: 1;
+                                chip: Bridge.rec-days[week * 7 + day];
+                                clicked => { Bridge.pick-day(week * 7 + day); }
+                            }
                         }
                     }
                     if Bridge.hub-connected: Rectangle { height: 1px; background: Palette.border; }
+                    if Bridge.hub-connected: HorizontalLayout {
+                        Text { text: Bridge.rec-date; font-weight: 600; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Muted { text: Bridge.rec-list-title; vertical-alignment: center; }
+                    }
                     if Bridge.hub-connected: Rectangle {
                         vertical-stretch: 1;
                         ListView {
