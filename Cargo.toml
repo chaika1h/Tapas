@@ -1,8 +1,8 @@
 [package]
-name = "tapo-viewer"
-version = "0.2.0"
+name = "tapas"
+version = "0.3.0"
 edition = "2024"
-description = "Desktop viewer for TP-Link Tapo cameras and the H500 HomeBase"
+description = "Tapas: TP-Link Tapo cameras and the H500 HomeBase on Windows, through the Tapo cloud"
 license = "MIT"
 
 [dependencies]

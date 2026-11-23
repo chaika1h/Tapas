@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draws Tapo Viewer's icon: the logo from the app (AppMark in ui/app.slint)
+"""Draws Tapas's icon: the logo from the app (AppMark in ui/app.slint)
 in its blue, as assets/app-icon.png (the window icon) and assets/app.ico
 (the exe's icon, every size Windows asks for).
 

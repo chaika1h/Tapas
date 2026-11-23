@@ -30,7 +30,7 @@ pub const APP_NAME: &str = "TP-Link_Tapo_Android";
 pub const APP_VERSION: &str = "3.21.114";
 const PLATFORM: &str = "Android 14";
 /// Shown in the Tapo app's list of signed-in devices.
-const TERMINAL_NAME: &str = "Tapo Viewer (Windows)";
+const TERMINAL_NAME: &str = "Tapas (Windows)";
 
 const LOGIN_URL: &str = "https://n-wap-gw.tplinkcloud.com";
 
@@ -323,10 +323,10 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
 }
 
 /// The account API server to sign in at. Debug builds can point it at a local
-/// fake cloud with `TAPO_VIEWER_FAKE_CLOUD` (see `tools/fake_cloud.py`).
+/// fake cloud with `TAPAS_FAKE_CLOUD` (see `tools/fake_cloud.py`).
 fn login_url() -> String {
     #[cfg(debug_assertions)]
-    if let Ok(url) = std::env::var("TAPO_VIEWER_FAKE_CLOUD") {
+    if let Ok(url) = std::env::var("TAPAS_FAKE_CLOUD") {
         return url;
     }
     LOGIN_URL.to_string()
@@ -338,7 +338,7 @@ fn build_tls() -> anyhow::Result<rustls::ClientConfig> {
     let mut roots = CertificateDer::pem_slice_iter(TP_LINK_ROOTS).collect::<std::result::Result<Vec<_>, _>>()?;
     // Debug builds only: trust the fake cloud's test CA.
     #[cfg(debug_assertions)]
-    if let Some(path) = std::env::var_os("TAPO_VIEWER_FAKE_CLOUD_CA") {
+    if let Some(path) = std::env::var_os("TAPAS_FAKE_CLOUD_CA") {
         let pem = std::fs::read(path)?;
         roots.extend(CertificateDer::pem_slice_iter(&pem).collect::<std::result::Result<Vec<_>, _>>()?);
     }

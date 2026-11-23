@@ -694,7 +694,7 @@ impl App {
         self.save_snapshot(frame, &name, Local::now());
     }
 
-    /// Saves a picture to `Pictures\TapoViewer`, named after the camera and
+    /// Saves a picture to `Pictures\Tapas`, named after the camera and
     /// when it was taken.
     fn save_snapshot(&self, frame: Frame, name: &str, when: chrono::DateTime<Local>) {
         let path = config::snapshot_dir().join(format!("{}_{}.png", file_safe(name), when.format("%Y-%m-%d_%H-%M-%S")));
@@ -991,7 +991,7 @@ impl App {
                 Some(p) if crate::ffmpeg::is_bundled(p) => "Using the built-in ffmpeg.".to_string(),
                 Some(p) => format!("Using {}", p.display()),
                 None => "ffmpeg not found: live view needs it. Download ffmpeg (e.g. gyan.dev or BtbN builds) \
-                         and put ffmpeg.exe next to TapoViewer.exe."
+                         and put ffmpeg.exe next to Tapas.exe."
                     .into(),
             }
             .into(),
@@ -2570,7 +2570,7 @@ impl App {
 
     // ---------------------------------------------------------------- saving
 
-    /// Saves a row's recording to `Videos\TapoViewer` without playing it.
+    /// Saves a row's recording to `Videos\Tapas` without playing it.
     fn download(&self, index: usize) {
         let Some((start, end, kind)) = self.hub.borrow().rows.get(index).and_then(ListRow::entry) else { return };
         let (Some(hub), Some(camera)) = (self.hub.borrow().hub.clone(), self.selected_rec_camera()) else { return };
@@ -2845,7 +2845,7 @@ fn local_time(unix: i64) -> chrono::DateTime<Local> {
     Local.timestamp_opt(unix, 0).single().unwrap_or_else(Local::now)
 }
 
-/// Where a recording is saved: `Videos\TapoViewer\<camera>_<start>.ts`.
+/// Where a recording is saved: `Videos\Tapas\<camera>_<start>.ts`.
 fn clip_path(camera: &HubCamera, start: i64) -> PathBuf {
     let start = local_time(start).format("%Y-%m-%d_%H-%M-%S");
     config::recordings_dir().join(format!("{}_{start}.ts", file_safe(&camera.name)))

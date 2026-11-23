@@ -15,17 +15,17 @@ fn main() {
 }
 
 /// Embeds ffmpeg into the executable when `vendor/ffmpeg.exe` (Windows) or
-/// `vendor/ffmpeg` (other targets) exists, or when `TAPO_VIEWER_FFMPEG` points
+/// `vendor/ffmpeg` (other targets) exists, or when `TAPAS_FFMPEG` points
 /// to a binary. Build it with `tools/build-ffmpeg.sh`. Without it, the app
 /// looks for ffmpeg next to the exe and on PATH instead.
 fn bundle_ffmpeg() {
     println!("cargo::rustc-check-cfg=cfg(bundled_ffmpeg)");
-    println!("cargo::rerun-if-env-changed=TAPO_VIEWER_FFMPEG");
+    println!("cargo::rerun-if-env-changed=TAPAS_FFMPEG");
     let windows = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
     let default = if windows { "vendor/ffmpeg.exe" } else { "vendor/ffmpeg" };
     println!("cargo::rerun-if-changed={default}");
 
-    let src = env::var_os("TAPO_VIEWER_FFMPEG").map(PathBuf::from).unwrap_or_else(|| default.into());
+    let src = env::var_os("TAPAS_FFMPEG").map(PathBuf::from).unwrap_or_else(|| default.into());
     let Ok(bytes) = fs::read(&src) else {
         if windows && env::var("PROFILE").as_deref() == Ok("release") {
             println!("cargo::warning=ffmpeg is not bundled; run tools/build-ffmpeg.sh to include it");

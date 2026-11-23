@@ -1,4 +1,4 @@
-//! Settings saved to `%APPDATA%\TapoViewer\config\config.json`.
+//! Settings saved to `%APPDATA%\Tapas\config\config.json`.
 
 use std::path::PathBuf;
 
@@ -165,17 +165,18 @@ fn account_hubs<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CloudCamer
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {
-    directories::ProjectDirs::from("", "", "TapoViewer")
+    directories::ProjectDirs::from("", "", "Tapas")
 }
 
 pub fn config_path() -> PathBuf {
     dirs()
         .map(|d| d.config_dir().join("config.json"))
-        .unwrap_or_else(|| PathBuf::from("tapo-viewer-config.json"))
+        .unwrap_or_else(|| PathBuf::from("tapas-config.json"))
 }
 
 pub fn load() -> AppConfig {
     let path = config_path();
+    move_from_old_name(&path);
     match std::fs::read_to_string(&path) {
         Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
             log::error!("{} is invalid ({e}); starting with empty settings", path.display());
@@ -183,6 +184,27 @@ pub fn load() -> AppConfig {
             AppConfig::default()
         }),
         Err(_) => AppConfig::default(),
+    }
+}
+
+/// The app was called Tapo Viewer, with its settings in
+/// `%APPDATA%\TapoViewer`: they come along on the first start as Tapas (the
+/// sign-in included, as it's encrypted for the Windows user, not the folder).
+fn move_from_old_name(path: &std::path::Path) {
+    if path.exists() {
+        return;
+    }
+    let Some(old) = directories::ProjectDirs::from("", "", "TapoViewer").map(|d| d.config_dir().join("config.json"))
+    else {
+        return;
+    };
+    if !old.exists() {
+        return;
+    }
+    let copied = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::copy(&old, path));
+    match copied {
+        Ok(_) => log::info!("settings moved from {} (Tapo Viewer)", old.display()),
+        Err(e) => log::warn!("could not move the settings from {}: {e}", old.display()),
     }
 }
 
@@ -198,19 +220,19 @@ pub fn save(cfg: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `%LOCALAPPDATA%\TapoViewer\data` (the unpacked built-in ffmpeg).
+/// `%LOCALAPPDATA%\Tapas\data` (the unpacked built-in ffmpeg).
 pub fn data_dir() -> PathBuf {
     dirs()
         .map(|d| d.data_local_dir().to_path_buf())
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// `Pictures\TapoViewer` (snapshots).
+/// `Pictures\Tapas` (snapshots).
 pub fn snapshot_dir() -> PathBuf {
     user_subdir(|u| u.picture_dir().map(Into::into))
 }
 
-/// `Videos\TapoViewer` (downloaded recordings).
+/// `Videos\Tapas` (downloaded recordings).
 pub fn recordings_dir() -> PathBuf {
     user_subdir(|u| u.video_dir().map(Into::into))
 }
@@ -219,7 +241,7 @@ fn user_subdir(pick: impl Fn(&directories::UserDirs) -> Option<PathBuf>) -> Path
     let base = directories::UserDirs::new()
         .and_then(|u| pick(&u).or_else(|| Some(u.home_dir().to_path_buf())))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("TapoViewer")
+    base.join("Tapas")
 }
 
 #[cfg(test)]

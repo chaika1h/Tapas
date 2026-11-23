@@ -1,13 +1,14 @@
-; Tapo Viewer's installer, built with NSIS (tools/build-installer.sh).
+; Tapas's installer, built with NSIS (tools/build-installer.sh).
 ;
 ; Installs for the current user, with no administrator rights, into
-; %LOCALAPPDATA%\Programs\TapoViewer, with a Start menu shortcut, an optional
+; %LOCALAPPDATA%\Programs\Tapas, with a Start menu shortcut, an optional
 ; desktop shortcut and an entry in Settings > Apps for uninstalling.
 ;
-; The app's updater runs it silently: TapoViewer-Setup.exe /S /RELAUNCH
+; The app's updater runs it silently: Tapas-Setup.exe /S /RELAUNCH
 ; installs over the running version once it has closed, then starts the app.
-; Settings and recordings (in %APPDATA%\TapoViewer and Videos) are kept on
-; update and on uninstall.
+; Settings and recordings (in %APPDATA%\Tapas and Videos) are kept on
+; update and on uninstall. It replaces an installed Tapo Viewer, the app's
+; former name.
 
 Unicode true
 ; 64-bit, like the app (Windows 10 and 11 x64).
@@ -18,18 +19,18 @@ SetCompressor /SOLID lzma
   !error "Pass the version: makensis -DVERSION=1.2.3"
 !endif
 !ifndef APP_EXE
-  !define APP_EXE "TapoViewer.exe"
+  !define APP_EXE "Tapas.exe"
 !endif
 !ifndef OUT_DIR
   !define OUT_DIR "."
 !endif
 
-!define APP_NAME "Tapo Viewer"
-!define APP_ID "TapoViewer"
+!define APP_NAME "Tapas"
+!define APP_ID "Tapas"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 
 Name "${APP_NAME}"
-OutFile "${OUT_DIR}\TapoViewer-Setup-${VERSION}.exe"
+OutFile "${OUT_DIR}\Tapas-Setup-${VERSION}.exe"
 InstallDir "$LOCALAPPDATA\Programs\${APP_ID}"
 InstallDirRegKey HKCU "${UNINSTALL_KEY}" "InstallLocation"
 RequestExecutionLevel user
@@ -89,10 +90,44 @@ VIAddVersionKey "LegalCopyright" "MIT licence"
   Delete "$INSTDIR\${APP_EXE}.old"
 !macroend
 
+; The app was called Tapo Viewer: an installed Tapo Viewer is closed (by the
+; updater) and removed, keeping its settings, which Tapas takes over.
+!define OLD_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\TapoViewer"
+Function RemoveTapoViewer
+  ReadRegStr $R0 HKCU "${OLD_KEY}" "InstallLocation"
+  ${If} $R0 == ""
+    Return
+  ${EndIf}
+  StrCpy $R1 0
+  ${Do}
+    ClearErrors
+    Delete "$R0\TapoViewer.exe"
+    ${IfNot} ${FileExists} "$R0\TapoViewer.exe"
+      ${Break}
+    ${EndIf}
+    IntOp $R1 $R1 + 1
+    ${If} $R1 > 40
+      ${Break}
+    ${EndIf}
+    Sleep 250
+  ${Loop}
+  Delete "$R0\README.md"
+  Delete "$R0\Uninstall.exe"
+  RMDir "$R0"
+  Delete "$SMPROGRAMS\Tapo Viewer.lnk"
+  ${If} ${FileExists} "$DESKTOP\Tapo Viewer.lnk"
+    Delete "$DESKTOP\Tapo Viewer.lnk"
+    CreateShortCut "$DESKTOP\${APP_NAME}.lnk" "$INSTDIR\${APP_EXE}"
+  ${EndIf}
+  RMDir /r "$LOCALAPPDATA\TapoViewer\data"
+  DeleteRegKey HKCU "${OLD_KEY}"
+FunctionEnd
+
 Section "${APP_NAME}" SecApp
   SectionIn RO
   SetOutPath "$INSTDIR"
   !insertmacro WaitForApp
+  Call RemoveTapoViewer
   File "/oname=${APP_EXE}" "${OUT_DIR}\${APP_EXE}"
   File "/oname=README.md" "..\README.md"
   WriteUninstaller "$INSTDIR\Uninstall.exe"

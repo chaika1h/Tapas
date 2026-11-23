@@ -21,6 +21,10 @@ fi
 
 tools/build-installer.sh
 OUT="$ROOT/target/installer"
-gh release create "v$VERSION" --repo "$REPO" --title "Tapo Viewer $VERSION" --notes "$NOTES" \
-  "$OUT/TapoViewer-Setup-$VERSION.exe" "$OUT/TapoViewer-$VERSION-portable.zip" "$OUT/SHA256SUMS.txt"
+# Tapo Viewer 0.2.0 (the app's former name) looks for TapoViewer-Setup-*.exe;
+# the same installer under that name lets it update to Tapas.
+cp "$OUT/Tapas-Setup-$VERSION.exe" "$OUT/TapoViewer-Setup-$VERSION.exe"
+gh release create "v$VERSION" --repo "$REPO" --title "Tapas $VERSION" --notes "$NOTES" \
+  "$OUT/Tapas-Setup-$VERSION.exe" "$OUT/Tapas-$VERSION-portable.zip" "$OUT/SHA256SUMS.txt" \
+  "$OUT/TapoViewer-Setup-$VERSION.exe"
 echo "Released v$VERSION on $REPO; the app offers it at its next start."
