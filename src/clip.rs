@@ -25,13 +25,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::cloud::{Clip, ClipStream, CloudCamera, CloudClient, CloudError, HubCamera};
 use crate::relay::{self, IdleTimeout, Part};
@@ -81,6 +81,11 @@ pub struct Progress {
 /// seen to work.
 const METHODS: [ClipStream; 3] = [ClipStream::Download("video"), ClipStream::Playback, ClipStream::Download("cover")];
 
+/// A hub serves one download at a time: one asked for while another is
+/// still closing is refused (the relay answers HTTP 500). Each download
+/// holds this until its connection has closed.
+static HUB_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 /// The index in [`METHODS`] that last brought video, tried first next time.
 static WORKING: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -113,7 +118,19 @@ pub async fn download(
     for i in order {
         let method = METHODS[i];
         log::info!("clip: trying {method:?}");
-        match attempt(client, request, method, media, progress).await {
+        let mut result = attempt(client, request, method, media, progress).await;
+        // The hub lets go of a session a moment after it ends.
+        for _ in 0..4 {
+            match &result {
+                Err(e) if e.is::<relay::RelayBusy>() => {
+                    log::info!("clip: {e:#}; trying again in a second");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    result = attempt(client, request, method, media, progress).await;
+                }
+                _ => break,
+            }
+        }
+        match result {
             Ok(got) => {
                 if WORKING.swap(i, Ordering::Relaxed) != i {
                     log::info!("clip: {method:?} works; using it first from now on");
@@ -151,6 +168,7 @@ async fn attempt(
             (playback_request(1, request, client_id), PLAYBACK_WINDOW_SIZE)
         }
     };
+    let slot = HUB_SLOT.clone().acquire_owned().await.expect("the hub slot is never closed");
     let info = client.request_clip_relay(&request.hub, &request.camera, &request.player_id, method).await?;
     let mut stream = relay::connect(client.tls(), &info).await?;
     let mut first = relay::recording_head(&info).into_bytes();
@@ -165,7 +183,12 @@ async fn attempt(
     let mut reader = BufReader::with_capacity(64 * 1024, read_half);
     let session = Arc::new(Mutex::new(None::<String>));
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let writer = tokio::spawn(write_parts(write_half, rx));
+    let writer = tokio::spawn(async move {
+        write_parts(write_half, rx).await;
+        // Give the hub a moment to let go of the session.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(slot);
+    });
     // From here on the hub has a session for us. The guard ends it however
     // this function ends, including when the download is cancelled (the
     // player stopped, another clip picked): it says stop, stops the

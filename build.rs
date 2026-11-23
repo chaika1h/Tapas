@@ -5,6 +5,13 @@ fn main() {
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
     slint_build::compile_with_config("ui/app.slint", config).expect("Slint UI failed to compile");
     bundle_ffmpeg();
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // The exe's icon (Explorer, the taskbar, shortcuts).
+        println!("cargo::rerun-if-changed=assets/app.ico");
+        embed_resource::compile("assets/app.rc", embed_resource::NONE)
+            .manifest_optional()
+            .expect("could not embed the app icon");
+    }
 }
 
 /// Embeds ffmpeg into the executable when `vendor/ffmpeg.exe` (Windows) or

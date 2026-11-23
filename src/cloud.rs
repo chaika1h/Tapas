@@ -205,6 +205,26 @@ impl Clip {
     }
 }
 
+/// What a hub says about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HubInfo {
+    pub firmware: String,
+    pub ip: String,
+    /// e.g. "1.2TB free of 1.8TB", if it said.
+    pub storage: String,
+    /// The storage's state, e.g. "normal", if it said.
+    pub storage_status: String,
+}
+
+/// The Tapo app's homes ("families") and rooms.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Homes {
+    /// Home names, in the account's order.
+    pub names: Vec<String>,
+    /// Room name by device id, for devices placed in a room.
+    pub rooms: HashMap<String, String>,
+}
+
 /// Something a camera detected, from the hub's event list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Detection {
@@ -912,6 +932,70 @@ impl CloudClient {
         Ok(found)
     }
 
+    /// The hub's firmware, address and storage, asked of the hub itself.
+    pub async fn hub_info(&self, hub: &CloudCamera) -> Result<HubInfo> {
+        let requests = vec![
+            json!({ "method": "getDeviceInfo", "params": { "device_info": { "name": ["basic_info"] } } }),
+            json!({ "method": "getSdCardStatus", "params": { "harddisk_manage": { "table": ["hd_info"] } } }),
+        ];
+        let responses = self.camera_requests(hub, requests).await?;
+        let info = first_result(&responses, "getDeviceInfo").unwrap_or_default();
+        let disks = first_result(responses.get(1..).unwrap_or_default(), "getSdCardStatus").unwrap_or_default();
+        let parsed = parse_hub_info(&info, &disks);
+        log::info!("hub {}: {parsed:?}; its storage said {disks}", hub.name);
+        Ok(parsed)
+    }
+
+    /// The account's homes and rooms (as in the Tapo app), from the IoT
+    /// service: `/v1/families`, then each home's `/rooms`.
+    pub async fn homes(&self) -> Result<Homes> {
+        let families = self.iot_get("/v1/families").await?;
+        log::info!("homes on the account: {families}");
+        let mut homes = Homes::default();
+        let mut ids = Vec::new();
+        for family in objects_with(&families, &["familyId", "id"]) {
+            if let Some(name) = name_of(family, &["familyName", "name"]) {
+                homes.names.push(name);
+            }
+            if let Some(id) = ["familyId", "id"].iter().map(|k| str_field(family, k)).find(|v| !v.is_empty()) {
+                ids.push(id);
+            }
+        }
+        for id in ids {
+            let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
+            match self.iot_get(&format!("/v1/families/{id}/rooms")).await {
+                Ok(rooms) => {
+                    log::info!("rooms: {rooms}");
+                    homes.rooms.extend(parse_rooms(&rooms));
+                }
+                Err(e) => log::info!("no rooms for a home: {e}"),
+            }
+        }
+        Ok(homes)
+    }
+
+    async fn iot_get(&self, path: &str) -> Result<Value> {
+        let session = self.require_session()?;
+        let gateway = self.service_url(&session, IOT_SERVICE).await?;
+        let url = format!("{}{path}", gateway.trim_end_matches('/'));
+        let mut request = self.http.get(&url);
+        for (name, value) in self.iot_headers(&session) {
+            request = request.header(name, value);
+        }
+        let response = request.send().await.map_err(network_error)?;
+        let status = response.status().as_u16();
+        let bytes = response.bytes().await.map_err(network_error)?;
+        if status == 401 {
+            return Err(CloudError::with_code("The Tapo cloud sign-in has expired", AUTH_EXPIRED));
+        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| CloudError::new(format!("Unexpected answer from the Tapo cloud (HTTP {status})")))?;
+        if status >= 400 {
+            return Err(CloudError::new(format!("The Tapo cloud refused {path} (HTTP {status}): {value}")));
+        }
+        Ok(value)
+    }
+
     /// The id the hub knows this account by, which its playback requests
     /// carry as `client_id`.
     pub async fn hub_user_id(&self, hub: &CloudCamera) -> Result<i64> {
@@ -1114,6 +1198,85 @@ fn parse_detections(result: &Value) -> Vec<Detection> {
         .collect()
 }
 
+/// `device_info.basic_info` and `harddisk_manage.hd_info` (a list wrapped
+/// like the other hub lists).
+fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
+    let basic = info.pointer("/device_info/basic_info").unwrap_or(&Value::Null);
+    let first = |keys: &[&str]| keys.iter().map(|k| str_field(basic, k)).find(|v| !v.is_empty()).unwrap_or_default();
+    let mut parsed = HubInfo {
+        firmware: first(&["sw_version", "fw_ver"]),
+        ip: first(&["local_ip", "ip"]),
+        ..Default::default()
+    };
+    let list = disks.pointer("/harddisk_manage/hd_info");
+    let disk = section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()).find(|d| d.get("total_space").is_some());
+    if let Some(disk) = disk {
+        let total = str_field(disk, "total_space");
+        let free = str_field(disk, "free_space");
+        parsed.storage = match (free.is_empty(), total.is_empty()) {
+            (false, false) => format!("{free} free of {total}"),
+            (true, false) => total,
+            _ => String::new(),
+        };
+        parsed.storage_status = str_field(disk, "status");
+    }
+    parsed
+}
+
+/// Objects anywhere in `value` that have one of `id_keys`.
+fn objects_with<'a>(value: &'a Value, id_keys: &[&str]) -> Vec<&'a Value> {
+    let mut found = Vec::new();
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Object(o) => {
+                if id_keys.iter().any(|k| o.contains_key(*k)) {
+                    found.push(v);
+                } else {
+                    stack.extend(o.values());
+                }
+            }
+            Value::Array(a) => stack.extend(a.iter().rev()),
+            _ => {}
+        }
+    }
+    found
+}
+
+fn name_of(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().map(|k| decode_name(str_field(v, k).trim())).find(|n| !n.is_empty())
+}
+
+/// Rooms and the devices in them: each room object with an id and a name,
+/// and any device ids (strings, or objects with a device or thing id) under
+/// it.
+fn parse_rooms(value: &Value) -> HashMap<String, String> {
+    let mut rooms = HashMap::new();
+    for room in objects_with(value, &["roomId"]) {
+        let Some(name) = name_of(room, &["roomName", "name"]) else { continue };
+        let mut stack: Vec<&Value> = room.as_object().into_iter().flat_map(|o| o.values()).collect();
+        while let Some(v) = stack.pop() {
+            match v {
+                Value::Array(a) => stack.extend(a),
+                Value::Object(o) => {
+                    let id = ["deviceId", "thingName", "thingId"].iter().map(|k| str_field(v, k)).find(|x| !x.is_empty());
+                    match id {
+                        Some(id) => {
+                            rooms.insert(id, name.clone());
+                        }
+                        None => stack.extend(o.values()),
+                    }
+                }
+                Value::String(s) if s.len() >= 20 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    rooms.insert(s.clone(), name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    rooms
+}
+
 /// The clip relay request for the log, without the player id.
 fn redact_relay_request(payload: &Value) -> Value {
     let mut copy = payload.clone();
@@ -1170,7 +1333,7 @@ fn camera_from(device: &Value) -> Option<CloudCamera> {
     }
     let name = [str_field(device, "alias"), str_field(device, "deviceName")]
         .into_iter()
-        .map(|n| n.trim().to_string())
+        .map(|n| decode_name(n.trim()))
         .find(|n| !n.is_empty())
         .unwrap_or_else(|| "Camera".into());
     Some(CloudCamera {
@@ -1180,6 +1343,24 @@ fn camera_from(device: &Value) -> Option<CloudCamera> {
         device_type: str_field(device, "deviceType"),
         mac: normalize_mac(&str_field(device, "deviceMac")),
     })
+}
+
+/// Some device names come base64-encoded (an H500 is listed as
+/// "VGFwbyBINTAw", "Tapo H500"). A name is decoded only if it is valid base64
+/// of readable UTF-8 text, so plain names are left alone.
+pub fn decode_name(name: &str) -> String {
+    let looks_encoded = name.len() >= 4
+        && name.len().is_multiple_of(4)
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
+    if looks_encoded
+        && let Ok(bytes) = B64.decode(name)
+        && let Ok(text) = String::from_utf8(bytes)
+        && !text.trim().is_empty()
+        && !text.chars().any(char::is_control)
+    {
+        return text.trim().to_string();
+    }
+    name.to_string()
 }
 
 pub fn normalize_mac(mac: &str) -> String {
@@ -1396,6 +1577,41 @@ mod tests {
             {"search_detection_list_1": {"alarm_type": "2", "start_time": "10", "end_time": "12"}}
         ]}});
         assert_eq!(parse_detections(&wrapped), vec![Detection { start: 10, end: 12, kind: 2, kinds: vec![] }]);
+    }
+
+    #[test]
+    fn base64_names_are_decoded() {
+        assert_eq!(decode_name("VGFwbyBINTAw"), "Tapo H500");
+        assert_eq!(decode_name("Üst Kat"), "Üst Kat");
+        assert_eq!(decode_name("Door"), "Door");
+        assert_eq!(decode_name("Garage"), "Garage");
+        assert_eq!(decode_name("Front door"), "Front door");
+        let hub = camera_from(&json!({"deviceId": "H", "alias": "VGFwbyBINTAw", "deviceType": "SMART.TAPOHUB"}));
+        assert_eq!(hub.unwrap().name, "Tapo H500");
+    }
+
+    #[test]
+    fn hub_info_and_homes() {
+        let info = json!({"device_info": {"basic_info": {"sw_version": "1.2.3 Build 250101", "local_ip": "192.168.1.40"}}});
+        let disks = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"total_space": "1.8TB", "free_space": "1.2TB", "status": "normal"}}]}});
+        assert_eq!(parse_hub_info(&info, &disks), HubInfo {
+            firmware: "1.2.3 Build 250101".into(),
+            ip: "192.168.1.40".into(),
+            storage: "1.2TB free of 1.8TB".into(),
+            storage_status: "normal".into(),
+        });
+        assert_eq!(parse_hub_info(&json!({}), &json!({})), HubInfo::default());
+
+        let rooms = json!({"data": {"rooms": [
+            {"roomId": "r1", "roomName": "Office", "things": [{"thingName": "CAM1"}, {"thingName": "HUB"}]},
+            {"roomId": "r2", "name": "Lobby", "deviceIds": ["802DDDB125A9F2705123B328A3947A4B2526D47C"]}
+        ]}});
+        let rooms = parse_rooms(&rooms);
+        assert_eq!(rooms.get("CAM1").map(String::as_str), Some("Office"));
+        assert_eq!(rooms.get("802DDDB125A9F2705123B328A3947A4B2526D47C").map(String::as_str), Some("Lobby"));
+        let families = json!({"data": [{"familyId": "f1", "familyName": "T2ZmaWNl"}]});
+        let names: Vec<_> = objects_with(&families, &["familyId", "id"]).iter().filter_map(|f| name_of(f, &["familyName", "name"])).collect();
+        assert_eq!(names, vec!["Office"]);
     }
 
     #[test]

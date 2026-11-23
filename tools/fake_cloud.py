@@ -59,14 +59,17 @@ for _camera in CAMERAS:
     _camera["deviceType"] = "SMART.IPCAMERA"
 OFFLINE = {"FAKE0003"}
 PATTERNS = {"FAKE0001": "testsrc2", "FAKE0002": "testsrc"}
-# Download sessions the hub serves at once.
-MAX_CLIP_SESSIONS = 2
+# Download sessions the hub serves at once: an H500 serves one, and the relay
+# answers HTTP 500 to another.
+MAX_CLIP_SESSIONS = 1
 # Cameras with pan/tilt (the C310 has none), and how far they can turn.
 PTZ = {"FAKE0001", "FAKE0003"}
 PAN_RANGE, TILT_RANGE = 170, 35
 
 HUBS = [
-    {"deviceId": "FAKEHUB1", "alias": "HomeBase", "deviceModel": "H500", "deviceMac": "A842A1000100", "status": 1},
+    # Hub names come base64-encoded, like an H500's: "HomeBase".
+    {"deviceId": "FAKEHUB1", "alias": base64.b64encode(b"HomeBase").decode(), "deviceModel": "H500",
+     "deviceMac": "A842A1000100", "status": 1, "fwVer": "1.2.3 Build 250101"},
     # A smart-home hub: same device type, no video. Tapo Viewer leaves it out.
     {"deviceId": "FAKEHUB2", "alias": "Sensor hub", "deviceModel": "H100", "deviceMac": "A842A1000101", "status": 1},
 ]
@@ -79,6 +82,12 @@ HUB_CAMERAS = [
 ]
 # Days ago with recordings, per camera, and the clips of such a day:
 # (hour, minute, seconds long, video_type).
+# The Tapo app's homes ("families") and their rooms.
+FAMILIES = [{"familyId": "fam1", "familyName": "Office", "avatarUrl": ""}]
+ROOMS = {"fam1": [
+    {"roomId": "room1", "roomName": "Entrance", "things": [{"thingName": "FAKE0001"}, {"thingName": "FAKEHUB1"}]},
+    {"roomId": "room2", "roomName": "Warehouse", "things": [{"thingName": "FAKE0002"}]},
+]}
 RECORDED_DAYS = {"FAKE0001": [0, 1, 3], "FAKE0002": [0]}
 DAY_CLIPS = [(0, 5, 12, 2), (8, 2, 25, 6), (9, 41, 18, 2), (10, 0, 360, 1), (12, 15, 40, 8), (15, 33, 20, 6),
              (18, 7, 30, 9), (21, 48, 15, 2)]
@@ -226,6 +235,21 @@ class Handler(BaseHTTPRequestHandler):
             return "bad signature"
         return None
 
+    def do_GET(self):
+        # The IoT service's homes and rooms: /iot/v1/families[/<id>/rooms]
+        url = urlsplit(self.path)
+        auth = self.headers.get("Authorization", "")
+        if not url.path.startswith("/iot/v1/families"):
+            return self.reply({"message": "not found"}, 404)
+        if not auth.startswith("ut|") or not self.state.valid(auth[3:]):
+            return self.reply({"message": "token expired"}, 401)
+        parts = url.path.strip("/").split("/")
+        if len(parts) == 3:
+            return self.reply({"data": FAMILIES})
+        if len(parts) == 5 and parts[4] == "rooms" and parts[3] in ROOMS:
+            return self.reply({"data": ROOMS[parts[3]]})
+        return self.reply({"message": "not found"}, 404)
+
     def do_POST(self):
         url = urlsplit(self.path)
         query = parse_qs(url.query)
@@ -331,7 +355,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def hub_method(self, method, params):
         result, code = {}, 0
-        if method == "searchDetectionList":
+        if method == "getDeviceInfo":
+            result = {"device_info": {"basic_info": {"device_alias": "HomeBase", "device_model": "H500",
+                                                     "sw_version": "1.2.3 Build 250101 Rel.1", "local_ip": "192.168.1.40"}}}
+        elif method == "getSdCardStatus":
+            result = {"harddisk_manage": {"hd_info": [{"hd_info_1": {
+                "disk_name": "1", "total_space": "1.8TB", "free_space": "1.2TB", "status": "normal"}}]}}
+        elif method == "searchDetectionList":
             query = params.get("playback", {}).get("search_detection_list", {})
             camera = query.get("child_device_id")
             if camera not in DETECTIONS:
@@ -451,6 +481,14 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if target[0] == "clip":
+            with self.state.lock:
+                busy = self.state.clip_sessions >= MAX_CLIP_SESSIONS
+            if busy:
+                print("  clip relay REFUSED (HTTP 500): the hub is still serving another download", flush=True)
+                self.send_response(500)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             return self.clip_relay(*target[1:])
         device, resolution = target
         size = "1280x720" if resolution == "HD" else "640x360"
