@@ -20,7 +20,7 @@ export struct CameraRow { id: int, name: string, detail: string }
 // A hub: `detail` is its model and firmware; `disk` names its main disk,
 // `space` how full that is (`used` 0-1, or -1 when unknown) and `note` the
 // other disks or a problem; `loaded` once the hub has answered.
-export struct HubRow { id: int, name: string, detail: string, storage: string, room: string, disk: string, space: string, used: float, note: string, loaded: bool }
+export struct HubRow { id: int, name: string, detail: string, storage: string, room: string, disk: string, space: string, used: float, warn: bool, note: string, loaded: bool }
 export struct PresetRow { id: string, name: string }
 export struct RecRow {
     // A heading for the hour (`time`) rather than a recording or event.
@@ -1148,7 +1148,8 @@ component HubCard inherits Rectangle {
                     x: 0;
                     width: max(8px, parent.width * root.hub.used);
                     border-radius: 4px;
-                    background: root.hub.used > 0.97 ? #e8a317 : Palette.accent-background;
+                    // Amber when it's full and not recording over the oldest.
+                    background: root.hub.warn ? #e8a317 : Palette.accent-background;
                 }
             }
         }

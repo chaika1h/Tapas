@@ -377,10 +377,17 @@ class Handler(BaseHTTPRequestHandler):
             result = {"device_info": {"basic_info": {"device_alias": "HomeBase", "device_model": "H500",
                                                      "sw_version": "1.2.3 Build 250101 Rel.1", "local_ip": "192.168.1.40"}}}
         elif method == "getSdCardStatus":
-            # An H500: its own storage, and the hard disk.
+            # An H500 lists only its own storage here...
             result = {"harddisk_manage": {"hd_info": [
-                {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.44GB", "status": "normal"}},
-                {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931.5GB", "free_space": "812.0GB", "status": "normal"}}]}}
+                {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00 GB", "free_space": "7.44 GB", "status": "normal"}}]}}
+        elif method == "getHardDiskStatus":
+            # ...and the hard disk here, full and recording in a loop.
+            result = {"harddisk_manage": {"hd_info": [
+                {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00 GB", "free_space": "7.44 GB", "status": "normal"}},
+                {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "942.50 GB", "free_space": "0.00 GB",
+                               "status": "normal", "temperature": 38, "power_on_hours": 2210}}]}}
+        elif method == "getCircularRecordingConfig":
+            result = {"harddisk_manage": {"harddisk": {"loop": "on"}}}
         elif method == "searchDetectionList":
             query = params.get("playback", {}).get("search_detection_list", {})
             camera = query.get("child_device_id")
@@ -541,17 +548,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
     def event_picture(self, camera, start, request):
-        """An event's picture, as an H500 sends it: one H.264 keyframe."""
+        """An event's picture, as an H500 sends it: a JPEG."""
         when = datetime.datetime.fromtimestamp(start).strftime("%H\\:%M\\:%S")
         label = f",drawtext=fontfile={FONT}:text='{when}':x=20:y=20:fontsize=64:fontcolor=white:box=1:boxcolor=black@0.6" if FONT else ""
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                "-i", f"{PATTERNS.get(camera, 'testsrc')}=size=640x360:rate=15{label}",
-               "-frames:v", "1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "h264", "pipe:1"]
+               "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "pipe:1"]
         frame = subprocess.run(cmd, capture_output=True, check=True).stdout
         print(f"  picture: {camera} event at {datetime.datetime.fromtimestamp(start)} ({len(frame)} bytes)", flush=True)
         reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": 0, "session_id": "42"}}
         self.send_part("application/json", json.dumps(reply).encode())
-        self.send_part("image/avc", frame, "X-If-Encrypt: 0\r\nX-Data-Sequence: 1\r\n")
+        self.send_part("image/jpeg", frame, f"X-If-Encrypt: 0\r\nsnapshot_ts: {start}\r\n")
         done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
         self.send_part("application/json", json.dumps(done).encode())
         while (part := self.read_client_part()) is not None:

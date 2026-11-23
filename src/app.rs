@@ -1425,7 +1425,11 @@ impl App {
                 // problem, a line under it.
                 let main = info.disks.first();
                 let disk = main.map(|d| disk_name(&d.label)).unwrap_or_default();
+                let looping = info.loop_recording == Some(true);
+                let full = main.and_then(cloud::Disk::used).is_some_and(|u| u > 0.97);
                 let space = match main {
+                    // As the Tapo app: a full disk recording in a loop is fine.
+                    Some(d) if full && looping => format!("{} · full, recording over the oldest", d.total),
                     Some(d) if !d.free.is_empty() => format!("{} free of {}", d.free, d.total),
                     Some(d) => d.total.clone(),
                     None => String::new(),
@@ -1442,6 +1446,9 @@ impl App {
                 if !info.storage_status.is_empty() {
                     note.push(info.storage_status.clone());
                 }
+                if looping && !full {
+                    note.push("Loop recording".into());
+                }
                 if known_none_after_try(loaded, main) {
                     note.push("The hub didn't say how its storage is.".into());
                 }
@@ -1454,6 +1461,7 @@ impl App {
                     disk: disk.into(),
                     space: space.into(),
                     used: main.and_then(cloud::Disk::used).unwrap_or(-1.0),
+                    warn: full && !looping,
                     note: note.join("  ·  ").into(),
                     loaded,
                 }
@@ -2645,6 +2653,12 @@ impl App {
                     player_id: player_id.clone(),
                 };
                 let picture = match clip::event_picture(&client, &request).await {
+                    // An H500 sends JPEGs; video keyframes go through ffmpeg.
+                    Ok((data, kind)) if kind.starts_with("image/") && !kind.contains("avc") && !kind.contains("hevc") => {
+                        tokio::task::spawn_blocking(move || crate::pictures::decode_still(&data, 256))
+                            .await
+                            .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+                    }
                     Ok((data, kind)) => crate::ffmpeg::decode_picture(&ffmpeg, &data, &kind, 256, 144).await,
                     Err(e) => Err(e),
                 };

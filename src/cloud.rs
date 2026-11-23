@@ -216,6 +216,8 @@ pub struct HubInfo {
     pub storage_status: String,
     /// The same disks, largest first, for the storage bar.
     pub disks: Vec<Disk>,
+    /// Whether the newest recordings replace the oldest when it's full.
+    pub loop_recording: Option<bool>,
 }
 
 /// One of a hub's disks.
@@ -971,18 +973,32 @@ impl CloudClient {
         let requests = vec![
             json!({ "method": "getDeviceInfo", "params": { "device_info": { "name": ["basic_info"] } } }),
             json!({ "method": "getSdCardStatus", "params": { "harddisk_manage": { "table": ["hd_info"] } } }),
+            // A hub with a hard disk (an H500) reports it here, as the Tapo
+            // app asks; getSdCardStatus has only its built-in storage.
+            json!({ "method": "getHardDiskStatus", "params": { "harddisk_manage": { "table": ["hd_info"] } } }),
+            json!({ "method": "getCircularRecordingConfig", "params": { "harddisk_manage": { "name": ["harddisk"] } } }),
         ];
         let responses = self.camera_requests(hub, requests).await?;
         // An H500 doesn't answer in the order asked: match by method.
-        let info = result_for(&responses, "getDeviceInfo", 0);
-        let disks = result_for(&responses, "getSdCardStatus", 1);
-        let (info, disks) = (info.clone().unwrap_or_default(), disks.clone().unwrap_or_default());
-        let parsed = parse_hub_info(&info, &disks);
+        let info = result_for(&responses, "getDeviceInfo", 0).unwrap_or_default();
+        let disks: Vec<Value> = [("getHardDiskStatus", 2), ("getSdCardStatus", 1)]
+            .iter()
+            .filter_map(|(method, i)| result_for(&responses, method, *i).ok())
+            .collect();
+        let looping = result_for(&responses, "getCircularRecordingConfig", 3).unwrap_or_default();
+        let mut parsed = parse_hub_info(&info, &disks);
+        parsed.loop_recording = match looping.pointer("/harddisk_manage/harddisk/loop").and_then(Value::as_str) {
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            _ => None,
+        };
         log::info!("hub {}: {parsed:?}", hub.name);
-        if parsed.disks.is_empty() {
-            let answer = Value::Array(responses).to_string();
-            log::info!("hub {}: no disks in its answer: {}", hub.name, answer.chars().take(3000).collect::<String>());
-        }
+        let storage: Vec<&Value> = responses
+            .iter()
+            .filter(|r| r.get("method").and_then(Value::as_str).is_some_and(|m| m != "getDeviceInfo"))
+            .collect();
+        let answer = serde_json::to_string(&storage).unwrap_or_default();
+        log::info!("hub {}: its storage answers: {}", hub.name, answer.chars().take(3000).collect::<String>());
         Ok(parsed)
     }
 
@@ -1268,7 +1284,7 @@ fn parse_detections(result: &Value) -> Vec<Detection> {
 
 /// `device_info.basic_info` and `harddisk_manage.hd_info` (a list wrapped
 /// like the other hub lists).
-fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
+fn parse_hub_info(info: &Value, disk_answers: &[Value]) -> HubInfo {
     let basic = info.pointer("/device_info/basic_info").unwrap_or(&Value::Null);
     let first = |keys: &[&str]| keys.iter().map(|k| str_field(basic, k)).find(|v| !v.is_empty()).unwrap_or_default();
     let mut parsed = HubInfo {
@@ -1276,10 +1292,18 @@ fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
         ip: first(&["local_ip", "ip"]),
         ..Default::default()
     };
-    // A hub lists each disk: its own storage and, in an H500, the hard disk.
-    let list = disks.pointer("/harddisk_manage/hd_info");
+    // The disks: a hub's own storage and, in an H500, the hard disk, from
+    // both answers (a disk in both counts once).
     let mut found: Vec<(f64, String, Disk)> = Vec::new();
-    for disk in section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()) {
+    let entries = disk_answers.iter().flat_map(|answer| {
+        let list = answer.pointer("/harddisk_manage/hd_info");
+        section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()).collect::<Vec<_>>()
+    });
+    let mut seen = std::collections::HashSet::new();
+    for disk in entries {
+        if !seen.insert((str_field(disk, "type"), str_field(disk, "disk_name"), str_field(disk, "total_space"))) {
+            continue;
+        }
         let total = str_field(disk, "total_space");
         if total.is_empty() {
             continue;
@@ -1331,7 +1355,7 @@ fn disk_label(kind: &str, name: &str) -> String {
 /// "931.5GB" → "931.5 GB".
 fn spaced(size: &str) -> String {
     let at = size.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(size.len());
-    format!("{} {}", &size[..at], &size[at..]).trim().to_string()
+    format!("{} {}", size[..at].trim(), size[at..].trim()).trim().to_string()
 }
 
 /// "1.8TB" → bytes, for putting the largest disk first.
@@ -1741,7 +1765,7 @@ mod tests {
             {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.44GB", "status": "normal"}},
             {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931.5GB", "free_space": "812.0GB", "status": "normal"}}
         ]}});
-        assert_eq!(parse_hub_info(&info, &disks), HubInfo {
+        assert_eq!(parse_hub_info(&info, std::slice::from_ref(&disks)), HubInfo {
             firmware: "1.2.3 Build 250101".into(),
             ip: "192.168.1.40".into(),
             storage: vec!["HDD 812.0 GB free of 931.5 GB".into(), "Internal 7.44 GB free of 10.00 GB".into()],
@@ -1764,12 +1788,23 @@ mod tests {
                     status: "normal".into(),
                 },
             ],
+            loop_recording: None,
         });
-        let used = parse_hub_info(&info, &disks).disks[0].used().unwrap();
+        let used = parse_hub_info(&info, std::slice::from_ref(&disks)).disks[0].used().unwrap();
+        // An H500: its built-in storage from getSdCardStatus, the hard disk
+        // (and the built-in storage again) from getHardDiskStatus.
+        let sd = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.45GB", "status": "normal"}}]}});
+        let hdd = json!({"harddisk_manage": {"hd_info": [
+            {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.45GB", "status": "normal"}},
+            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "942.50GB", "free_space": "0.00GB", "status": "normal", "temperature": 38}}
+        ]}});
+        let both = parse_hub_info(&json!({}), &[hdd, sd]);
+        assert_eq!(both.disks.len(), 2);
+        assert_eq!((both.disks[0].label.as_str(), both.disks[0].total.as_str()), ("HDD", "942.50 GB"));
         assert!((used - 0.128).abs() < 0.01, "{used}");
         let broken = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "hdd", "total_space": "1TB", "status": "unformatted"}}]}});
-        assert_eq!(parse_hub_info(&json!({}), &broken).storage_status, "HDD: unformatted");
-        assert_eq!(parse_hub_info(&json!({}), &json!({})), HubInfo::default());
+        assert_eq!(parse_hub_info(&json!({}), &[broken]).storage_status, "HDD: unformatted");
+        assert_eq!(parse_hub_info(&json!({}), &[json!({})]), HubInfo::default());
 
         let rooms = json!({"data": {"rooms": [
             {"roomId": "r1", "roomName": "Office", "things": [{"thingName": "CAM1"}, {"thingName": "HUB"}]},
