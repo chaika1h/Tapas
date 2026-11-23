@@ -66,12 +66,12 @@ fn select_backend(renderer: Renderer) {
     }
 }
 
-/// Logs to stderr and to `tapo-viewer.log` next to the settings file, since
+/// Logs to stderr and to `tapas.log` next to the settings file, since
 /// release builds have no console.
 fn init_logging() {
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu=warn,naga=warn"));
-    let log_path = config::config_path().with_file_name("tapo-viewer.log");
+    let log_path = config::config_path().with_file_name("tapas.log");
     if let Some(dir) = log_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

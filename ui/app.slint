@@ -585,7 +585,7 @@ component SignInScreens inherits Rectangle {
         }
         Rectangle { height: 24px; }
         Text {
-            text: "Tapo Viewer";
+            text: "Tapas";
             font-size: 44px;
             font-weight: 700;
             color: Palette.accent-background;
@@ -740,7 +740,7 @@ component Sidebar inherits Rectangle {
             AppMark { size: 38px; }
             VerticalLayout {
                 alignment: center;
-                Text { text: "Tapo Viewer"; font-size: 17px; font-weight: 700; }
+                Text { text: "Tapas"; font-size: 17px; font-weight: 700; }
                 Text {
                     text: Bridge.account-name;
                     font-size: 12px;
@@ -1102,7 +1102,7 @@ component HomePage inherits Rectangle {
                             alignment: center;
                             horizontal-stretch: 1;
                             Text {
-                                text: Bridge.update-busy || Bridge.update-failed ? Bridge.update-status : "Tapo Viewer " + Bridge.update-version + " is available.";
+                                text: Bridge.update-busy || Bridge.update-failed ? Bridge.update-status : "Tapas " + Bridge.update-version + " is available.";
                                 font-weight: 600;
                                 overflow: elide;
                             }
@@ -2372,7 +2372,7 @@ component SettingsPage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
-                            Text { text: "Tapo Viewer " + Bridge.app-version; font-weight: 600; }
+                            Text { text: "Tapas " + Bridge.app-version; font-weight: 600; }
                             Muted { text: Bridge.update-status; wrap: word-wrap; }
                         }
                         if Bridge.update-busy: VerticalLayout {
@@ -2408,7 +2408,7 @@ component SettingsPage inherits Rectangle {
                         AboutSlint { max-width: 200px; }
                         Muted {
                             horizontal-stretch: 1;
-                            text: "Tapo Viewer: TP-Link Tapo cameras and the H500 HomeBase through the Tapo cloud. Its cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu.";
+                            text: "Tapas: TP-Link Tapo cameras and the H500 HomeBase through the Tapo cloud. Its cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu.";
                         }
                     }
                 }
@@ -2418,7 +2418,7 @@ component SettingsPage inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    title: "Tapo Viewer";
+    title: "Tapas";
     icon: @image-url("../assets/app-icon.png");
 
     // Gives the keyboard back to the shortcuts (F11, Esc, arrow keys): a

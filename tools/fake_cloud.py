@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake Tapo cloud for testing Tapo Viewer's cloud live view without an account.
+"""Fake Tapo cloud for testing Tapas without an account or devices.
 
 Serves over HTTPS on 127.0.0.1:
   * the account API: sign-in (with a regional redirect and, with --mfa, a
@@ -13,11 +13,11 @@ Serves over HTTPS on 127.0.0.1:
 Signed account calls are checked like the real cloud checks them (Content-MD5
 and the HMAC signature), so a client signing wrongly fails here too.
 
-Only debug builds of Tapo Viewer can be pointed at it:
+Only debug builds of Tapas can be pointed at it:
 
   tools/fake_cloud.py --certs target/fake-cloud --mfa
-  TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 \
-  TAPO_VIEWER_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
+  TAPAS_FAKE_CLOUD=https://127.0.0.1:8443 \
+  TAPAS_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
 
 Sign in with any email and the password "secret"; the verification code is
 123456. "Back yard" is reported offline; "Front door" has pan/tilt and
@@ -72,7 +72,7 @@ HUBS = [
     # Hub names come base64-encoded, like an H500's: "HomeBase".
     {"deviceId": "FAKEHUB1", "alias": base64.b64encode(b"HomeBase").decode(), "deviceModel": "H500",
      "deviceMac": "A842A1000100", "status": 1, "fwVer": "1.2.3 Build 250101"},
-    # A smart-home hub: same device type, no video. Tapo Viewer leaves it out.
+    # A smart-home hub: same device type, no video. Tapas leaves it out.
     {"deviceId": "FAKEHUB2", "alias": "Sensor hub", "deviceModel": "H100", "deviceMac": "A842A1000101", "status": 1},
 ]
 for _hub in HUBS:
@@ -239,14 +239,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
-        # A GitHub release for the updater (TAPO_VIEWER_UPDATE_URL=<base>/github/releases/latest).
+        # A GitHub release for the updater (TAPAS_UPDATE_URL=<base>/github/releases/latest).
         if url.path == "/github/releases/latest":
             setup = FAKE_SETUP
             return self.reply({"tag_name": "v9.9.9", "body": "A fake update from fake_cloud.py.", "assets": [
-                {"name": "TapoViewer-Setup-9.9.9.exe", "size": len(setup),
-                 "browser_download_url": self.base + "/github/TapoViewer-Setup-9.9.9.exe",
+                {"name": "Tapas-Setup-9.9.9.exe", "size": len(setup),
+                 "browser_download_url": self.base + "/github/Tapas-Setup-9.9.9.exe",
                  "digest": "sha256:" + hashlib.sha256(setup).hexdigest()}]})
-        if url.path == "/github/TapoViewer-Setup-9.9.9.exe":
+        if url.path == "/github/Tapas-Setup-9.9.9.exe":
             self.send_response(200)
             self.send_header("Content-Length", str(len(FAKE_SETUP)))
             self.end_headers()

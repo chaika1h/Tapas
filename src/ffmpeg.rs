@@ -45,7 +45,7 @@ pub fn is_bundled(path: &Path) -> bool {
 }
 
 /// The minimal ffmpeg embedded at build time (see `build.rs`), unpacked on
-/// first use to `%LOCALAPPDATA%\TapoViewer`.
+/// first use to `%LOCALAPPDATA%\Tapas`.
 #[cfg(bundled_ffmpeg)]
 mod bundled {
     use std::path::PathBuf;
@@ -108,7 +108,7 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     let ffmpeg = spec
         .ffmpeg
         .as_deref()
-        .context("ffmpeg not found: live view needs it. Put ffmpeg.exe next to TapoViewer.exe or set its path in Settings")?;
+        .context("ffmpeg not found: live view needs it. Put ffmpeg.exe next to Tapas.exe or set its path in Settings")?;
     let (mut resolution, w, h) = match spec.quality {
         Quality::Hd => (Resolution::Hd, 1920usize, 1080usize),
         _ => (Resolution::Vga, 640, 360),

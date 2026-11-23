@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a minimal, LGPL-only ffmpeg with just what Tapo Viewer needs:
+# Builds a minimal, LGPL-only ffmpeg with just what Tapas needs:
 # MPEG-TS input from stdin (the Tapo cloud video relay), H.264/H.265
 # decoding, scaling and raw video output. No network or other formats.
 # The result is a few MB instead of ~100 MB for a full build, and LGPL means

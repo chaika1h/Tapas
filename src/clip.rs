@@ -503,7 +503,7 @@ impl Download {
         }
         if part.header("x-if-encrypt") == Some("1") || part.header("x-data-hmac").is_some() {
             log::warn!("clip: encrypted media part, headers {:?}", part.headers);
-            bail!("The hub sent the recording encrypted, which Tapo Viewer can't read through the cloud yet");
+            bail!("The hub sent the recording encrypted, which Tapas can't read through the cloud yet");
         }
         if self.got.bytes == 0 {
             log::info!("clip: first media part, headers {:?}", part.headers);

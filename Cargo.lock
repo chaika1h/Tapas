@@ -5036,8 +5036,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "tapo-viewer"
-version = "0.2.0"
+name = "tapas"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",

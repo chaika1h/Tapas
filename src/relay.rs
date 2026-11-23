@@ -222,7 +222,7 @@ where
             }
         }
         if encrypted {
-            bail!("This camera sends encrypted video through the cloud, which Tapo Viewer can't play yet");
+            bail!("This camera sends encrypted video through the cloud, which Tapas can't play yet");
         }
         if length == 0 {
             continue;

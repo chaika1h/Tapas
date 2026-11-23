@@ -1,5 +1,5 @@
 //! Updates from GitHub releases. The newest release's installer
-//! (`TapoViewer-Setup-<version>.exe`, from `tools/build-installer.sh`) is
+//! (`Tapas-Setup-<version>.exe`, from `tools/build-installer.sh`) is
 //! downloaded, checked against the SHA-256 GitHub publishes for it and run
 //! silently (`/S /RELAUNCH`): it installs over this version once the app has
 //! closed and starts the new one.
@@ -32,7 +32,7 @@ fn client(timeout: Option<Duration>) -> Result<reqwest::Client> {
     let tls = crate::cloud::tls_config().map_err(|e| anyhow!("{e}"))?;
     let mut builder = reqwest::Client::builder()
         .tls_backend_preconfigured((*tls).clone())
-        .user_agent(format!("TapoViewer/{CURRENT}"))
+        .user_agent(format!("Tapas/{CURRENT}"))
         .connect_timeout(Duration::from_secs(15));
     if let Some(t) = timeout {
         builder = builder.timeout(t);
@@ -42,7 +42,7 @@ fn client(timeout: Option<Duration>) -> Result<reqwest::Client> {
 
 fn latest_url(repo: &str) -> String {
     #[cfg(debug_assertions)]
-    if let Ok(url) = std::env::var("TAPO_VIEWER_UPDATE_URL") {
+    if let Ok(url) = std::env::var("TAPAS_UPDATE_URL") {
         return url;
     }
     format!("https://api.github.com/repos/{repo}/releases/latest")
@@ -81,7 +81,7 @@ fn parse_release(release: &Value) -> Result<Option<Release>> {
         .flatten()
         .find(|a| {
             let name = a.get("name").and_then(Value::as_str).unwrap_or("");
-            name.starts_with("TapoViewer-Setup") && name.ends_with(".exe")
+            name.starts_with("Tapas-Setup") && name.ends_with(".exe")
         })
         .ok_or_else(|| anyhow!("Release {tag} has no installer"))?;
     let sha256 = asset
@@ -108,7 +108,7 @@ pub fn is_newer(a: &str, b: &str) -> bool {
 /// Downloads the installer to the temp folder, reporting (bytes, of bytes).
 pub async fn download(release: &Release, progress: &mut (dyn FnMut(u64, u64) + Send)) -> Result<PathBuf> {
     use tokio::io::AsyncWriteExt;
-    let path = std::env::temp_dir().join(format!("TapoViewer-Setup-{}.exe", release.version));
+    let path = std::env::temp_dir().join(format!("Tapas-Setup-{}.exe", release.version));
     let mut response = client(None)?.get(&release.url).send().await.context("Could not download the update")?;
     if !response.status().is_success() {
         bail!("Could not download the update (HTTP {})", response.status().as_u16());
@@ -177,8 +177,8 @@ mod tests {
             "tag_name": "v99.1.0",
             "body": "Faster playback.\n",
             "assets": [
-                {"name": "TapoViewer-99.1.0-portable.zip", "browser_download_url": "https://x/zip", "size": 5},
-                {"name": "TapoViewer-Setup-99.1.0.exe", "browser_download_url": "https://x/setup", "size": 12,
+                {"name": "Tapas-99.1.0-portable.zip", "browser_download_url": "https://x/zip", "size": 5},
+                {"name": "Tapas-Setup-99.1.0.exe", "browser_download_url": "https://x/setup", "size": 12,
                  "digest": "sha256:ABCDEF"}
             ]
         });

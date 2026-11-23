@@ -1,194 +1,204 @@
-# Tapo Viewer
+# Tapas
 
-A Windows desktop app for TP-Link **Tapo** cameras and the **H500 HomeBase**, written in Rust with
-[Slint](https://slint.dev) (Fluent style). Everything goes through the Tapo cloud with your Tapo
-app login, like the Tapo app.
+Tapas is a Windows app for TP-Link **Tapo** cameras and the **H500 HomeBase** hub. It signs in
+with your Tapo account and works through the Tapo cloud, like the Tapo app on your phone, so it
+works from anywhere with internet: no VPN, port forwarding or camera passwords.
 
-- **Live view from anywhere** through the Tapo cloud, like the Tapo app: no VPN, port forwarding
-  or camera accounts.
-- **Home**: a card per camera with a recent picture and its room, and the H500 with its
-  firmware, storage and recordings; the page is titled with your home's name from the Tapo app.
-- **Live view**: all cameras in a grid sized to fit the window, one click from anywhere.
-- **Camera view**: the video with Take Photo, Pan & Tilt (pad and presets; arrow keys work too),
-  Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
-- **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
-- **Playback from anywhere**: the H500's recordings of each camera along a day timeline, like the
-  Tapo app: click or drag to any moment, 1× to 16×, pause, full screen, detected events with
-  their pictures, a month calendar, Record and Take photo. Recordings stream through the cloud;
-  ↓ saves one to `Videos\TapoViewer`.
-- **Snapshots** to `Pictures\TapoViewer`.
-- **Light or dark**, or the same as Windows (*Settings › Video & display*), always in the app's
-  own blue rather than the Windows accent colour.
-- **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
-  sent to your phone.
-- The password (with *Remember me*) and the cloud session are encrypted with Windows DPAPI, so
-  they only work for your Windows user.
+- **Live view** of every camera in a grid, or one camera at a time.
+- **Pan & tilt**, presets, privacy mode, SD/HD, snapshots.
+- **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16×,
+  detected events with their pictures, a calendar, recording clips and saving them.
+- **Full screen** for live view and playback.
+- Your **homes and rooms** from the Tapo app, and the hub's firmware and storage.
+- **Light or dark**, an **installer** and **automatic updates**.
 
-## Installing and updating
+Tapas is written in Rust with [Slint](https://slint.dev). It isn't made or supported by TP-Link.
+It was called Tapo Viewer before version 0.3.
 
-Run **`TapoViewer-Setup-<version>.exe`**. It installs Tapo Viewer for your Windows user (no
-administrator rights) into `%LOCALAPPDATA%\Programs\TapoViewer`, with a Start menu shortcut, an
-optional desktop shortcut and an uninstaller in *Settings › Apps*. The installer isn't code-signed,
-so Windows SmartScreen may say "Windows protected your PC": choose *More info › Run anyway*.
-The portable zip has the same `TapoViewer.exe` to run from anywhere instead.
+## Installing
 
-**Updates**: at start-up (and with *Check for updates* in *Settings › About & updates*) the app
-looks at the newest release on GitHub. When there's a newer version, Home shows **Update now**:
-it downloads the new installer, checks it against the SHA-256 GitHub publishes, closes the app,
-installs the update silently and starts the new version. Settings, the sign-in and saved
-recordings are kept, also when uninstalling. *Check for updates when the app starts* turns the
-automatic check off.
+Run **`Tapas-Setup-<version>.exe`**. It installs Tapas for your Windows user, without
+administrator rights, into `%LOCALAPPDATA%\Programs\Tapas`, with a Start menu shortcut, an
+optional desktop shortcut and an uninstaller under *Settings › Apps*.
 
-Releases come from `github.com/chaika1h/tapas/releases` (`update_repo` in the settings file
-chooses another repository). The app has no GitHub sign-in, so **the releases must be public**:
-make the repository public, or publish releases to a separate public repository and set
-`update_repo` to it.
+The installer isn't code-signed, so Windows may say *Windows protected your PC*; choose
+*More info › Run anyway*. The portable zip has the same `Tapas.exe`, to run without installing.
 
-## How it talks to the devices
+Coming from **Tapo Viewer**: the installer removes it, and Tapas picks up its settings and
+sign-in. Recordings and snapshots it saved stay in `Videos\TapoViewer` and
+`Pictures\TapoViewer`.
 
-Everything uses your **Tapo app login** (email and password).
+Windows 10 or 11, 64-bit.
 
-| Feature | How | Where it works |
-|---|---|---|
-| Live video | Tapo cloud video relay (HTTPS) | Anywhere with internet |
-| Pan/tilt, presets, privacy | Tapo cloud camera control (HTTPS) | Anywhere with internet |
-| H500 recordings: list | Tapo cloud, passed through to the hub (HTTPS) | Anywhere with internet |
-| H500 recordings: play, save | Tapo cloud video relay, from the hub (HTTPS) | Anywhere with internet |
+## Signing in
 
-### Getting started
+When it isn't signed in, Tapas opens on its welcome screen. **Log In** with your TP-Link ID: the
+email and password you use in the Tapo app.
 
-1. When you're not signed in, the app opens on its welcome screen. Press **Log In** and enter your
-   TP-Link ID (the email and password you use in the Tapo app). TP-Link IDs are created in the
-   Tapo app; *Create a TP-Link ID* and *Forgot Password?* explain where.
-2. The first time this PC logs in, Tapo asks for a verification code. Like the Tapo app, Tapo
-   Viewer has it sent straight to the Tapo app on your phone; *Receive Code via Email* sends it by
-   email instead, and *Resend Code* becomes available after a minute. The PC is remembered after
-   that.
-3. The cameras and the H500 on your account are added automatically and **Home** opens. **Update camera
-   list** (⟳ on Home, or *Settings › Tapo account*) picks up cameras added later. To change which account
-   camera an entry shows, edit it and pick its *Tapo camera*.
+The first time this PC signs in, Tapo asks for a **verification code**, which Tapas has sent to
+the Tapo app on your phone (*Receive Code via Email* sends it by email instead). The PC is
+remembered after that.
 
-With **Remember me** ticked, the password is saved (encrypted) so the app can log in again by
-itself when the session expires. Without it,
-the password is only kept until the app closes. The session token is always saved, encrypted.
-If the session expires and the app can't renew it, the log-in card comes back. **Sign out**
-(*Settings › Tapo account*) forgets the session and the password and keeps the email.
+With **Remember me**, the password is kept, encrypted for your Windows user, so Tapas can sign in
+again by itself when the session runs out. Without it, the password is forgotten when Tapas
+closes, and you sign in again when the session ends. **Sign out** is under *Settings › Tapo
+account*.
 
-The grid uses each camera's sub-stream (SD) and the single view its main stream (HD); you can
-change either per camera.
+The cameras and hubs on your account are added by themselves. ⟳ on Home looks again, for
+cameras added in the Tapo app later.
 
-Home's cards get their pictures from one frame of each camera when Home first opens, and are
-refreshed whenever you've been watching a camera. **Live view** (in the sidebar or on Home) shows
-all cameras at once; click one for its camera view.
+## Using Tapas
 
-In the camera view, **Pan & Tilt** works for cameras that have it. Each move goes through the
-cloud, so it takes a moment; arrow presses made meanwhile are combined into one move. **Privacy
-Mode** covers the camera's lens (the Tapo app's privacy mode); the video comes back by itself
-when it's turned off. **Playback & Download** opens that camera's recordings on the H500.
+### Home
+
+Home is titled with your home's name from the Tapo app. It has a card for the hub, with its model,
+room, firmware and storage (each disk, e.g. the H500's hard disk and its own storage), and a card
+for each camera with a recent picture and its room. **Live view** shows every camera; a camera's
+card opens it on its own.
+
+### Live view and the camera view
+
+**Live view** shows all cameras in a grid that fits the window. Click a camera for its own view:
+
+- **Take Photo** saves the picture to `Pictures\Tapas`.
+- **Pan & Tilt** (cameras that have it): the pad or the arrow keys, and presets to go to or save.
+  Each move goes through the cloud, so it takes a moment; presses made meanwhile add up to one
+  move.
+- **Privacy Mode** covers the lens, as in the Tapo app; the picture comes back when it's off.
+- **SD / HD** picks the camera's stream. The grid uses SD and the camera view HD unless you
+  change it.
+- **Playback & Download** opens the camera's recordings on the hub.
+- **Full screen**: its button, F11 or a double-click; Esc leaves it.
 
 ### Playback
 
-**Playback** (in the sidebar, on the H500's Home card, or *Playback & Download* in a camera view)
-shows what the H500 recorded. Pick the camera and a day in the calendar (days with recordings have
-a dot). The timeline under the video shows the day: recordings in blue, detected events in amber.
+**Playback** shows what the hub recorded. Pick the camera and a day; the calendar marks days with
+recordings. The timeline under the picture shows the day: recordings in blue, detected events in
+amber.
 
-- **Click the timeline** (or an event or recording in the list) to watch from there. Playback runs
-  on through the day's recordings, skipping the gaps between them.
-- **Drag** the timeline to move along it, **scroll** (or ＋/－) to zoom from the whole day down to
-  five minutes. While playing, it follows the picture.
-- **1× 2× 4× 8× 16×** change the speed; from 8× only keyframes are shown, about one every
-  second or two of recording. Click the picture (or ❚❚) to pause.
-- **Full screen** (its button, F11 or double-click the picture; Esc leaves it) puts the timeline
-  and controls over the picture. The list button by ⟳ hides the list for a bigger picture.
-- **Record** marks where the picture is; press it again to save from there to where the picture
-  is then (watching on, or jumping ahead) to `Videos\TapoViewer`, from memory where it can.
-- **Take photo** saves the picture shown to `Pictures\TapoViewer`; **↓** on an event or recording
-  saves it to `Videos\TapoViewer`.
+- **Click the timeline**, or an event in the list, to watch from there. Playback carries on through
+  the day's recordings, skipping the gaps.
+- **Drag** the timeline to move along it, and **scroll** (or the zoom buttons) to zoom between the
+  whole day and five minutes. It follows the picture while playing.
+- **1× 2× 4× 8× 16×** set the speed. From 8×, only keyframes are shown, like fast-forward.
+- **Click the picture** (or ❚❚) to pause. **Full screen** puts the timeline and controls over the
+  picture; the list button at the top hides the list instead.
+- **Record**: press it, watch on (or jump ahead), press it again, and that stretch is saved to
+  `Videos\Tapas`.
+- **↓** next to an event or recording saves it to `Videos\Tapas`. **Take Photo** saves the
+  picture.
 
-The list shows the day's **detected events** (person, vehicle, animal, motion…) under each hour,
-with the picture the hub keeps for each, as in the Tapo app; days without any list the
-recordings. Pictures are fetched one at a time while nothing plays, as the hub serves one
-session at a time.
+The list has the day's **detected events** (person, vehicle, animal, motion…) by hour, with the
+picture the hub keeps for each. On a day without events it lists the recordings.
 
-Watching keeps nothing on disk: the recording comes from the hub through the cloud a couple of
-minutes at a time, shortly before it's needed, and what has arrived stays in memory for a while
-(up to about 200 MB), so going back, or forward into what has already arrived, starts at once.
-The hub serves one download at a time, so jumps are queued behind the one finishing. Days follow
-this PC's time zone.
+Recordings come from the hub through the cloud a couple of minutes at a time, just before they're
+needed, and nothing is saved unless you ask. What has arrived stays in memory for a while, so going
+back, or forward into it, starts at once. A jump elsewhere takes a few seconds while the hub
+answers. Days are in this PC's time zone. Saved recordings are `.ts` files, which VLC and Windows'
+media players play.
 
-### About the cloud
+### Settings
 
-Live view and pan/tilt use TP-Link's private, undocumented cloud service, ported from the MIT-licensed
-[Topo](https://github.com/filirnd/topo) and [Topo TV](https://github.com/abdulmominsakib/tapo-android-tv)
-projects (see `src/cloud.rs` and `src/relay.rs`). TP-Link can change it at any time; if it
-stops working after a Tapo app update, the protocol has probably changed (see *Troubleshooting*).
-Cameras that send encrypted video through the cloud aren't supported yet; their tile says so.
+- **Tapo account**: who is signed in; update the camera list; sign out.
+- **Cameras**: rename, reorder, hide (remove) a camera, and choose its grid stream.
+- **Video & display**: light, dark or as Windows; the graphics renderer; a different ffmpeg.
+- **About & updates**: the version, *Check for updates*, and whether to check at start-up.
 
-The day's recordings, events and calendar come from the hub's own searches (`searchVideoWithUTC`,
-`searchDetectionList` naming the camera by id and MAC, `searchDateWithVideo` a month at a time).
-An event's picture is a single H.264/H.265 keyframe (`image/avc`, `image/hevc`) from a "cover"
-download of media type 3, as the app's event list fetches them. Playback asks the cloud for a relay
-to the hub naming the camera, as the Tapo app does, and then
-has the conversation the hub has on its local media port (request, acknowledgements every 25
-parts, heartbeats, stop), ported from the MIT-licensed
-[`tapo`](https://github.com/mihai-dinculescu/tapo) crate (see `src/clip.rs`). The Tapo app has
-several kinds of relay for recordings, and an H500 accepts its "cover" download but sends nothing,
-so Tapo Viewer tries the "video" download, then the real-time playback stream, then "cover", and
-uses the one that brought video first from then on. Every session is ended (stop, connection
-closed) however the playback ends, as a hub serves only a few at a time. The log has the details
-of every step. The picture is decoded by ffmpeg, whose `showinfo` filter gives each frame's time,
-so frames are shown at their recorded time divided by the speed.
+## Updates
 
-## Rendering on Windows
+At start-up, and with *Check for updates*, Tapas looks for a newer release on GitHub. When there
+is one, Home shows **Update now**: Tapas downloads the new installer, checks it against the
+checksum GitHub publishes, closes, installs it and starts again. Settings and the sign-in stay.
 
-The default renderer is **FemtoVG on wgpu with Direct3D 12**. It avoids OpenGL, whose fullscreen
-switch makes some Windows drivers blank the screen for a moment. You can change the renderer under
-*Settings › Video & display* (it applies after a restart):
+Updates come from [github.com/chaika1h/tapas/releases](https://github.com/chaika1h/tapas/releases),
+which must be public, as Tapas has no GitHub sign-in. `update_repo` in the settings file points it
+at another repository.
 
-- **Direct3D 12**: the default.
-- **Vulkan**: an alternative GPU path.
-- **Software**: works everywhere (remote desktop, VMs, very old GPUs).
-- **OpenGL**: only for comparison.
-
-If the app won't start, run `TapoViewer.exe --software`, or set `SLINT_BACKEND=winit-software`.
-
-### What else comes from the account
-
-- **Names**: hubs' names come base64-encoded from the cloud (an H500 is "VGFwbyBINTAw", "Tapo
-  H500") and are decoded.
-- **Homes and rooms** (as set up in the Tapo app): the home's name titles Home, and each camera's
-  room is on its card. They come from the cloud's IoT service (`/v1/families`, then each home's
-  `/rooms`); the log has its answers.
-- **The hub's firmware, address and storage**, asked of the hub itself through the cloud
-  (`getDeviceInfo`, `getSdCardStatus`).
-
-## Files
+## Where things are
 
 | What | Where |
 |---|---|
-| Settings | `%APPDATA%\TapoViewer\config\config.json` |
-| Log | `%APPDATA%\TapoViewer\config\tapo-viewer.log` |
-| Snapshots | `Pictures\TapoViewer` |
-| Recordings | `Videos\TapoViewer` (`.ts` files; VLC or Windows Media Player play them) |
-| Built-in ffmpeg (unpacked) | `%LOCALAPPDATA%\TapoViewer\data` |
+| The app | `%LOCALAPPDATA%\Programs\Tapas` |
+| Settings and sign-in (encrypted) | `%APPDATA%\Tapas\config\config.json` |
+| Log | `%APPDATA%\Tapas\config\tapas.log` |
+| Snapshots | `Pictures\Tapas` |
+| Saved recordings | `Videos\Tapas` |
+| The built-in ffmpeg, unpacked | `%LOCALAPPDATA%\Tapas\data` |
 
-## Building
+Uninstalling keeps settings, snapshots and recordings.
 
-The minimal ffmpeg that gets embedded lives in `vendor/ffmpeg.exe` (see `vendor/README.md`).
-The icon (`assets/app.ico`, and `assets/app-icon.png` for the window) is the in-app logo, drawn by
-`tools/make-icon.py`; `build.rs` embeds it in the exe through `assets/app.rc`.
-`build.rs` embeds it automatically; without it, the app looks for ffmpeg next to the exe and on
-PATH instead.
+## Troubleshooting
 
-On Windows (MSVC toolchain):
+- **Tapas doesn't start, or the window stays blank**: run `Tapas.exe --software`, then choose
+  another renderer under *Settings › Video & display* (*Software* works everywhere, e.g. over
+  remote desktop or on old graphics chips).
+- **"Camera is offline"**: the cloud can't reach the camera; check it in the Tapo app.
+- **The Tapo app says "No recordings", or Tapas's playback stops**: a hub serves only a few
+  playback sessions at once. Close Tapas, which ends its sessions; if the Tapo app still can't
+  play, restart the hub.
+- **Sign-in or video refused after a Tapo app update**: TP-Link may have changed its service.
+  Raising `APP_VERSION` in `src/cloud.rs` to the current Tapo app's version is the first thing to
+  try. The log has the details.
+- **"Couldn't check for updates: No releases…"**: the releases repository is private or has no
+  releases yet.
+- Anything else: the log (see *Where things are*) records every step with the cloud and the hub;
+  playback lines start with `clip:` and `playback:`.
+
+## How it works
+
+Tapas uses TP-Link's private cloud service, the one the Tapo app uses. It isn't documented and
+TP-Link can change it.
+
+- **Sign-in and devices**: the account API (signed requests, two-step verification) lists the
+  cameras and hubs (`getDeviceListByPage`), and the IoT service lists homes and rooms.
+- **Control**: camera and hub commands (pan/tilt, privacy, the hub's camera list, recording and
+  event searches, disk status) go to the device through the cloud's pass-through, in the device's
+  own API.
+- **Video**: the cloud opens a relay to the device, and video arrives over it as MPEG-TS, decoded
+  by a small built-in ffmpeg. Live view asks a camera; playback asks the hub, naming the camera,
+  and then talks to the hub as it would on its local media port (request, acknowledgements,
+  heartbeats, stop). Event pictures come the same way, as single keyframes.
+- Each frame's recorded time comes from ffmpeg, so playback runs at the chosen speed, and the hub
+  stamps every piece of video with its time, which lines up the timeline.
+
+**Limitations**: no sound yet; cameras that send encrypted video through the cloud can't be shown;
+the Tapo app's cloud recordings (Tapo Care) aren't supported.
+
+**Privacy**: Tapas talks to TP-Link's cloud (sign-in, devices, video) and to GitHub (the update
+check, which sends only the app's version). The password, when remembered, and the cloud session
+are encrypted with Windows DPAPI, so only your Windows user can read them.
+
+## Development
+
+### Source
+
+| Path | What |
+|---|---|
+| `src/main.rs` | Start-up, renderer choice, logging |
+| `src/app.rs` | The app's state and everything between the UI and the work below |
+| `ui/app.slint` | The whole UI |
+| `src/cloud.rs` | The Tapo cloud: sign-in, devices, homes, pass-through requests, relays |
+| `src/relay.rs` | The relay connection (a long HTTP request carrying multipart parts) |
+| `src/stream.rs`, `src/ffmpeg.rs` | Live video: relay → ffmpeg → frames |
+| `src/ptz.rs` | Pan/tilt, presets and privacy mode |
+| `src/clip.rs` | Hub recordings and event pictures over the relay |
+| `src/playback.rs` | Timeline playback: fetching ahead, the in-memory cache, pacing, speeds |
+| `src/update.rs` | Updates from GitHub releases |
+| `src/config.rs`, `src/secret.rs` | Settings, and DPAPI encryption of secrets |
+| `installer/Tapas.nsi` | The installer (NSIS) |
+| `tools/` | Build scripts, the icon, the fake cloud |
+| `vendor/` | The built-in ffmpeg (see `vendor/README.md`) |
+| `assets/`, `certs/`, `tests/fixtures/` | Icon, TP-Link's root certificates, test video |
+
+### Building
+
+On Windows, with Rust's MSVC toolchain:
 
 ```bash
 cargo build --release
 ```
 
-The exe is `target\release\tapo-viewer.exe`.
-
-Cross-compiling from Linux:
+From Linux or WSL, cross-compiling:
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
@@ -202,69 +212,61 @@ sudo apt-get install mingw-w64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-The exe is `target/x86_64-pc-windows-gnu/release/tapo-viewer.exe`.
-
-To rebuild the embedded ffmpeg (on Linux or WSL, with mingw-w64 installed):
-
-```bash
-tools/build-ffmpeg.sh windows
-```
+`build.rs` embeds `vendor/ffmpeg.exe` and the icon. `tools/build-ffmpeg.sh` rebuilds that ffmpeg
+(MPEG-TS, H.264 and H.265 in, raw frames out, nothing else), and `tools/make-icon.py` redraws the
+icon from the in-app logo.
 
 ### Installer and releases
 
-`tools/build-installer.sh` builds `target/installer/TapoViewer-Setup-<version>.exe` (NSIS,
-`installer/TapoViewer.nsi`; needs `makensis`), the portable zip and their SHA-256 sums.
-`tools/release.sh [owner/repo] ["notes"]` builds them and publishes release `v<version>` with the
-GitHub CLI; raise `version` in `Cargo.toml` first. The installer takes `/S` (silent) and
-`/RELAUNCH` (start the app when done), which the app's updater uses.
+```bash
+tools/build-installer.sh
+```
 
-### Testing without cameras
+This builds `target/installer/Tapas-Setup-<version>.exe` (needs `makensis`), the portable zip and
+their SHA-256 sums. The installer takes `/S` (silent) and `/RELAUNCH` (start Tapas afterwards),
+which the updater uses.
 
-`tools/fake_cloud.py` is a fake Tapo cloud and video relay for testing cloud live view without
-an account. It checks request signatures like the real cloud, redirects to a "regional" server,
-can ask for a verification code (`--mfa`, code `123456`), can expire sessions
-(`--expire-after 60`) and simulates pan/tilt, presets and privacy mode, with the cloud's delay if
-you like (`--control-delay 0.4`). It needs `openssl` and an ffmpeg with libx264. Only debug builds can be
-pointed at it:
+To publish a release that installed copies update to, raise `version` in `Cargo.toml`, then:
+
+```bash
+tools/release.sh chaika1h/tapas "What's new"
+```
+
+### Testing without devices
+
+`tools/fake_cloud.py` is a fake Tapo cloud: account, cameras with pan/tilt and privacy, an H500
+with recordings, detected events and pictures (sending one session at a time, like a real one),
+homes, rooms and an update. It needs Python 3, `openssl` and an ffmpeg with libx264 and drawtext.
+Debug builds can be pointed at it:
 
 ```bash
 python3 tools/fake_cloud.py --certs target/fake-cloud --mfa
 ```
 
 ```bash
-TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/fake-cloud/ca.pem cargo run
+TAPAS_FAKE_CLOUD=https://127.0.0.1:8443 TAPAS_FAKE_CLOUD_CA=target/fake-cloud/ca.pem TAPAS_UPDATE_URL=https://127.0.0.1:8443/github/releases/latest cargo run
 ```
 
-Sign in with any email and the password `secret`. "Back yard" is reported offline; "Front door"
-has pan/tilt and "Garage" hasn't. The H500 "HomeBase" has recordings of "Front door" (today,
-yesterday and three days ago, including six minutes of continuous recording at 10:00 with
-detected events) and "Garage" (today); the recorded time is written on the picture. Like a real hub it serves only two downloads
-at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
-open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output. Like an H500
-it sends nothing for the "cover" download; `--clip-path video|playback|none` picks which other way
-works. Debug builds read updates from `TAPO_VIEWER_UPDATE_URL`, and the fake cloud serves a
-release 9.9.9 at `<base>/github/releases/latest`. Like an H500 it serves one download at a time (the relay answers HTTP 500 to a second), and
-the account has a home ("Office") with rooms, and the hub reports its firmware and storage.
+Sign in with any email and the password `secret`; the verification code is `123456`. Its options:
+`--expire-after N` (sessions expire), `--control-delay S` (slow pan/tilt), `--slow-clips`
+(recordings in real time), `--clip-path video|playback|none` (which way the hub sends
+recordings). The recorded time is written on the fake recordings' picture.
 
-## Troubleshooting
+```bash
+cargo test
+```
 
-- **No hub on Playback**: hubs come from the Tapo account's device list; press ⟳ on Home after
-  adding one in the Tapo app. Only camera hubs (H500, H200) are shown.
-- **A recording won't play** ("The cloud relay refused the stream", "The hub refused the
-  recording", "encrypted"): the log has the hub's answers (lines starting `clip:`). Please send
-  them, as the cloud's playback path hasn't been checked against a real H500 yet.
-- **"Pan/tilt: Reached the end of the pan/tilt range"**: the camera is at its end stop in that
-  direction.
-- **"Camera is offline"**: the cloud can't reach the camera; check it in the
-  Tapo app.
-- **"The cloud relay refused the stream (code …)"** or **sign-in refused**:
-  TP-Link may have changed its service. Raising `APP_VERSION` in `src/cloud.rs` to the current
-  Tapo app version is the first thing to try. The log (see *Files*) has the details.
+## Credits and licences
 
-## License notes
+Tapas is MIT-licensed (see `LICENSE`). Its cloud client is ported from the MIT-licensed
+[Topo](https://github.com/filirnd/topo) and
+[Topo TV](https://github.com/abdulmominsakib/tapo-android-tv), and the hub's recording protocol
+from the MIT-licensed [tapo](https://github.com/mihai-dinculescu/tapo) crate.
+`certs/tapo-cloud-roots.pem` holds TP-Link's two public root certificates, as those projects ship
+them.
 
-Slint is used under its Royalty-free License, which requires showing attribution (the "Made with
-Slint" badge, or a mention in the About information). The Tapo cloud client (`src/cloud.rs`, `src/relay.rs`) is a port
-of the MIT-licensed [Topo](https://github.com/filirnd/topo) and
-[Topo TV](https://github.com/abdulmominsakib/tapo-android-tv) projects. `certs/tapo-cloud-roots.pem`
-holds TP-Link's two public root certificates, as shipped by those projects.
+- [Slint](https://slint.dev) is used under its Royalty-free License, which asks for the
+  attribution shown in *Settings › About & updates*.
+- The built-in ffmpeg is LGPL 2.1 (see `vendor/README.md`).
+
+Tapo is a trademark of TP-Link; Tapas isn't affiliated with TP-Link.
