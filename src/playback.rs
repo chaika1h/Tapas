@@ -10,6 +10,7 @@
 //! when each frame was recorded; frames are shown at that time divided by
 //! the speed. Nothing is written to disk.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -35,9 +36,9 @@ const WINDOW: i64 = 120;
 /// The next window is fetched when less than this many seconds (times the
 /// speed) are left to show.
 const AHEAD: i64 = 45;
-/// How much fetched video is kept in memory, across recordings: several
-/// minutes of a camera's HD video.
-const CACHE_BYTES: usize = 128 << 20;
+/// How much fetched video is kept in memory, across recordings: a few
+/// minutes of a camera's HD video. Cleared when leaving Playback.
+const CACHE_BYTES: usize = 48 << 20;
 /// Paused this long, playback lets go of its ffmpeg (whose queues fill
 /// while nothing is read: ~100 MB) and the hub's session; the picture stays,
 /// and playing on starts again from it, mostly from the cache.
@@ -400,7 +401,7 @@ async fn read_frames(
 ) {
     let Some(mut times) = times else { return };
     let (w, h) = (decoder.width, decoder.height);
-    let mut buf = vec![0u8; w * h * 3];
+    let mut buf = vec![0u8; w * h * 4];
     let mut last = 0.0;
     loop {
         if decoder.stdout.read_exact(&mut buf).await.is_err() {
@@ -436,7 +437,7 @@ struct Run {
     id: u64,
     /// (camera, recording start)
     recording: (String, i64),
-    pieces: Vec<Piece>,
+    pieces: VecDeque<Piece>,
     bytes: usize,
     /// Everything up to here (ms) has been fetched.
     until: i64,
@@ -445,7 +446,9 @@ struct Run {
 
 /// Video fetched lately, so seeking back, or forward into what has already
 /// arrived, needs no new download. The least recently used stretches go
-/// once it holds [`CACHE_BYTES`].
+/// once it holds [`CACHE_BYTES`], and the active stretch trims from its
+/// front at keyframe boundaries so a long continuous recording never grows
+/// unboundedly.
 #[derive(Default)]
 struct Cache {
     runs: Vec<Run>,
@@ -460,23 +463,34 @@ pub fn cached_bytes() -> usize {
     CACHE.lock().unwrap().bytes
 }
 
+/// Releases all cached recorded video (called when closing playback or
+/// leaving the Playback page for a while).
+pub fn clear_cache() {
+    let mut cache = CACHE.lock().unwrap();
+    if cache.bytes > 0 {
+        log::info!("playback: cleared {} MB of cached recordings", cache.bytes >> 20);
+    }
+    cache.runs.clear();
+    cache.bytes = 0;
+}
+
 impl Cache {
     /// The pieces to show from `at_ms` (from the keyframe at or before it),
     /// the stretch they belong to and how far it goes.
     fn find(&mut self, recording: &(String, i64), at_ms: i64) -> Option<(Vec<Piece>, u64, i64)> {
         let run = self.runs.iter_mut().find(|r| {
-            &r.recording == recording && r.pieces.first().is_some_and(|p| p.pts <= at_ms) && at_ms < r.until
+            &r.recording == recording && r.pieces.front().is_some_and(|p| p.pts <= at_ms) && at_ms < r.until
         })?;
         let from = run.pieces.iter().rposition(|p| p.key && p.pts <= at_ms)?;
         run.used = std::time::Instant::now();
-        Some((run.pieces[from..].to_vec(), run.id, run.until))
+        Some((run.pieces.range(from..).cloned().collect(), run.id, run.until))
     }
 
     fn start(&mut self, recording: (String, i64)) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         let now = std::time::Instant::now();
-        self.runs.push(Run { id, recording, pieces: Vec::new(), bytes: 0, until: i64::MIN, used: now });
+        self.runs.push(Run { id, recording, pieces: VecDeque::new(), bytes: 0, until: i64::MIN, used: now });
         id
     }
 
@@ -486,7 +500,7 @@ impl Cache {
         self.bytes += piece.data.len();
         run.until = run.until.max(piece.pts);
         run.used = std::time::Instant::now();
-        run.pieces.push(piece);
+        run.pieces.push_back(piece);
         self.evict(id);
     }
 
@@ -507,6 +521,21 @@ impl Cache {
                 .min_by_key(|(_, r)| r.used)
                 .map(|(i, _)| i)
             else {
+                // Only the active stretch remains: trim its oldest pieces from
+                // the front so a long continuous recording stays within budget.
+                let Some(run) = self.runs.iter_mut().find(|r| r.id == keep) else { return };
+                while self.bytes > CACHE_BYTES && run.pieces.len() > 1 {
+                    let Some(old) = run.pieces.pop_front() else { break };
+                    run.bytes -= old.data.len();
+                    self.bytes -= old.data.len();
+                }
+                // Re-align the front to a keyframe so future seeks from this
+                // stretch can always start cleanly.
+                while run.pieces.len() > 1 && run.pieces.front().is_some_and(|p| !p.key) {
+                    let Some(old) = run.pieces.pop_front() else { break };
+                    run.bytes -= old.data.len();
+                    self.bytes -= old.data.len();
+                }
                 return;
             };
             let run = self.runs.remove(oldest);
@@ -521,11 +550,11 @@ pub fn cached_video(camera_id: &str, recording_start: i64, from_ms: i64, to_ms: 
     let mut cache = CACHE.lock().unwrap();
     let recording = (camera_id.to_string(), recording_start);
     let run = cache.runs.iter_mut().find(|r| {
-        r.recording == recording && r.pieces.first().is_some_and(|p| p.pts <= from_ms) && r.until >= to_ms
+        r.recording == recording && r.pieces.front().is_some_and(|p| p.pts <= from_ms) && r.until >= to_ms
     })?;
     let first = run.pieces.iter().rposition(|p| p.key && p.pts <= from_ms)?;
     run.used = std::time::Instant::now();
-    Some(run.pieces[first..].iter().take_while(|p| p.pts <= to_ms).map(|p| p.data.clone()).collect())
+    Some(run.pieces.range(first..).take_while(|p| p.pts <= to_ms).map(|p| p.data.clone()).collect())
 }
 
 /// Feeds ffmpeg the recording from `from_ms` to its end: what's in memory
@@ -674,5 +703,20 @@ mod tests {
         cache.add(big, piece(9_000, true, CACHE_BYTES));
         assert!(cache.find(&recording, 2_700).is_none());
         assert_eq!(cache.runs.len(), 1);
+
+        // Even a single active stretch trims from its front at a keyframe
+        // boundary instead of growing past CACHE_BYTES.
+        let half = CACHE_BYTES / 2;
+        let mut active = Cache::default();
+        let long = active.start(("cam".into(), 300));
+        active.add(long, piece(1_000, true, half));
+        active.add(long, piece(1_500, false, 1024));
+        active.add(long, piece(2_000, true, half - 1024));
+        active.add(long, piece(2_500, false, 4096));
+        active.complete_to(long, 3_000);
+        assert!(active.bytes <= CACHE_BYTES, "active run grew to {}", active.bytes);
+        assert!(active.find(&("cam".into(), 300), 1_200).is_none());
+        let (pieces, _, _) = active.find(&("cam".into(), 300), 2_200).unwrap();
+        assert!(pieces[0].key && pieces[0].pts == 2_000);
     }
 }

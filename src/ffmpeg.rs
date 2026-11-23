@@ -224,7 +224,7 @@ impl Decoder {
     /// Like [`Decoder::push_frames`], waiting up to `quiet` for each frame.
     pub async fn push_frames_within(&mut self, sink: &mut FrameSink, quiet: Duration) -> Stopped {
         let (w, h) = (self.width, self.height);
-        let mut buf = vec![0u8; w * h * 3];
+        let mut buf = vec![0u8; w * h * 4];
         loop {
             match timeout(quiet, self.stdout.read_exact(&mut buf)).await {
                 Err(_) => return Stopped::NoVideo,
@@ -241,14 +241,14 @@ impl Decoder {
 
 /// Decodes a single encoded picture (an event's keyframe from a hub,
 /// `image/avc` or `image/hevc`) into a `width`×`height` frame.
-pub async fn decode_picture(ffmpeg: &Path, data: &[u8], content_type: &str, width: usize, height: usize) -> Result<SharedPixelBuffer<slint::Rgb8Pixel>> {
+pub async fn decode_picture(ffmpeg: &Path, data: &[u8], content_type: &str, width: usize, height: usize) -> Result<SharedPixelBuffer<slint::Rgba8Pixel>> {
     use tokio::io::AsyncWriteExt;
     let format = if content_type.contains("hevc") || content_type.contains("265") { "hevc" } else { "h264" };
     let mut decoder = Decoder::spawn(ffmpeg, &["-f", format, "-i", "pipe:0"], width, height)?;
     let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
     stdin.write_all(data).await.context("Could not pass the picture to ffmpeg")?;
     drop(stdin);
-    let mut buf = vec![0u8; width * height * 3];
+    let mut buf = vec![0u8; width * height * 4];
     match timeout(Duration::from_secs(10), decoder.stdout.read_exact(&mut buf)).await {
         Ok(Ok(_)) => Ok(SharedPixelBuffer::clone_from_slice(&buf, width as u32, height as u32)),
         _ => {
@@ -287,7 +287,9 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> to
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
         .args(["-an", "-sn", "-vf", &vf, "-fps_mode", "passthrough"])
-        .args(["-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"])
+        // Output RGBA directly so Slint's femtovg-wgpu renderer uploads the
+        // buffer as-is instead of allocating and converting RGB->RGBA per frame.
+        .args(["-pix_fmt", "rgba", "-f", "rawvideo", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -356,7 +358,7 @@ mod tests {
         assert_eq!((frame.width(), frame.height()), (640, 360));
         // testsrc2 is colourful: the picture must not be flat.
         let bytes = frame.as_bytes();
-        let distinct: std::collections::HashSet<_> = bytes.chunks(3).step_by(97).collect();
+        let distinct: std::collections::HashSet<_> = bytes.chunks(4).step_by(97).collect();
         assert!(distinct.len() > 20, "frame looks blank");
         drop(relay_tx);
     }
