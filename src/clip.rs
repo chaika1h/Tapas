@@ -22,6 +22,7 @@
 //! uses are tried in turn, ending with its real-time playback; whichever
 //! works is used first after that.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -463,6 +464,245 @@ fn picture_request(seq: u32, request: &ClipRequest, media_type: i64) -> Value {
     })
 }
 
+/// The Tapo app's request for H500 facial profile JPEGs (`GetImageRequest` /
+/// `GetDownloadFaceImageParams` on `STREAM_TYPE_IMAGE = 6`).
+fn face_image_request(seq: u32, face_ids: &[i64]) -> Value {
+    json!({
+        "type": "request",
+        "seq": seq,
+        "params": {
+            "method": "get",
+            "image": {
+                "face_id": face_ids,
+            }
+        }
+    })
+}
+
+/// Downloads face profile JPEGs for `face_ids` from an H500 hub over the
+/// cloud relay (`STREAM_TYPE_IMAGE = 6`). Yields to active playback/downloads
+/// via `take_hub(true)` so it never competes with video streams.
+pub async fn face_images(
+    client: &CloudClient,
+    hub: &CloudCamera,
+    player_id: &str,
+    face_ids: &[i64],
+) -> Result<HashMap<i64, Vec<u8>>> {
+    if face_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut last_err = None;
+    for attempt_no in 0..3 {
+        match face_images_once(client, hub, player_id, face_ids).await {
+            Ok(map) => return Ok(map),
+            Err(e) if e.is::<relay::RelayBusy>() && attempt_no < 2 => {
+                log::info!("face_images: {e:#}; retrying in 1s");
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("The hub was busy while fetching face photos")))
+}
+
+async fn face_images_once(
+    client: &CloudClient,
+    hub: &CloudCamera,
+    player_id: &str,
+    face_ids: &[i64],
+) -> Result<HashMap<i64, Vec<u8>>> {
+    let slot = take_hub(true).await;
+    let info = client.request_face_image_relay(hub, player_id).await?;
+    let mut stream = relay::connect(client.tls(), &info).await?;
+    let ask = face_image_request(1, face_ids);
+    let mut first = relay::recording_head(&info).into_bytes();
+    first.extend(relay::client_part(
+        &[("Content-Type", "application/json"), ("X-Data-Window-Size", DATA_WINDOW_SIZE)],
+        ask.to_string().as_bytes(),
+    ));
+    stream.write_all(&first).await.context("Could not talk to the video relay")?;
+    stream.flush().await?;
+
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::with_capacity(64 * 1024, read_half);
+    let session = Arc::new(Mutex::new(None::<String>));
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let writer = tokio::spawn(async move {
+        write_parts(write_half, rx).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(slot);
+    });
+    let mut guard = SessionGuard { tx: Some(tx.clone()), session: session.clone(), heartbeat: None };
+    relay::read_response_head(&mut reader).await?;
+    guard.heartbeat = Some(tokio::spawn({
+        let (tx, session) = (tx.clone(), session.clone());
+        async move {
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
+            loop {
+                tick.tick().await;
+                let part = control_part(&session, &[], &json!({"type": "notification", "params": {"event_type": "heartbeat"}}));
+                if tx.send(part).is_err() {
+                    break;
+                }
+            }
+        }
+    }));
+
+    let mut state = FaceImageSession::new(tx, session.clone(), face_ids);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let result = async {
+        loop {
+            if Instant::now() > deadline {
+                break;
+            }
+            let wait = if state.received.len() >= face_ids.len() { END_QUIET } else { Duration::from_secs(15) };
+            let part = match relay::read_part(&mut reader, wait).await {
+                Ok(part) => part,
+                Err(e) if e.is::<IdleTimeout>() => {
+                    state.flush_pending(None);
+                    break;
+                }
+                Err(e) if !state.received.is_empty() => {
+                    log::info!("face_images: relay ended after {} photo(s): {e:#}", state.received.len());
+                    state.flush_pending(None);
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+            if state.handle(part)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    let received = std::mem::take(&mut state.received);
+    drop(state);
+    drop(guard);
+    let _ = tokio::time::timeout(Duration::from_secs(3), writer).await;
+    result?;
+    log::info!("face_images: fetched {}/{} photo(s) from hub", received.len(), face_ids.len());
+    Ok(received)
+}
+
+/// Multipart state machine for `STREAM_TYPE_IMAGE` (H500 face JPEGs).
+struct FaceImageSession {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    session: Arc<Mutex<Option<String>>>,
+    requested: Vec<i64>,
+    current_buf: Vec<u8>,
+    current_face_id: Option<i64>,
+    received: HashMap<i64, Vec<u8>>,
+}
+
+impl FaceImageSession {
+    fn new(tx: mpsc::UnboundedSender<Vec<u8>>, session: Arc<Mutex<Option<String>>>, face_ids: &[i64]) -> Self {
+        Self {
+            tx,
+            session,
+            requested: face_ids.to_vec(),
+            current_buf: Vec::new(),
+            current_face_id: None,
+            received: HashMap::new(),
+        }
+    }
+
+    fn next_unreceived(&self) -> Option<i64> {
+        self.requested.iter().copied().find(|id| !self.received.contains_key(id))
+    }
+
+    fn flush_pending(&mut self, hint_face_id: Option<i64>) {
+        if self.current_buf.is_empty() {
+            return;
+        }
+        let id = hint_face_id.or(self.current_face_id).or_else(|| self.next_unreceived());
+        let data = std::mem::take(&mut self.current_buf);
+        self.current_face_id = None;
+        if let Some(id) = id {
+            self.received.insert(id, data);
+        }
+    }
+
+    fn handle(&mut self, part: Part) -> Result<bool> {
+        if part.is_json() {
+            let text = String::from_utf8_lossy(&part.body);
+            log::info!("face_images: hub says {text}");
+            let Ok(message) = serde_json::from_slice::<Value>(&part.body) else { return Ok(false) };
+            let params = message.get("params").cloned().unwrap_or(Value::Null);
+            match message.get("type").and_then(Value::as_str) {
+                Some("response") if message.get("seq").and_then(Value::as_i64) == Some(1) => {
+                    let code = params.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+                    if code != 0 {
+                        bail!("{}", refusal(code));
+                    }
+                    let id = match params.get("session_id") {
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(Value::Number(n)) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    if id.is_some() {
+                        *self.session.lock().unwrap() = id;
+                    }
+                    Ok(false)
+                }
+                Some("notification") => {
+                    let event = params.get("event_type").and_then(Value::as_str).unwrap_or("");
+                    if event != "stream_status" {
+                        return Ok(false);
+                    }
+                    let res = params.get("result").unwrap_or(&params);
+                    let status = res
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .or_else(|| params.get("status").and_then(Value::as_str))
+                        .unwrap_or("");
+                    let face_id = res
+                        .get("face_id")
+                        .or_else(|| params.get("face_id"))
+                        .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+                    match status {
+                        "image_ended" => {
+                            self.flush_pending(face_id);
+                            let ack = json!({
+                                "type": "notification",
+                                "params": {
+                                    "event_type": "ack_receive",
+                                    "status": "success"
+                                }
+                            });
+                            let _ = self.tx.send(control_part(&self.session, &[], &ack));
+                            Ok(false)
+                        }
+                        "finished" => {
+                            self.flush_pending(face_id);
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    }
+                }
+                _ => Ok(false),
+            }
+        } else {
+            if part.body.is_empty() {
+                return Ok(false);
+            }
+            if part.header("x-if-encrypt") == Some("1") || part.header("x-data-hmac").is_some() {
+                log::warn!("face_images: encrypted part, headers {:?}", part.headers);
+                bail!("The hub sent encrypted face photos");
+            }
+            if self.current_face_id.is_none()
+                && let Some(id) = part.header("x-face-id").and_then(|s| s.trim().parse::<i64>().ok())
+            {
+                self.current_face_id = Some(id);
+            }
+            self.current_buf.extend_from_slice(&part.body);
+            Ok(false)
+        }
+    }
+}
+
 /// The first client part: which clip, from which camera.
 fn download_request(seq: u32, request: &ClipRequest) -> Value {
     json!({
@@ -814,5 +1054,48 @@ mod tests {
         }
         let s = clock.seconds();
         assert!((5.0..6.5).contains(&s), "{s}");
+    }
+
+    #[test]
+    fn face_image_conversation_handles_jpegs_and_acks() {
+        assert_eq!(
+            face_image_request(1, &[101, 202]),
+            json!({"type": "request", "seq": 1, "params": {"method": "get", "image": {"face_id": [101, 202]}}})
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut s = FaceImageSession::new(tx, Arc::default(), &[101, 202]);
+        assert!(!s.handle(json_part(r#"{"type":"response","seq":1,"params":{"error_code":0,"session_id":"88"}}"#)).unwrap());
+        assert_eq!(s.session.lock().unwrap().as_deref(), Some("88"));
+
+        let jpeg_part = |bytes: &[u8]| Part {
+            headers: vec![("content-type".into(), "image/jpeg".into())],
+            body: bytes.to_vec(),
+        };
+        assert!(!s.handle(jpeg_part(b"\xff\xd8part1")).unwrap());
+        assert!(!s.handle(jpeg_part(b"part2\xff\xd9")).unwrap());
+        assert!(!s
+            .handle(json_part(
+                r#"{"type":"notification","params":{"event_type":"stream_status","result":{"status":"image_ended","face_id":101}}}"#,
+            ))
+            .unwrap());
+        let ack1 = String::from_utf8(rx.try_recv().unwrap()).unwrap();
+        assert!(ack1.contains("X-Session-Id: 88") && ack1.contains("ack_receive"), "{ack1}");
+
+        // Second face without explicit face_id falls back to requested order.
+        assert!(!s.handle(jpeg_part(b"\xff\xd8second\xff\xd9")).unwrap());
+        assert!(!s
+            .handle(json_part(
+                r#"{"type":"notification","params":{"event_type":"stream_status","status":"image_ended"}}"#,
+            ))
+            .unwrap());
+        assert!(rx.try_recv().is_ok());
+
+        assert!(s
+            .handle(json_part(
+                r#"{"type":"notification","params":{"event_type":"stream_status","status":"finished"}}"#,
+            ))
+            .unwrap());
+        assert_eq!(s.received.get(&101).map(Vec::as_slice), Some(&b"\xff\xd8part1part2\xff\xd9"[..]));
+        assert_eq!(s.received.get(&202).map(Vec::as_slice), Some(&b"\xff\xd8second\xff\xd9"[..]));
     }
 }

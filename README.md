@@ -4,15 +4,18 @@ Tapas is a Windows app for TP-Link **Tapo** cameras and the **H500 HomeBase** hu
 with your Tapo account and works through the Tapo cloud, like the Tapo app on your phone, so it
 works from anywhere with internet: no VPN, port forwarding or camera passwords.
 
-- **Live view** of every camera in a grid, or one camera at a time, with **live audio** (G.711 and AAC).
+- **Live view** of every camera in a grid, or one camera at a time, with **live audio** (G.711 and AAC),
+  **digital zoom & pan (`1×–8×`)**, and **live lossless MP4 recording**.
 - **Camera controls**: pan & tilt, pan/tilt patrol, saved presets (go to, save, delete), privacy mode,
   spotlight, night vision mode, auto-tracking, siren/alarm, reboot, SD/HD, and snapshots.
 - **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16× with 1× audio,
-  AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`), a clickable **24-hour activity chart**,
-  an **All cameras** cross-camera events feed with pictures, a calendar, recording clips, and single or **batch lossless MP4 exports**.
-- **People (H500 Facial Recognition)**: browse Familiar and Stranger faces recognized by your H500 HomeBase,
-  name or mark people as Familiar, explore their **cross-camera tracking timeline** by day, and jump straight into Playback.
-- **Full screen** for live view and playback.
+  **digital zoom & pan (`1×–8×`)**, AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`),
+  a clickable **24-hour activity chart**, an **All cameras** cross-camera events feed with pictures,
+  a calendar, recording clips, and single or **batch lossless MP4 exports**.
+- **People (H500 Facial Recognition)**: browse Familiar and Stranger faces with **face profile photos**
+  recognized by your H500 HomeBase, name or mark people as Familiar, explore their **cross-camera tracking timeline**
+  by day, and jump straight into Playback.
+- **NVR keyboard shortcuts** and **full screen** for live view and playback.
 - Your **homes and rooms** from the Tapo app, and the H500 hub's firmware, storage, HDD health
   (temperature & power-on hours), loop recording, and hub alarm/ring.
 - **Integrated Windows 11 Fluent window** (light or dark, OpenGL default with software fallback),
@@ -68,11 +71,15 @@ watching it; ⟳ takes new ones of every camera.
 
 **Live view** shows all cameras in a grid that fits the window, each with a quick speaker button to
 listen in (only one camera plays audio at a time). Until a camera's video comes, its tile shows its
-last picture, dimmed. Click a camera for its own view, which starts with the grid's picture while
-the HD video connects:
+last picture, dimmed. Click a camera (or press `1`–`9`) for its own view, which starts with the grid's
+picture while the HD video connects:
 
 - **Sound** (`M` or speaker button): listen to the camera's live audio stream.
-- **Take Photo** saves the picture to `Pictures\Tapas`.
+- **Take Photo** (`S`) saves the picture to `Pictures\Tapas`.
+- **Record Video** (`R`) captures the live camera stream directly to a lossless `.mp4` file in `Videos\Tapas`
+  with an on-screen `REC` timer.
+- **Digital Zoom & Pan (`1×–8×`)**: scroll the mouse wheel over the video to zoom in toward the cursor,
+  click and drag to pan, and double-click, click the zoom pill, or press `0` to reset.
 - **Pan & Tilt** (cameras that have it): the pad or the arrow keys, **Pan Patrol / Tilt Patrol / Stop**,
   and presets to go to, save, or delete. Each move goes through the cloud, so it takes a moment;
   presses made meanwhile add up to one move.
@@ -82,7 +89,7 @@ the HD video connects:
 - **SD / HD** picks the camera's stream. The grid uses SD and the camera view HD unless you
   change it.
 - **Playback & Download** opens the camera's recordings on the hub.
-- **Full screen**: its button, F11 or a double-click; Esc leaves it.
+- **Full screen**: its button, F11 or a double-click (when unzoomed); Esc leaves it.
 
 Video keeps coming for 20 seconds after you leave a page, so going back, e.g. from a camera to the
 grid, is instant.
@@ -98,18 +105,19 @@ picture shows the day: recordings in blue, detected events in amber.
   through the day's recordings, skipping the gaps.
 - **Filter events** with the chips above the list (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`).
 - **24-hour activity chart**: hover any hourly bar to see its event count and click to jump straight to that hour.
+- **Digital Zoom & Pan (`1×–8×`)**: scroll over the player to inspect details, drag to pan, press `0` or click the zoom pill to reset.
 - **Drag the white playhead** to a moment: its label shows the time it will play from.
 - **Drag** anywhere else on the timeline to move along it, and **scroll** (or the zoom buttons) to
   zoom between the whole day and five minutes. It follows the picture while playing.
-- **1× 2× 4× 8× 16×** set the speed, with **audio (`M`)** available at 1×. From 8×, only keyframes
+- **1× 2× 4× 8× 16×** (`[` / `]`) set the speed, with **audio (`M`)** available at 1×. From 8×, only keyframes
   are shown, like fast-forward.
-- **Click the picture** (or ❚❚) to pause. **Full screen** puts the timeline and controls over the
-  picture; the list button at the top hides the list instead.
-- **Record**: press it, watch on (or jump ahead), press it again, and that stretch is saved to
+- **Click the picture** (or `Space` / ❚❚) to pause, and `←` / `→` to skip ±10s (`Shift+←`/`→` for ±30s).
+  **Full screen** puts the timeline and controls over the picture; the list button at the top hides the list instead.
+- **Record (`R`)**: press it, watch on (or jump ahead), press it again, and that stretch is saved to
   `Videos\Tapas`.
 - **↓** next to an event or recording saves it to `Videos\Tapas`, or click **Select** to pick multiple
   clips and export them sequentially as lossless `.mp4` files with live progress and cancel support.
-  **Take Photo** saves the picture.
+  **Take Photo (`S`)** saves the picture.
 
 The list has the day's **detected events** (person, vehicle, animal, motion…) by hour, with the
 picture the hub keeps for each. The pictures come while you watch, whenever playback isn't using
@@ -127,12 +135,27 @@ video copy with AAC audio and `+faststart`), ready to play anywhere or share in 
 ### People
 
 When your account has an H500 HomeBase with Facial Recognition enabled, **People** lists every
-**Familiar** and **Stranger** face recognized by the hub:
+**Familiar** and **Stranger** face recognized by the hub with their **face profile photos** (cached locally):
 
 - Filter by `All`, `Familiar`, or `Stranger`.
 - Select any person to rename them or mark a stranger as Familiar directly on the H500.
 - Browse the **Cross-camera timeline** by day and click any appearance to jump straight into
   Playback on that camera at that exact timestamp.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `Ctrl+1` – `Ctrl+5` | Switch pages (Home, Live view, Playback, People, Settings) |
+| `1` – `9` | Open camera 1–9 from Home or Live view |
+| `Space` | Play / pause in Playback |
+| `←` / `→` | Skip ±10s in Playback (`Shift+←`/`→` for ±30s), or pan in Single PTZ view |
+| `[` / `]` | Decrease / increase Playback speed |
+| `M` | Mute / unmute audio |
+| `S` | Take snapshot (`Pictures\Tapas`) |
+| `R` | Start / stop MP4 recording (`Videos\Tapas`) |
+| `0` | Reset digital zoom to `1×` |
+| `F11` / `Esc` | Toggle / exit fullscreen, or go back from Single view |
 
 ### Settings
 

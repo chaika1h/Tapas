@@ -53,6 +53,7 @@ const HUB_TYPE: &str = "SMART.TAPOHUB";
 const STREAM_PREVIEW: i64 = 0;
 const STREAM_PLAYBACK: i64 = 1;
 const STREAM_DOWNLOAD: i64 = 3;
+const STREAM_IMAGE: i64 = 6;
 
 /// The kinds of relay the Tapo app opens for a hub's recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -949,6 +950,24 @@ impl CloudClient {
             ClipStream::Playback => payload["streamType"] = STREAM_PLAYBACK.into(),
         }
         log::info!("clip relay request: {}", redact_relay_request(&payload));
+        self.relay_request(&payload, player_id.to_string(), "Hub").await
+    }
+
+    /// Asks the cloud for a relay session to download face profile JPEGs from
+    /// an H500 hub (`STREAM_TYPE_IMAGE = 6` in the Tapo app).
+    pub async fn request_face_image_relay(&self, hub: &CloudCamera, player_id: &str) -> Result<RelayInfo> {
+        let device_type = if hub.device_type.is_empty() { HUB_TYPE } else { &hub.device_type };
+        let payload = json!({
+            "deviceId": hub.device_id,
+            "dataTimeoutCount": 0,
+            "cloudType": 2,
+            "deviceType": device_type,
+            "playerId": player_id,
+            "rootCaVer": "1",
+            "preConnection": 0,
+            "streamType": STREAM_IMAGE,
+        });
+        log::info!("face image relay request: {}", redact_relay_request(&payload));
         self.relay_request(&payload, player_id.to_string(), "Hub").await
     }
 

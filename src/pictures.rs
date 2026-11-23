@@ -31,6 +31,10 @@ fn event_path(device_id: &str, start: i64) -> PathBuf {
     dir().join("events").join(safe(device_id)).join(format!("{start}.jpg"))
 }
 
+fn face_path(hub_id: &str, face_id: i64) -> PathBuf {
+    dir().join("faces").join(safe(hub_id)).join(format!("{face_id}.jpg"))
+}
+
 /// A camera's last picture and when it was taken.
 pub fn load_camera(device_id: &str) -> Option<(Frame, SystemTime)> {
     let path = camera_path(device_id);
@@ -51,6 +55,16 @@ pub fn load_event(device_id: &str, start: i64) -> Option<Frame> {
 pub fn save_event(device_id: &str, start: i64, frame: &Frame) {
     if let Err(e) = save(&event_path(device_id, start), frame, 85) {
         log::info!("could not keep an event picture: {e:#}");
+    }
+}
+
+pub fn load_face(hub_id: &str, face_id: i64) -> Option<Frame> {
+    load(&face_path(hub_id, face_id))
+}
+
+pub fn save_face(hub_id: &str, face_id: i64, frame: &Frame) {
+    if let Err(e) = save(&face_path(hub_id, face_id), frame, 88) {
+        log::info!("could not keep a face picture: {e:#}");
     }
 }
 

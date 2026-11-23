@@ -61,6 +61,7 @@ pub struct StreamHandle {
     pub slot: Arc<Mutex<Slot>>,
     /// Audio source id for [`crate::audio`]; mute/unmute switches the active id.
     pub audio_id: u64,
+    recorder: crate::relay::LiveRecorder,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -73,17 +74,40 @@ impl StreamHandle {
             fps: 0.0,
         }));
         let audio_id = crate::audio::next_source_id();
-        let task = rt.spawn(run(spec, FrameSink::with_audio(slot.clone(), audio_id)));
-        Self { slot, audio_id, task }
+        let recorder: crate::relay::LiveRecorder = Arc::new(Mutex::new(None));
+        let task = rt.spawn(run(spec, FrameSink::with_audio_and_recorder(slot.clone(), audio_id, recorder.clone())));
+        Self { slot, audio_id, recorder, task }
     }
 
     pub fn latest_frame(&self) -> Option<Frame> {
         self.slot.lock().unwrap().frame.clone()
     }
+
+    /// Starts teeing the live stream's raw MPEG-TS packets into `path`.
+    pub fn start_recording(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::File::create(path)?;
+        *self.recorder.lock().unwrap() = Some(std::io::BufWriter::new(file));
+        Ok(())
+    }
+
+    /// Stops teeing MPEG-TS and flushes/closes the file. Returns whether recording was active.
+    pub fn stop_recording(&self) -> bool {
+        use std::io::Write;
+        if let Some(mut writer) = self.recorder.lock().unwrap().take() {
+            let _ = writer.flush();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for StreamHandle {
     fn drop(&mut self) {
+        self.stop_recording();
         crate::audio::release(self.audio_id);
         self.task.abort();
     }
@@ -93,6 +117,7 @@ impl Drop for StreamHandle {
 pub struct FrameSink {
     slot: Arc<Mutex<Slot>>,
     pub audio_id: u64,
+    pub recorder: crate::relay::LiveRecorder,
     pub frames: u64,
     window_start: Instant,
     window_frames: u32,
@@ -108,7 +133,15 @@ impl FrameSink {
     }
 
     pub(crate) fn with_audio(slot: Arc<Mutex<Slot>>, audio_id: u64) -> Self {
-        Self { slot, audio_id, frames: 0, window_start: Instant::now(), window_frames: 0, first_frame: None }
+        Self::with_audio_and_recorder(slot, audio_id, Arc::new(Mutex::new(None)))
+    }
+
+    pub(crate) fn with_audio_and_recorder(
+        slot: Arc<Mutex<Slot>>,
+        audio_id: u64,
+        recorder: crate::relay::LiveRecorder,
+    ) -> Self {
+        Self { slot, audio_id, recorder, frames: 0, window_start: Instant::now(), window_frames: 0, first_frame: None }
     }
 
     /// Logs how long the next frame takes to come, from `started`.
