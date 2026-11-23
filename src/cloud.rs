@@ -205,6 +205,17 @@ impl Clip {
     }
 }
 
+/// Something a camera detected, from the hub's event list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detection {
+    pub start: i64,
+    pub end: i64,
+    /// What it was (`alarm_type`); see [`clip_kind`].
+    pub kind: i64,
+    /// Everything detected meanwhile (`events_1`, a bit per kind).
+    pub kinds: Vec<i64>,
+}
+
 /// Whether a `SMART.TAPOHUB` model stores camera video (the H500 HomeBase and
 /// the H200), unlike the smart-home hubs (H100, H110).
 pub fn is_camera_hub(model: &str) -> bool {
@@ -856,6 +867,51 @@ impl CloudClient {
         Ok(days)
     }
 
+    /// What the camera detected between `start` and `end` (Unix seconds, at
+    /// most a day), oldest first. This is the camera's own event search with
+    /// the hub's `child_device_id`; hubs that answer otherwise give an error
+    /// (logged with their answer).
+    pub async fn hub_detections(&self, hub: &CloudCamera, camera_id: &str, start: i64, end: i64) -> Result<Vec<Detection>> {
+        const PAGE: i64 = 100;
+        let mut found = Vec::new();
+        let mut index = 0;
+        while index <= 12288 {
+            let request = json!({
+                "method": "searchDetectionList",
+                "params": { "playback": { "search_detection_list": {
+                    "channel": 0,
+                    "start_time": start,
+                    "end_time": end,
+                    "start_index": index,
+                    "end_index": index + PAGE - 1,
+                    "child_device_id": camera_id,
+                } } },
+            });
+            let responses = self.camera_requests(hub, vec![request]).await?;
+            let result = match first_result(&responses, "searchDetectionList") {
+                Ok(r) => r,
+                Err(e) => {
+                    log::info!("searchDetectionList: {e}; the hub said {}", Value::Array(responses));
+                    return Err(e);
+                }
+            };
+            let page = parse_detections(&result);
+            if index == 0 && page.is_empty() {
+                log::info!("searchDetectionList found nothing; the hub said {result}");
+            }
+            let more = result.pointer("/playback/to_be_continued").and_then(int_value) == Some(1)
+                || page.len() as i64 >= PAGE;
+            found.extend(page);
+            if !more {
+                break;
+            }
+            index += PAGE;
+        }
+        found.sort_by_key(|d| d.start);
+        found.dedup();
+        Ok(found)
+    }
+
     /// The id the hub knows this account by, which its playback requests
     /// carry as `client_id`.
     pub async fn hub_user_id(&self, hub: &CloudCamera) -> Result<i64> {
@@ -1035,6 +1091,25 @@ fn parse_clips(result: &Value) -> Vec<Clip> {
             let end = time(e, ["endTime", "end_time"])?;
             let kind = e.get("video_type").and_then(int_value).unwrap_or(0);
             (end > start).then_some(Clip { start, end, kind })
+        })
+        .collect()
+}
+
+/// `playback.search_detection_list` of `searchDetectionList`: a plain list,
+/// or wrapped like the other hub lists.
+fn parse_detections(result: &Value) -> Vec<Detection> {
+    let list = result.pointer("/playback/search_detection_list");
+    let plain = list.and_then(Value::as_array).into_iter().flatten().filter(|e| e.get("start_time").is_some());
+    let wrapped = section_entries(list).filter(|e| e.get("start_time").is_some());
+    plain
+        .chain(wrapped)
+        .filter_map(|e| {
+            let start = e.get("start_time").and_then(int_value)?;
+            let end = e.get("end_time").and_then(int_value).unwrap_or(start);
+            let kind = e.get("alarm_type").and_then(int_value).unwrap_or(0);
+            let mask = e.get("events_1").and_then(int_value).unwrap_or(0);
+            let kinds = (0..63).filter(|bit| mask & (1 << bit) != 0).map(|bit| bit + 1).collect();
+            Some(Detection { start, end: end.max(start), kind, kinds })
         })
         .collect()
 }
@@ -1309,6 +1384,18 @@ mod tests {
         assert_eq!(clip_kind(2), "Motion");
         assert_eq!(clip_kind(99), "Event 99");
         assert!(parse_clips(&json!({"playback": {}})).is_empty());
+    }
+
+    #[test]
+    fn hub_detections() {
+        let result = json!({"playback": {"search_detection_list": [
+            {"alarm_type": 6, "start_time": 1792786149, "end_time": 1792786217, "events_1": 34}
+        ], "to_be_continued": 0}});
+        assert_eq!(parse_detections(&result), vec![Detection { start: 1792786149, end: 1792786217, kind: 6, kinds: vec![2, 6] }]);
+        let wrapped = json!({"playback": {"search_detection_list": [
+            {"search_detection_list_1": {"alarm_type": "2", "start_time": "10", "end_time": "12"}}
+        ]}});
+        assert_eq!(parse_detections(&wrapped), vec![Detection { start: 10, end: 12, kind: 2, kinds: vec![] }]);
     }
 
     #[test]

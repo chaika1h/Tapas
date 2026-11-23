@@ -22,6 +22,8 @@
 //! uses are tried in turn, ending with its real-time playback; whichever
 //! works is used first after that.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +47,17 @@ const HEARTBEAT: Duration = Duration::from_secs(15);
 const IDLE: Duration = Duration::from_secs(30);
 /// Quiet this long once nearly all of the clip has come means it's over.
 const END_QUIET: Duration = Duration::from_secs(3);
+
+/// A piece of the recording as the hub sent it.
+pub struct Media<'a> {
+    pub data: &'a [u8],
+    /// The hub's wall-clock time for this piece (`X-Data-Pts`), in ms.
+    pub pts_ms: Option<i64>,
+    /// The piece starts a keyframe (`X-If-Iframe`).
+    pub key: bool,
+}
+
+pub type MediaSink<'a> = dyn FnMut(Media<'_>) -> Result<()> + Send + 'a;
 
 /// Which recording to fetch.
 #[derive(Clone)]
@@ -88,7 +101,7 @@ impl std::error::Error for NoVideo {}
 pub async fn download(
     client: &CloudClient,
     request: &ClipRequest,
-    media: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    media: &mut MediaSink<'_>,
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Progress> {
     let known = WORKING.load(Ordering::Relaxed);
@@ -122,7 +135,7 @@ async fn attempt(
     client: &CloudClient,
     request: &ClipRequest,
     method: ClipStream,
-    media: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    media: &mut MediaSink<'_>,
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Progress> {
     let (first_request, window) = match method {
@@ -242,6 +255,44 @@ fn playback_request(seq: u32, request: &ClipRequest, client_id: i64) -> Value {
     })
 }
 
+/// Downloads a recording to `path`, through `partial` (see [`partial_path`]),
+/// which is renamed once the hub has sent all of it.
+pub async fn save_clip(
+    client: &CloudClient,
+    request: &ClipRequest,
+    path: &Path,
+    partial: &Path,
+    progress: &mut (dyn FnMut(Progress) + Send),
+) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("Could not create {}", dir.display()))?;
+    }
+    let file = std::fs::File::create(partial).with_context(|| format!("Could not create {}", partial.display()))?;
+    let mut file = std::io::BufWriter::new(file);
+    let mut media = |m: Media<'_>| -> Result<()> {
+        file.write_all(m.data)?;
+        Ok(())
+    };
+    let result = download(client, request, &mut media, progress).await;
+    let result = result.and_then(|_| {
+        file.flush()?;
+        drop(file);
+        std::fs::rename(partial, path).with_context(|| format!("Could not save {}", path.display()))?;
+        Ok(())
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(partial);
+    }
+    result
+}
+
+/// A download's own file until it's complete, so two downloads of a clip
+/// don't share one.
+pub fn partial_path(path: &Path) -> PathBuf {
+    let tag = &uuid::Uuid::new_v4().simple().to_string()[..8];
+    path.with_extension(format!("ts.{tag}.part"))
+}
+
 /// The first client part: which clip, from which camera.
 fn download_request(seq: u32, request: &ClipRequest) -> Value {
     json!({
@@ -326,7 +377,7 @@ struct Download {
 
 impl Download {
     /// Returns `true` once the hub has sent the whole clip.
-    fn handle(&mut self, part: Part, media: &mut (dyn FnMut(&[u8]) -> Result<()> + Send)) -> Result<bool> {
+    fn handle(&mut self, part: Part, media: &mut MediaSink<'_>) -> Result<bool> {
         if part.is_json() {
             return self.control(&part);
         }
@@ -340,7 +391,9 @@ impl Download {
         if self.got.bytes == 0 {
             log::info!("clip: first media part, headers {:?}", part.headers);
         }
-        media(&part.body).context("Could not save the recording")?;
+        let pts_ms = part.header("x-data-pts").and_then(|v| v.trim().parse::<i64>().ok());
+        let key = part.header("x-if-iframe") == Some("1");
+        media(Media { data: &part.body, pts_ms, key }).context("Could not use the recording")?;
         self.got.bytes += part.body.len() as u64;
         self.clock.feed(&part.body);
         self.got.seconds = self.clock.seconds();
@@ -539,8 +592,8 @@ mod tests {
         };
         let saved = Arc::new(Mutex::new(Vec::new()));
         let sink = saved.clone();
-        let mut media = move |b: &[u8]| -> Result<()> {
-            sink.lock().unwrap().extend_from_slice(b);
+        let mut media = move |m: Media<'_>| -> Result<()> {
+            sink.lock().unwrap().extend_from_slice(m.data);
             Ok(())
         };
         assert!(!d.handle(json_part(r#"{"type":"response","seq":1,"params":{"error_code":0,"session_id":"42"}}"#), &mut media).unwrap());
@@ -560,7 +613,7 @@ mod tests {
     fn refusals_and_encryption_are_errors() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut d = Download { tx, session: Arc::default(), clock: TsClock::default(), got: Progress::default(), last_sequence: None };
-        let mut media = |_: &[u8]| -> Result<()> { Ok(()) };
+        let mut media = |_: Media<'_>| -> Result<()> { Ok(()) };
         let e = d.handle(json_part(r#"{"type":"response","seq":1,"params":{"error_code":-40210}}"#), &mut media).unwrap_err();
         assert!(e.to_string().contains("-40210"));
         let mut encrypted = media_part(1, b"x");

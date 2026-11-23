@@ -11,8 +11,9 @@ app login, like the Tapo app.
 - **Camera view**: the video with Take Photo, Pan & Tilt (pad and presets; arrow keys work too),
   Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
 - **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
-- **Playback from anywhere**: the H500's recordings of each camera, by day, played in the app
-  through the cloud and saved to `Videos\TapoViewer` as they play.
+- **Playback from anywhere**: the H500's recordings of each camera along a day timeline, like the
+  Tapo app: click or drag to any moment, 1× to 16×, pause, detected events, a month calendar.
+  Recordings stream through the cloud; ↓ saves one to `Videos\TapoViewer`.
 - **Snapshots** to `Pictures\TapoViewer`.
 - **Light or dark**, or the same as Windows (*Settings › Video & display*).
 - **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
@@ -65,14 +66,20 @@ when it's turned off. **Playback & Download** opens that camera's recordings on 
 ### Playback
 
 **Playback** (in the sidebar, on the H500's Home card, or *Playback & Download* in a camera view)
-shows the recordings the H500 holds. Pick the camera, then the day: the week strip marks the days
-with recordings, and the arrows go a day back or forward. Click a recording to play it in the app.
-It comes from the hub through the cloud, the way the Tapo app plays recordings away from home,
-and is saved to `Videos\TapoViewer` while it plays, so playing it again (or *Open file*) uses the
-saved copy. The ↓ button saves a recording without playing it.
+shows what the H500 recorded. Pick the camera and a day in the calendar (days with recordings have
+a dot). The timeline under the video shows the day: recordings in blue, detected events in amber.
 
-Days follow this PC's time zone. Downloading usually runs faster than playback; the picture is
-paced to real time. There's no seeking yet: to jump around in a recording, open the saved file.
+- **Click the timeline** (or an event or recording in the list) to watch from there. Playback runs
+  on through the day's recordings, skipping the gaps between them.
+- **Drag** the timeline to move along it, **scroll** (or ＋/－) to zoom from the whole day down to
+  five minutes. While playing, it follows the picture.
+- **1× 2× 4× 8× 16×** change the speed; from 8× only keyframes are shown, about one every
+  second or two of recording. Click the picture (or ❚❚) to pause.
+- **Take photo** saves the picture shown to `Pictures\TapoViewer`; **↓** on an event or recording
+  saves it to `Videos\TapoViewer`.
+
+Watching keeps nothing on disk: the recording comes from the hub through the cloud a couple of
+minutes at a time, shortly before it's needed. Days follow this PC's time zone.
 
 ### About the cloud
 
@@ -82,7 +89,9 @@ projects (see `src/cloud.rs` and `src/relay.rs`). TP-Link can change it at any t
 stops working after a Tapo app update, the protocol has probably changed (see *Troubleshooting*).
 Cameras that send encrypted video through the cloud aren't supported yet; their tile says so.
 
-Playback asks the cloud for a relay to the hub naming the camera, as the Tapo app does, and then
+The day's recordings, events and calendar come from the hub's own searches (`searchVideoWithUTC`,
+`searchDetectionList`, `searchDateWithVideo` a month at a time). Playback asks the cloud for a relay
+to the hub naming the camera, as the Tapo app does, and then
 has the conversation the hub has on its local media port (request, acknowledgements every 25
 parts, heartbeats, stop), ported from the MIT-licensed
 [`tapo`](https://github.com/mihai-dinculescu/tapo) crate (see `src/clip.rs`). The Tapo app has
@@ -90,7 +99,8 @@ several kinds of relay for recordings, and an H500 accepts its "cover" download 
 so Tapo Viewer tries the "video" download, then the real-time playback stream, then "cover", and
 uses the one that brought video first from then on. Every session is ended (stop, connection
 closed) however the playback ends, as a hub serves only a few at a time. The log has the details
-of every step.
+of every step. The picture is decoded by ffmpeg, whose `showinfo` filter gives each frame's time,
+so frames are shown at their recorded time divided by the speed.
 
 ## Rendering on Windows
 
@@ -170,7 +180,8 @@ TAPO_VIEWER_FAKE_CLOUD=https://127.0.0.1:8443 TAPO_VIEWER_FAKE_CLOUD_CA=target/f
 
 Sign in with any email and the password `secret`. "Back yard" is reported offline; "Front door"
 has pan/tilt and "Garage" hasn't. The H500 "HomeBase" has recordings of "Front door" (today,
-yesterday and three days ago) and "Garage" (today). Like a real hub it serves only two downloads
+yesterday and three days ago, including six minutes of continuous recording at 10:00 with
+detected events) and "Garage" (today); the recorded time is written on the picture. Like a real hub it serves only two downloads
 at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
 open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output. Like an H500
 it sends nothing for the "cover" download; `--clip-path video|playback|none` picks which other way

@@ -80,7 +80,54 @@ HUB_CAMERAS = [
 # Days ago with recordings, per camera, and the clips of such a day:
 # (hour, minute, seconds long, video_type).
 RECORDED_DAYS = {"FAKE0001": [0, 1, 3], "FAKE0002": [0]}
-DAY_CLIPS = [(0, 5, 12, 2), (8, 2, 25, 6), (9, 41, 18, 2), (12, 15, 40, 8), (15, 33, 20, 6), (18, 7, 30, 9), (21, 48, 15, 2)]
+DAY_CLIPS = [(0, 5, 12, 2), (8, 2, 25, 6), (9, 41, 18, 2), (10, 0, 360, 1), (12, 15, 40, 8), (15, 33, 20, 6),
+             (18, 7, 30, 9), (21, 48, 15, 2)]
+# What "Front door" detected, besides its event recordings: (hour, minute,
+# seconds long, alarm_type), inside the continuous recording at 10:00. The
+# other cameras' hubs don't list detections.
+DETECTIONS = {"FAKE0001": [(10, 1, 20, 6), (10, 3, 15, 8)]}
+FONT = next((f for f in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",) if Path(f).exists()), None)
+
+
+def detections_for(camera, start, end):
+    """The fake detections of `camera` within start..end: the event
+    recordings, and DETECTIONS."""
+    today = datetime.date.today()
+    found = [(a, b, k) for a, b, k in clips_for(camera, start, end) if k != 1]
+    if camera in DETECTIONS:
+        for ago in RECORDED_DAYS.get(camera, []):
+            day = today - datetime.timedelta(days=ago)
+            for hour, minute, length, kind in DETECTIONS[camera]:
+                t = int(datetime.datetime(day.year, day.month, day.day, hour, minute).timestamp())
+                if start <= t <= end and t + length < time.time():
+                    found.append((t, t + length, kind))
+    return sorted(found)
+
+
+def frame_pieces(ts, start_ms):
+    """Splits MPEG-TS into a piece per video frame, as the H500 sends them:
+    (data, wall-clock ms of the frame, keyframe?)."""
+    pieces, current, meta, first = [], bytearray(), None, None
+    for i in range(0, len(ts) - 187, 188):
+        packet = ts[i:i + 188]
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        if pid == 0x100 and packet[1] & 0x40:
+            if current and meta:
+                pieces.append((bytes(current), *meta))
+                current = bytearray()
+            offset, key = 4, False
+            if (packet[3] >> 4) & 2:
+                length = packet[4]
+                key = length > 0 and bool(packet[5] & 0x40)
+                offset = 5 + length
+            pes = packet[offset:]
+            pts = (((pes[9] >> 1) & 7) << 30) | (pes[10] << 22) | ((pes[11] >> 1) << 15) | (pes[12] << 7) | (pes[13] >> 1)
+            first = pts if first is None else first
+            meta = (start_ms + (pts - first) // 90, key)
+        current += packet
+    if current and meta:
+        pieces.append((bytes(current), *meta))
+    return pieces
 
 
 def clips_for(camera, start, end):
@@ -284,7 +331,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def hub_method(self, method, params):
         result, code = {}, 0
-        if method == "getUserID":
+        if method == "searchDetectionList":
+            query = params.get("playback", {}).get("search_detection_list", {})
+            camera = query.get("child_device_id")
+            if camera not in DETECTIONS:
+                code = -40106
+            else:
+                found = detections_for(camera, int(query["start_time"]), int(query["end_time"]))
+                page = found[int(query["start_index"]):int(query["end_index"]) + 1]
+                result = {"playback": {"search_detection_list": [
+                    {"alarm_type": k, "start_time": a, "end_time": b, "events_1": (1 << (k - 1)) | 2} for a, b, k in page],
+                    "to_be_continued": int(int(query["end_index"]) + 1 < len(found))}}
+        elif method == "getUserID":
             result = {"user_id": "7"}
         elif method == "getGeneralDeviceList":
             result = {"general_camera_manage": {"max_bound": 4, "paired_general_device_list": HUB_CAMERAS}}
@@ -501,16 +559,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         playback = stream[0] == 1
         pattern = PATTERNS.get(camera, "testsrc")
+        # The recorded time on the picture, like a camera's overlay.
+        clock = (f",drawtext=fontfile={FONT}:text='%{{pts\\:localtime\\:{start}}}':x=24:y=24:fontsize=40"
+                 ":fontcolor=white:box=1:boxcolor=black@0.6" if FONT else "")
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", f"{pattern}=size=1280x720:rate=15:duration={end - start}",
+               "-f", "lavfi", "-i", f"{pattern}=size=960x540:rate=15:duration={end - start}{clock}",
                "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-pix_fmt", "yuv420p", "-f", "mpegts", "pipe:1"]
         ts = subprocess.run(cmd, capture_output=True, check=True).stdout
-        chunks = [ts[i:i + 4 * 1316] for i in range(0, len(ts), 4 * 1316)]
+        chunks = frame_pieces(ts, start * 1000)
         # --slow-clips: send in real time, like a hub on a slow uplink.
         pace = (end - start) / len(chunks) if self.state.args.slow_clips or playback else 0
         acked, heartbeats = 0, 0
         try:
-            for seq, chunk in enumerate(chunks, 1):
+            for seq, (chunk, pts_ms, key) in enumerate(chunks, 1):
                 while seq - acked > 50:  # the window: wait for the client's acknowledgement
                     part = self.read_client_part()
                     if part is None:
@@ -528,13 +589,15 @@ class Handler(BaseHTTPRequestHandler):
                     elif message.get("params", {}).get("method") == "do":
                         print("  clip: client stopped early", flush=True)
                         return
-                self.send_part("video/mp2t", chunk, f"X-Data-Sequence: {seq}\r\nX-If-Encrypt: 0\r\n")
+                self.send_part("video/mp2t", chunk, f"X-Session-Id: 42\r\nX-If-Encrypt: 0\r\nX-If-Iframe: {int(key)}\r\n"
+                                                    f"X-Data-Sequence: {seq}\r\nX-Data-Pts: {pts_ms}\r\n")
                 if pace:
                     time.sleep(pace)
             if not playback:  # playback just goes quiet at the end
                 done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
                 self.send_part("application/json", json.dumps(done).encode())
-            print(f"  clip: sent {len(chunks)} parts, {len(ts)} bytes; acknowledged up to {acked}", flush=True)
+            print(f"  clip: sent {len(chunks)} parts ({sum(1 for c in chunks if c[2])} keyframes), {len(ts)} bytes; "
+                  f"acknowledged up to {acked}", flush=True)
             while (part := self.read_client_part()) is not None:
                 if part[1].get("params", {}).get("method") == "do":
                     print("  clip: client said stop", flush=True)

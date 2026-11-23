@@ -1,0 +1,478 @@
+//! Watching a camera's recordings on its hub along the day, like the Tapo
+//! app's playback: from any moment, on through the day's recordings, at 1× to
+//! 16×, with pause.
+//!
+//! The video comes through the cloud in windows of two minutes (see
+//! [`crate::clip`]), each fetched shortly before the picture needs it and
+//! kept only in memory. Each recording is decoded by its own ffmpeg, whose
+//! `showinfo` timestamps say when each frame was recorded; frames are shown
+//! at that time divided by the speed. Nothing is written to disk.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::Result;
+use slint::SharedPixelBuffer;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+use crate::clip::{self, ClipRequest, Media};
+use crate::cloud::{Clip, CloudCamera, CloudClient, CloudError, HubCamera};
+use crate::ffmpeg::Decoder;
+use crate::stream::{Frame, FrameSink, Slot, Status};
+
+pub const SPEEDS: [u32; 5] = [1, 2, 4, 8, 16];
+/// From this speed only keyframes are decoded: decoding every frame eight
+/// times faster than real time is too much for many PCs.
+const KEYFRAMES_FROM: u32 = 8;
+/// Seconds of recording fetched at a time.
+const WINDOW: i64 = 120;
+/// The next window is fetched when less than this many seconds (times the
+/// speed) are left to show.
+const AHEAD: i64 = 45;
+const WIDTH: usize = 1280;
+const HEIGHT: usize = 720;
+
+/// What to play: a camera's recordings on a hub, for one day.
+#[derive(Clone)]
+pub struct Source {
+    pub client: Arc<CloudClient>,
+    pub hub: CloudCamera,
+    pub camera: HubCamera,
+    pub player_id: String,
+    /// The day's recordings, in any order.
+    pub segments: Vec<Clip>,
+    pub ffmpeg: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlayState {
+    /// When the picture shown was recorded (Unix ms).
+    pub position_ms: i64,
+    pub paused: bool,
+    pub speed: u32,
+    /// Waiting for video.
+    pub buffering: bool,
+    /// Why playback stopped, if it did.
+    pub message: String,
+    /// Past the day's last recording.
+    pub ended: bool,
+}
+
+enum Cmd {
+    Seek(i64),
+    Pause(bool),
+    Speed(u32),
+}
+
+pub struct Playback {
+    pub slot: Arc<Mutex<Slot>>,
+    pub state: Arc<Mutex<PlayState>>,
+    cmds: mpsc::UnboundedSender<Cmd>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Playback {
+    pub fn start(rt: &tokio::runtime::Handle, source: Source, at_ms: i64, speed: u32) -> Self {
+        let slot = Arc::new(Mutex::new(Slot { frame: None, version: 0, status: Status::Connecting, fps: 0.0 }));
+        let state = Arc::new(Mutex::new(PlayState { position_ms: at_ms, speed, buffering: true, ..Default::default() }));
+        let (cmds, rx) = mpsc::unbounded_channel();
+        let mut segments = source.segments.clone();
+        segments.sort_by_key(|c| c.start);
+        let source = Source { segments, ..source };
+        let task = rt.spawn(run(source, FrameSink::new(slot.clone()), state.clone(), rx, at_ms));
+        Self { slot, state, cmds, task }
+    }
+
+    pub fn seek(&self, at_ms: i64) {
+        let _ = self.cmds.send(Cmd::Seek(at_ms));
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        let _ = self.cmds.send(Cmd::Pause(paused));
+    }
+
+    pub fn set_speed(&self, speed: u32) {
+        let _ = self.cmds.send(Cmd::Speed(speed));
+    }
+
+    pub fn latest_frame(&self) -> Option<Frame> {
+        self.slot.lock().unwrap().frame.clone()
+    }
+}
+
+impl Drop for Playback {
+    fn drop(&mut self) {
+        // Dropping the task ends any download through its session guard.
+        self.task.abort();
+    }
+}
+
+/// The recording that `at_ms` falls in, or else the next one.
+fn segment_at(segments: &[Clip], at_ms: i64) -> Option<Clip> {
+    segments.iter().find(|c| c.end * 1000 > at_ms).copied()
+}
+
+/// How playing a recording ended.
+enum Outcome {
+    /// It got to the end.
+    Ended,
+    Seek(i64),
+    /// Start again from the position (the decoding mode changed).
+    Restart,
+    Failed(String),
+}
+
+async fn run(source: Source, mut sink: FrameSink, state: Arc<Mutex<PlayState>>, mut cmds: mpsc::UnboundedReceiver<Cmd>, mut at: i64) {
+    loop {
+        let Some(segment) = segment_at(&source.segments, at) else {
+            {
+                let mut s = state.lock().unwrap();
+                s.ended = true;
+                s.buffering = false;
+                s.message = "No more recordings on this day".into();
+            }
+            match wait_for_seek(&mut cmds, &state).await {
+                Some(t) => {
+                    at = t;
+                    continue;
+                }
+                None => return,
+            }
+        };
+        let from = at.max(segment.start * 1000);
+        {
+            let mut s = state.lock().unwrap();
+            s.position_ms = from;
+            s.ended = false;
+            s.buffering = true;
+            s.message.clear();
+        }
+        match play_segment(&source, segment, from, &mut sink, &state, &mut cmds).await {
+            Outcome::Ended => at = segment.end * 1000,
+            Outcome::Seek(t) => at = t,
+            Outcome::Restart => at = state.lock().unwrap().position_ms,
+            Outcome::Failed(message) => {
+                log::warn!("playback: {message}");
+                if message.contains("expired") {
+                    crate::app::on_ui(|app| app.cloud_auth_failed());
+                }
+                {
+                    let mut s = state.lock().unwrap();
+                    s.buffering = false;
+                    s.message = message;
+                }
+                match wait_for_seek(&mut cmds, &state).await {
+                    Some(t) => at = t,
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
+/// Handles commands until a seek (or the player going away).
+async fn wait_for_seek(cmds: &mut mpsc::UnboundedReceiver<Cmd>, state: &Mutex<PlayState>) -> Option<i64> {
+    loop {
+        match cmds.recv().await? {
+            Cmd::Seek(t) => return Some(t),
+            Cmd::Pause(p) => state.lock().unwrap().paused = p,
+            Cmd::Speed(s) => state.lock().unwrap().speed = s,
+        }
+    }
+}
+
+/// Plays one recording from `from_ms` until it ends or a command says
+/// otherwise.
+async fn play_segment(
+    source: &Source,
+    segment: Clip,
+    from_ms: i64,
+    sink: &mut FrameSink,
+    state: &Arc<Mutex<PlayState>>,
+    cmds: &mut mpsc::UnboundedReceiver<Cmd>,
+) -> Outcome {
+    let keyframes = state.lock().unwrap().speed >= KEYFRAMES_FROM;
+    let mut input = vec!["-f", "mpegts", "-i", "pipe:0"];
+    if keyframes {
+        input.splice(0..0, ["-skip_frame", "nokey"]);
+    }
+    let mut decoder = match Decoder::spawn_timed(&source.ffmpeg, &input, WIDTH, HEIGHT) {
+        Ok(d) => d,
+        Err(e) => return Outcome::Failed(format!("{e:#}")),
+    };
+    let stdin = decoder.stdin.take();
+    let times = decoder.times.take();
+
+    // Fetching (and feeding ffmpeg) runs beside the frame loop.
+    let anchor = Arc::new(Mutex::new(None::<i64>)); // the first keyframe's recorded time
+    let fetch_error = Arc::new(Mutex::new(None::<String>));
+    let fetching = tokio::spawn(fetch_and_feed(
+        source.clone(),
+        segment,
+        from_ms,
+        stdin,
+        state.clone(),
+        anchor.clone(),
+        fetch_error.clone(),
+    ));
+    let _stop_fetching = AbortOnDrop(fetching);
+
+    // Frames come off ffmpeg in a task of their own, so a command never
+    // interrupts a read half-way through a frame.
+    let (frames_tx, mut frames) = mpsc::channel::<(Frame, f64)>(2);
+    let reading = tokio::spawn(read_frames(decoder, times, frames_tx));
+    let _stop_reading = AbortOnDrop(reading);
+
+    let mut first_time: Option<f64> = None;
+    // (when, recorded ms) of the frame the pacing is measured from.
+    let mut pace: Option<(Instant, i64)> = None;
+    let mut last_shown = from_ms;
+    let mut last_display = Instant::now();
+    let (mut got, mut shown, mut report) = (0u32, 0u32, Instant::now());
+    loop {
+        if report.elapsed() >= Duration::from_secs(1) {
+            log::debug!("playback: {got} frames in, {shown} shown, at {last_shown}, {} queued", frames.len());
+            (got, shown, report) = (0, 0, Instant::now());
+        }
+        // The next frame, handling commands meanwhile.
+        let (frame, t) = loop {
+            tokio::select! {
+                next = frames.recv() => match next {
+                    Some(f) => break f,
+                    None => {
+                        let error = fetch_error.lock().unwrap().take();
+                        return match error {
+                            Some(e) => Outcome::Failed(e),
+                            None => Outcome::Ended,
+                        };
+                    }
+                },
+                cmd = cmds.recv() => match cmd {
+                    None => return Outcome::Failed(String::new()),
+                    Some(Cmd::Seek(t)) => return Outcome::Seek(t),
+                    Some(Cmd::Pause(p)) => {
+                        state.lock().unwrap().paused = p;
+                        pace = None;
+                    }
+                    Some(Cmd::Speed(s)) => {
+                        state.lock().unwrap().speed = s;
+                        if (s >= KEYFRAMES_FROM) != keyframes {
+                            return Outcome::Restart;
+                        }
+                        pace = None;
+                    }
+                },
+                _ = tokio::time::sleep(Duration::from_millis(700)) => {
+                    state.lock().unwrap().buffering = true;
+                }
+            }
+        };
+        got += 1;
+        let t0 = *first_time.get_or_insert(t);
+        let base = anchor.lock().unwrap().unwrap_or(from_ms);
+        let recorded = base + ((t - t0) * 1000.0).round() as i64;
+        if recorded < from_ms - 500 {
+            continue; // before the moment asked for (the hub starts at a keyframe)
+        }
+        state.lock().unwrap().buffering = false;
+
+        // Wait for the frame's moment, or while paused.
+        loop {
+            let (paused, speed) = {
+                let s = state.lock().unwrap();
+                (s.paused, s.speed.max(1))
+            };
+            let wait = if paused {
+                None
+            } else {
+                let (since, at) = *pace.get_or_insert((Instant::now(), last_shown));
+                let due = since + Duration::from_millis(((recorded - at).max(0) as f64 / speed as f64) as u64);
+                if Instant::now() >= due {
+                    break;
+                }
+                Some(due)
+            };
+            tokio::select! {
+                _ = async {
+                    match wait {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending().await,
+                    }
+                } => break,
+                cmd = cmds.recv() => match cmd {
+                    None => return Outcome::Failed(String::new()),
+                    Some(Cmd::Seek(t)) => return Outcome::Seek(t),
+                    Some(Cmd::Pause(p)) => {
+                        state.lock().unwrap().paused = p;
+                        pace = None;
+                    }
+                    Some(Cmd::Speed(s)) => {
+                        state.lock().unwrap().speed = s;
+                        if (s >= KEYFRAMES_FROM) != keyframes {
+                            return Outcome::Restart;
+                        }
+                        pace = None;
+                    }
+                },
+            }
+        }
+        // Behind (a slow PC at high speed): skip frames rather than fall
+        // further behind, but keep the picture moving.
+        let late = pace.is_some_and(|(since, at)| {
+            let speed = state.lock().unwrap().speed.max(1) as f64;
+            let due = since + Duration::from_millis(((recorded - at).max(0) as f64 / speed) as u64);
+            Instant::now() > due + Duration::from_millis(300)
+        });
+        last_shown = recorded;
+        state.lock().unwrap().position_ms = recorded;
+        if late && last_display.elapsed() < Duration::from_millis(100) {
+            continue;
+        }
+        last_display = Instant::now();
+        shown += 1;
+        sink.push(frame);
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn read_frames(
+    mut decoder: Decoder,
+    times: Option<mpsc::UnboundedReceiver<f64>>,
+    frames: mpsc::Sender<(Frame, f64)>,
+) {
+    let Some(mut times) = times else { return };
+    let (w, h) = (decoder.width, decoder.height);
+    let mut buf = vec![0u8; w * h * 3];
+    let mut last = 0.0;
+    loop {
+        if decoder.stdout.read_exact(&mut buf).await.is_err() {
+            let error = decoder.last_error.lock().unwrap().clone();
+            if !error.is_empty() {
+                log::warn!("playback: ffmpeg: {error}");
+            }
+            return;
+        }
+        // showinfo reports a frame as it passes, before it's written out.
+        let t = match tokio::time::timeout(Duration::from_secs(2), times.recv()).await {
+            Ok(Some(t)) => t,
+            _ => last + 1.0 / 15.0,
+        };
+        last = t;
+        let frame = SharedPixelBuffer::clone_from_slice(&buf, w as u32, h as u32);
+        if frames.send((frame, t)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Fetches the recording from `from_ms` to its end, window by window, a
+/// little ahead of the picture, and feeds it to ffmpeg.
+async fn fetch_and_feed(
+    source: Source,
+    segment: Clip,
+    from_ms: i64,
+    stdin: Option<tokio::process::ChildStdin>,
+    state: Arc<Mutex<PlayState>>,
+    anchor: Arc<Mutex<Option<i64>>>,
+    error: Arc<Mutex<Option<String>>>,
+) {
+    let Some(mut stdin) = stdin else { return };
+    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let feeding = async move {
+        while let Some(piece) = rx.recv().await {
+            if stdin.write_all(&piece).await.is_err() {
+                return;
+            }
+        }
+        // Closing stdin lets ffmpeg finish the recording.
+    };
+    let fetching = async move {
+        let mut start = from_ms / 1000;
+        // The newest piece passed on (i64::MIN: none yet). A window starts at
+        // a keyframe before the moment asked for, so at its start, pieces
+        // already passed on are skipped.
+        let newest = AtomicI64::new(i64::MIN);
+        let overlap = AtomicBool::new(false);
+        while start < segment.end {
+            let end = (start + WINDOW).min(segment.end);
+            let request = ClipRequest {
+                hub: source.hub.clone(),
+                camera: source.camera.clone(),
+                clip: Clip { start, end, kind: segment.kind },
+                player_id: source.player_id.clone(),
+            };
+            let mut media = |m: Media<'_>| -> Result<()> {
+                if let Some(pts) = m.pts_ms {
+                    let seen = newest.load(Ordering::Relaxed);
+                    if overlap.load(Ordering::Relaxed) && pts <= seen {
+                        return Ok(());
+                    }
+                    overlap.store(false, Ordering::Relaxed);
+                    newest.store(seen.max(pts), Ordering::Relaxed);
+                    if m.key {
+                        let mut a = anchor.lock().unwrap();
+                        if a.is_none() {
+                            *a = Some(pts);
+                        }
+                    }
+                }
+                let _ = tx.send(m.data.to_vec());
+                Ok(())
+            };
+            let mut progress = |_| {};
+            overlap.store(newest.load(Ordering::Relaxed) != i64::MIN, Ordering::Relaxed);
+            let mut result = clip::download(&source.client, &request, &mut media, &mut progress).await;
+            if let Err(e) = &result
+                && !e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth)
+            {
+                log::warn!("playback: fetching {start}..{end} failed ({e:#}); trying again");
+                overlap.store(newest.load(Ordering::Relaxed) != i64::MIN, Ordering::Relaxed);
+                result = clip::download(&source.client, &request, &mut media, &mut progress).await;
+            }
+            if let Err(e) = result {
+                *error.lock().unwrap() = Some(format!("{e:#}"));
+                return;
+            }
+            start = end;
+            // Wait until the picture gets close to the end of what's fetched.
+            loop {
+                let (position, speed) = {
+                    let s = state.lock().unwrap();
+                    (s.position_ms, s.speed.max(1) as i64)
+                };
+                if start >= segment.end || position + AHEAD * 1000 * speed >= start * 1000 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        drop(tx);
+    };
+    tokio::join!(feeding, fetching);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_recording_to_play() {
+        let segments = [Clip { start: 100, end: 200, kind: 1 }, Clip { start: 300, end: 400, kind: 1 }];
+        assert_eq!(segment_at(&segments, 50_000).unwrap().start, 100);
+        assert_eq!(segment_at(&segments, 150_000).unwrap().start, 100);
+        // In a gap: the next one.
+        assert_eq!(segment_at(&segments, 250_000).unwrap().start, 300);
+        assert!(segment_at(&segments, 400_000).is_none());
+    }
+}
