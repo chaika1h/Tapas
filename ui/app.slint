@@ -1,6 +1,6 @@
 import { AboutSlint, Button, LineEdit, ComboBox, CheckBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView, Switch } from "std-widgets.slint";
 
-export enum Page { home, live, single, recordings, settings }
+export enum Page { home, live, single, recordings, people, settings }
 
 export struct Tile {
     id: int,
@@ -52,8 +52,26 @@ export struct RecRow {
     duration: string,
     playing: bool,
     saved: bool,
+    selected: bool,
     thumb: image,
     has-thumb: bool,
+}
+export struct HourBar { hour: int, count: int, ratio: float, peak: bool }
+export struct FaceRow {
+    face-id: string,
+    name: string,
+    initial: string,
+    familiar: bool,
+    last-seen: string,
+    selected: bool,
+}
+export struct FaceTrackRow {
+    time: string,
+    camera: string,
+    clips: string,
+    face-name: string,
+    familiar: bool,
+    playable: bool,
 }
 export struct DayChip { day: string, has-video: bool, selected: bool, future: bool, in-month: bool }
 export struct TlSeg { x: float, w: float, event: bool }
@@ -263,6 +281,43 @@ export global Bridge {
     callback tl-zoom(float, float);
     callback tl-whole-day();
     callback open-file(string);
+    // 24-hour activity summary chart
+    in property <[HourBar]> hour-bars;
+    in property <string> hour-summary;
+    callback jump-hour(int);
+    // batch MP4 clip export
+    in-out property <bool> batch-mode;
+    in property <int> batch-selected-count;
+    in property <bool> batch-busy;
+    in property <string> batch-status;
+    callback batch-toggle-mode();
+    callback batch-toggle-row(int);
+    callback batch-select-all();
+    callback batch-clear();
+    callback batch-export();
+    callback batch-cancel();
+    // people / H500 facial recognition & cross-camera tracking
+    in property <[FaceRow]> faces;
+    in-out property <int> face-filter;
+    in property <[string]> face-filter-labels: ["All", "Familiar", "Stranger"];
+    in property <bool> faces-loading;
+    in property <string> faces-message;
+    in property <string> selected-face-id;
+    in property <string> selected-face-title;
+    in-out property <string> face-edit-name;
+    in-out property <bool> face-edit-familiar;
+    in property <bool> face-saving;
+    in property <string> face-track-date;
+    in property <bool> face-track-is-today;
+    in property <bool> face-track-loading;
+    in property <string> face-track-message;
+    in property <[FaceTrackRow]> face-tracks;
+    callback faces-refresh();
+    callback face-filter-changed(int);
+    callback face-select(string);
+    callback face-save();
+    callback face-track-day(int);
+    callback face-track-play(int);
     // updates
     in property <string> app-version;
     in property <string> update-status;
@@ -285,6 +340,7 @@ export global Tr {
     in-out property <string> nav-home: "Home";
     in-out property <string> nav-live: "Live view";
     in-out property <string> nav-playback: "Playback";
+    in-out property <string> nav-people: "People";
     in-out property <string> nav-settings: "Settings";
     in-out property <string> win-minimize: "Minimize";
     in-out property <string> win-maximize: "Maximize";
@@ -387,6 +443,26 @@ export global Tr {
     in-out property <string> saved-tooltip: "Saved";
     in-out property <string> save-to-videos: "Save to Videos";
     in-out property <[string]> weekdays: ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+    in-out property <string> activity-24h: "24h activity";
+    in-out property <string> batch-select: "Select";
+    in-out property <string> batch-done: "Done";
+    in-out property <string> batch-all: "All";
+    in-out property <string> batch-clear: "Clear";
+    in-out property <string> batch-export-prefix: "Export ";
+    in-out property <string> batch-export-suffix: " MP4";
+
+    // people / faces
+    in-out property <string> people-subtitle: "Recognized faces and cross-camera tracking on your H500 HomeBase.";
+    in-out property <string> people-all-option: "All people";
+    in-out property <string> people-familiar: "Familiar";
+    in-out property <string> people-stranger: "Stranger";
+    in-out property <string> people-edit-title: "Edit person";
+    in-out property <string> people-name-placeholder: "Enter name";
+    in-out property <string> people-mark-familiar: "Mark as familiar";
+    in-out property <string> people-timeline-title: "Cross-camera timeline";
+    in-out property <string> people-prev-day: "Previous day";
+    in-out property <string> people-next-day: "Next day";
+    in-out property <string> people-watch: "Watch";
 
     // settings
     in-out property <string> sec-account: "Tapo account";
@@ -904,6 +980,7 @@ global Icons {
     out property <string> power: "M 12 3.5 V 11.5 M 7.5 6.2 A 7 7 0 1 0 16.5 6.2";
     out property <string> trash: "M 4.5 7 H 19.5 M 9.5 7 V 4.5 H 14.5 V 7 M 6.5 7 L 7.5 19.5 H 16.5 L 17.5 7";
     out property <string> globe: "M 12 3 A 9 9 0 1 0 12.01 3 Z M 3.5 12 H 20.5 M 12 3 C 14.8 6 14.8 18 12 21 C 9.2 18 9.2 6 12 3";
+    out property <string> faces: "M 4 8 V 4 H 8 M 16 4 H 20 V 8 M 20 16 V 20 H 16 M 8 20 H 4 V 16 M 12 8 A 2.5 2.5 0 1 0 12.01 8 Z M 8 17.5 C 8 15 9.8 14 12 14 C 14.2 14 16 15 16 17.5";
 }
 
 component Icon inherits Path {
@@ -995,6 +1072,12 @@ component Sidebar inherits Rectangle {
             icon: Icons.playback;
             active: Bridge.page == Page.recordings;
             clicked => { Bridge.navigate(Page.recordings); }
+        }
+        if Bridge.hubs.length > 0: SideNavItem {
+            text: Tr.nav-people;
+            icon: Icons.faces;
+            active: Bridge.page == Page.people;
+            clicked => { Bridge.navigate(Page.people); }
         }
         SideNavItem {
             text: Tr.nav-settings;
@@ -2219,14 +2302,17 @@ component DayButton inherits Rectangle {
 }
 
 // A recording or detected event in the list (or an hour's heading): click
-// to watch from it; the arrow saves it.
+// to watch from it; the arrow saves it. In batch mode, clicking toggles selection.
 component ClipRow inherits Rectangle {
     in property <RecRow> rec;
+    in property <bool> batch-mode;
     callback play();
     callback save();
+    callback toggle-select();
     height: root.rec.header ? 34px : root.rec.has-thumb ? 74px : 54px;
     border-radius: 10px;
     background: root.rec.header ? transparent
+        : root.batch-mode && root.rec.selected ? Palette.accent-background.transparentize(0.84)
         : root.rec.playing ? Palette.accent-background.transparentize(0.85)
         : ta.has-hover ? Palette.foreground.transparentize(0.94) : transparent;
     if root.rec.header: Text {
@@ -2241,14 +2327,37 @@ component ClipRow inherits Rectangle {
     ta := TouchArea {
         enabled: !root.rec.header;
         mouse-cursor: pointer;
-        clicked => { root.play(); }
+        clicked => {
+            if (root.batch-mode) {
+                root.toggle-select();
+            } else {
+                root.play();
+            }
+        }
     }
     if !root.rec.header: HorizontalLayout {
         padding-left: 6px;
         padding-right: 4px;
         spacing: 10px;
+        if root.batch-mode: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                border-width: 1.5px;
+                border-color: root.rec.selected ? Palette.accent-background : Palette.foreground.transparentize(0.55);
+                background: root.rec.selected ? Palette.accent-background : transparent;
+                if root.rec.selected: Icon {
+                    width: 12px;
+                    height: 12px;
+                    commands: Icons.check;
+                    color: Palette.accent-foreground;
+                }
+            }
+        }
         if root.rec.has-thumb: Rectangle {
-            width: 112px;
+            width: root.batch-mode ? 96px : 112px;
             height: 63px;
             y: (parent.height - self.height) / 2;
             border-radius: 8px;
@@ -2305,7 +2414,7 @@ component ClipRow inherits Rectangle {
                 }
             }
         }
-        VerticalLayout {
+        if !root.batch-mode: VerticalLayout {
             alignment: center;
             RoundIconButton {
                 width: 32px;
@@ -2315,6 +2424,92 @@ component ClipRow inherits Rectangle {
                 base: transparent;
                 clicked => { root.save(); }
             }
+        }
+    }
+}
+
+// Clickable 24-hour activity sparkline above the Playback list: each bar is an
+// hour of the day; clicking a non-zero bar jumps straight to that hour.
+component ActivityChart inherits Rectangle {
+    in property <[HourBar]> bars;
+    in property <string> summary;
+    callback jump(int);
+    property <int> hover-hour: -1;
+    property <int> hover-count: 0;
+    height: 76px;
+    border-radius: 10px;
+    background: Palette.foreground.transparentize(0.955);
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 5px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: Tr.activity-24h;
+                font-size: 11px;
+                font-weight: 600;
+                color: Palette.foreground.transparentize(0.3);
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.hover-hour >= 0
+                    ? (root.hover-hour < 10 ? "0" : "") + root.hover-hour + ":00  ·  " + root.hover-count
+                    : root.summary;
+                font-size: 11px;
+                color: root.hover-hour >= 0 ? Palette.accent-background : Palette.foreground.transparentize(0.45);
+                font-weight: root.hover-hour >= 0 ? 600 : 400;
+            }
+        }
+        HorizontalLayout {
+            height: 32px;
+            spacing: 2px;
+            for bar in root.bars: Rectangle {
+                horizontal-stretch: 1;
+                background: transparent;
+                Rectangle {
+                    y: parent.height - self.height;
+                    width: parent.width;
+                    height: bar.count > 0 ? max(4px, parent.height * bar.ratio) : 2px;
+                    border-radius: 2px;
+                    background: bar.count == 0
+                        ? Palette.foreground.transparentize(0.88)
+                        : bta.has-hover ? Palette.accent-background
+                        : bar.peak ? Palette.accent-background.transparentize(0.1)
+                        : Palette.accent-background.transparentize(0.42);
+                }
+                bta := TouchArea {
+                    mouse-cursor: bar.count > 0 ? pointer : default;
+                    changed has-hover => {
+                        if (self.has-hover) {
+                            root.hover-hour = bar.hour;
+                            root.hover-count = bar.count;
+                        } else if (root.hover-hour == bar.hour) {
+                            root.hover-hour = -1;
+                        }
+                    }
+                    clicked => {
+                        if (bar.count > 0) {
+                            root.jump(bar.hour);
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            Text { text: "00"; font-size: 9px; color: Palette.foreground.transparentize(0.5); }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: "06"; font-size: 9px; color: Palette.foreground.transparentize(0.5); }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: "12"; font-size: 9px; color: Palette.foreground.transparentize(0.5); }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: "18"; font-size: 9px; color: Palette.foreground.transparentize(0.5); }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: "23"; font-size: 9px; color: Palette.foreground.transparentize(0.5); }
         }
     }
 }
@@ -2841,9 +3036,29 @@ component PlaybackPage inherits Rectangle {
                     }
                     if Bridge.hub-connected: Rectangle { height: 1px; background: Palette.border; }
                     if Bridge.hub-connected: HorizontalLayout {
+                        spacing: 8px;
                         Text { text: Bridge.rec-date; font-weight: 600; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                         Muted { text: Bridge.rec-list-title; vertical-alignment: center; }
+                        if Bridge.recordings.length > 0 && !Bridge.batch-busy: Rectangle {
+                            height: 24px;
+                            width: sel-lbl.preferred-width + 16px;
+                            border-radius: 12px;
+                            background: Bridge.batch-mode ? Palette.accent-background
+                                : sel-ta.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
+                            sel-lbl := Text {
+                                text: Bridge.batch-mode ? Tr.batch-done : Tr.batch-select;
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: Bridge.batch-mode ? Palette.accent-foreground : Palette.foreground.transparentize(0.2);
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            sel-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { Bridge.batch-toggle-mode(); }
+                            }
+                        }
                     }
                     if Bridge.hub-connected: HorizontalLayout {
                         spacing: 4px;
@@ -2873,6 +3088,66 @@ component PlaybackPage inherits Rectangle {
                             }
                         }
                     }
+                    if Bridge.hub-connected && Bridge.hour-bars.length == 24 && Bridge.hour-summary != "": ActivityChart {
+                        bars: Bridge.hour-bars;
+                        summary: Bridge.hour-summary;
+                        jump(h) => { Bridge.jump-hour(h); }
+                    }
+                    if Bridge.hub-connected && (Bridge.batch-mode || Bridge.batch-busy): Rectangle {
+                        height: 36px;
+                        border-radius: 10px;
+                        background: Palette.accent-background.transparentize(0.9);
+                        border-width: 1px;
+                        border-color: Palette.accent-background.transparentize(0.65);
+                        if !Bridge.batch-busy: HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            VerticalLayout {
+                                alignment: center;
+                                Button { text: Tr.batch-all; clicked => { Bridge.batch-select-all(); } }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: Tr.batch-clear;
+                                    enabled: Bridge.batch-selected-count > 0;
+                                    clicked => { Bridge.batch-clear(); }
+                                }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: Tr.batch-export-prefix + Bridge.batch-selected-count + Tr.batch-export-suffix;
+                                    primary: true;
+                                    enabled: Bridge.batch-selected-count > 0;
+                                    clicked => { Bridge.batch-export(); }
+                                }
+                            }
+                        }
+                        if Bridge.batch-busy: HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 8px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Spinner { width: 16px; height: 16px; indeterminate: true; }
+                            }
+                            Text {
+                                text: Bridge.batch-status;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Button { text: Tr.cancel; clicked => { Bridge.batch-cancel(); } }
+                            }
+                        }
+                    }
                     if Bridge.hub-connected: Rectangle {
                         vertical-stretch: 1;
                         ListView {
@@ -2880,8 +3155,10 @@ component PlaybackPage inherits Rectangle {
                             height: parent.height;
                             for r[i] in Bridge.recordings: ClipRow {
                                 rec: r;
+                                batch-mode: Bridge.batch-mode;
                                 play => { Bridge.play-clip(i); }
                                 save => { Bridge.download(i); }
+                                toggle-select => { Bridge.batch-toggle-row(i); }
                             }
                         }
                         if Bridge.rec-loading: VerticalLayout {
@@ -2901,6 +3178,383 @@ component PlaybackPage inherits Rectangle {
                         }
                     }
                     if Bridge.hub-connected && Bridge.recordings.length > 0: Muted { text: Bridge.rec-message; }
+                }
+            }
+        }
+    }
+}
+
+component FaceListRow inherits Rectangle {
+    in property <FaceRow> face;
+    callback clicked();
+    height: 58px;
+    border-radius: 10px;
+    background: root.face.selected ? Palette.accent-background.transparentize(0.84)
+        : ta.has-hover ? Palette.foreground.transparentize(0.94) : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: root.face.familiar ? Palette.accent-background.transparentize(0.82) : #e8a31730;
+                Text {
+                    text: root.face.initial;
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: root.face.familiar ? Palette.accent-background : #d48a00;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.face.name;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.face.familiar ? Tr.people-familiar : Tr.people-stranger;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: root.face.familiar ? Palette.accent-background : #d48a00;
+                }
+                if root.face.last-seen != "": Text {
+                    text: "·  " + root.face.last-seen;
+                    font-size: 11px;
+                    color: Palette.foreground.transparentize(0.45);
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}
+
+component FaceTrackListRow inherits Rectangle {
+    in property <FaceTrackRow> item;
+    callback play();
+    height: 60px;
+    border-radius: 10px;
+    background: ta.has-hover ? Palette.foreground.transparentize(0.94) : transparent;
+    ta := TouchArea {
+        enabled: root.item.playable;
+        mouse-cursor: root.item.playable ? pointer : default;
+        clicked => { root.play(); }
+    }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: root.item.familiar ? Palette.accent-background.transparentize(0.84) : #e8a31730;
+                Icon {
+                    width: 18px;
+                    height: 18px;
+                    commands: Icons.faces;
+                    color: root.item.familiar ? Palette.accent-background : #d48a00;
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 3px;
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: root.item.time;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                if root.item.face-name != "": Text {
+                    text: "·  " + root.item.face-name;
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: root.item.familiar ? Palette.accent-background : #d48a00;
+                    overflow: elide;
+                }
+            }
+            Text {
+                text: root.item.camera + (root.item.clips != "" ? "  ·  " + root.item.clips : "");
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.4);
+                overflow: elide;
+            }
+        }
+        if root.item.playable: VerticalLayout {
+            alignment: center;
+            RoundIconButton {
+                width: 34px;
+                height: 34px;
+                icon: Icons.play;
+                label: Tr.people-watch;
+                base: Palette.foreground.transparentize(0.93);
+                clicked => { root.play(); }
+            }
+        }
+    }
+}
+
+component PeoplePage inherits Rectangle {
+    VerticalLayout {
+        PageHeader {
+            title: Tr.nav-people;
+            subtitle: Tr.people-subtitle;
+            if Bridge.hub-names.length > 1: VerticalLayout {
+                alignment: center;
+                ComboBox {
+                    width: 220px;
+                    model: Bridge.hub-names;
+                    current-index <=> Bridge.rec-hub;
+                    selected => { Bridge.faces-refresh(); }
+                }
+            }
+            if Bridge.faces-loading || Bridge.face-track-loading: VerticalLayout {
+                alignment: center;
+                Spinner { width: 22px; height: 22px; indeterminate: true; }
+            }
+            VerticalLayout {
+                alignment: center;
+                RoundIconButton {
+                    icon: Icons.refresh;
+                    label: Tr.reload;
+                    enabled: !Bridge.faces-loading;
+                    clicked => { Bridge.faces-refresh(); }
+                }
+            }
+        }
+        HorizontalLayout {
+            vertical-stretch: 1;
+            padding-left: 28px;
+            padding-right: 24px;
+            padding-bottom: 20px;
+            spacing: 20px;
+
+            // Left column: recognized people + inline rename / mark familiar editor.
+            Rectangle {
+                width: 350px;
+                border-radius: 14px;
+                background: Palette.control-background;
+                border-width: 1px;
+                border-color: Palette.border;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 10px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        for f[i] in Bridge.face-filter-labels: Rectangle {
+                            height: 28px;
+                            horizontal-stretch: 1;
+                            border-radius: 14px;
+                            background: Bridge.face-filter == i
+                                ? Palette.accent-background
+                                : fta.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
+                            Text {
+                                text: f;
+                                font-size: 12px;
+                                font-weight: 600;
+                                color: Bridge.face-filter == i ? Palette.accent-foreground : Palette.foreground.transparentize(0.2);
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (Bridge.face-filter != i) {
+                                        Bridge.face-filter = i;
+                                        Bridge.face-filter-changed(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if Bridge.selected-face-id != "": HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: Tr.people-all-option;
+                            clicked => { Bridge.face-select(""); }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        ListView {
+                            width: parent.width;
+                            height: parent.height;
+                            for f in Bridge.faces: FaceListRow {
+                                face: f;
+                                clicked => { Bridge.face-select(f.face-id); }
+                            }
+                        }
+                        if Bridge.faces-loading && Bridge.faces.length == 0: VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Spinner { width: 28px; height: 28px; indeterminate: true; }
+                            }
+                        }
+                        if !Bridge.faces-loading && Bridge.faces.length == 0: Muted {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Bridge.faces-message;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if Bridge.selected-face-id != "": Rectangle {
+                        border-radius: 10px;
+                        background: Palette.foreground.transparentize(0.96);
+                        border-width: 1px;
+                        border-color: Palette.border;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text { text: Tr.people-edit-title; font-size: 13px; font-weight: 600; }
+                            LineEdit {
+                                text <=> Bridge.face-edit-name;
+                                placeholder-text: Tr.people-name-placeholder;
+                                accepted => { Bridge.face-save(); }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: Tr.people-mark-familiar;
+                                        font-size: 12px;
+                                        color: Palette.foreground.transparentize(0.25);
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Switch {
+                                        checked <=> Bridge.face-edit-familiar;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: 8px;
+                                if Bridge.face-saving: VerticalLayout {
+                                    alignment: center;
+                                    Spinner { width: 16px; height: 16px; indeterminate: true; }
+                                }
+                                Button {
+                                    text: Tr.save;
+                                    primary: true;
+                                    enabled: !Bridge.face-saving;
+                                    clicked => { Bridge.face-save(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Right column: cross-camera face tracking timeline for the selected day.
+            Rectangle {
+                horizontal-stretch: 1;
+                border-radius: 14px;
+                background: Palette.control-background;
+                border-width: 1px;
+                border-color: Palette.border;
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            spacing: 2px;
+                            Text {
+                                text: Bridge.selected-face-title != "" ? Bridge.selected-face-title : Tr.people-timeline-title;
+                                font-size: 16px;
+                                font-weight: 600;
+                                overflow: elide;
+                            }
+                        }
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.chevron-left;
+                            label: Tr.people-prev-day;
+                            base: transparent;
+                            clicked => { Bridge.face-track-day(-1); }
+                        }
+                        Text {
+                            text: Bridge.face-track-date;
+                            font-size: 13px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                        RoundIconButton {
+                            width: 32px;
+                            height: 32px;
+                            icon: Icons.chevron-right;
+                            label: Tr.people-next-day;
+                            base: transparent;
+                            enabled: !Bridge.face-track-is-today;
+                            clicked => { Bridge.face-track-day(1); }
+                        }
+                        Button {
+                            text: Tr.today;
+                            enabled: !Bridge.face-track-is-today;
+                            clicked => { Bridge.face-track-day(0); }
+                        }
+                    }
+                    Rectangle { height: 1px; background: Palette.border; }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        ListView {
+                            width: parent.width;
+                            height: parent.height;
+                            for tr[i] in Bridge.face-tracks: FaceTrackListRow {
+                                item: tr;
+                                play => { Bridge.face-track-play(i); }
+                            }
+                        }
+                        if Bridge.face-track-loading && Bridge.face-tracks.length == 0: VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                alignment: center;
+                                Spinner { width: 28px; height: 28px; indeterminate: true; }
+                            }
+                        }
+                        if !Bridge.face-track-loading && Bridge.face-tracks.length == 0: Muted {
+                            width: parent.width;
+                            height: parent.height;
+                            text: Bridge.face-track-message;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                    if Bridge.face-tracks.length > 0 && Bridge.face-track-message != "": Muted {
+                        text: Bridge.face-track-message;
+                    }
                 }
             }
         }
@@ -3426,6 +4080,7 @@ export component MainWindow inherits Window {
                 if Bridge.page == Page.live: LivePage { vertical-stretch: 1; }
                 if Bridge.page == Page.single: SinglePage { vertical-stretch: 1; }
                 if Bridge.page == Page.recordings: PlaybackPage { vertical-stretch: 1; }
+                if Bridge.page == Page.people: PeoplePage { vertical-stretch: 1; }
                 if Bridge.page == Page.settings: SettingsPage { vertical-stretch: 1; }
                 if !Bridge.fullscreen && Bridge.page != Page.single: StatusBar { }
             }

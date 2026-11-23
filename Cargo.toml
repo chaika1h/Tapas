@@ -1,6 +1,6 @@
 [package]
 name = "tapas"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 description = "Tapas: TP-Link Tapo cameras and the H500 HomeBase on Windows, through the Tapo cloud"
 license = "MIT"

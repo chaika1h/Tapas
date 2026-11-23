@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
@@ -14,8 +15,8 @@ use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 
 use crate::clip::{self, ClipRequest};
 use crate::cloud::{
-    self, Clip, CloudCamera, CloudClient, Detection, EventFilter, Homes, HubCamera, HubInfo, Login, MfaChallenge,
-    MfaMethod, NightVisionMode, PatrolAxis, Session,
+    self, Clip, CloudCamera, CloudClient, Detection, EventFilter, FaceFilter, FaceInfo, FaceTag, FaceTrackingEntry,
+    Homes, HubCamera, HubInfo, Login, MfaChallenge, MfaMethod, NightVisionMode, PatrolAxis, Session,
 };
 use crate::config::{self, AppConfig, CameraConfig, Language, Quality, Renderer, Theme};
 use crate::i18n;
@@ -24,8 +25,8 @@ use crate::ptz::{Ptz, PtzCmd};
 use crate::secret::Secret;
 use crate::stream::{Frame, StreamHandle, StreamSpec};
 use crate::{
-    Bridge, CameraRow, DayChip, DownloadRow, HomeCard, HubRow, MainWindow, Page, PresetRow, RecRow, Tile, TlSeg,
-    TlTick,
+    Bridge, CameraRow, DayChip, DownloadRow, FaceRow, FaceTrackRow, HomeCard, HourBar, HubRow, MainWindow, Page,
+    PresetRow, RecRow, Tile, TlSeg, TlTick,
 };
 
 thread_local! {
@@ -46,6 +47,7 @@ pub fn shutdown() {
     crate::audio::shutdown();
     if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
         app.timer.stop();
+        app.batch_cancel();
         app.stop_event_pictures();
         app.watching.borrow_mut().take();
         app.streams.borrow_mut().clear();
@@ -247,9 +249,22 @@ pub struct App {
     playback_left_at: Cell<Option<Instant>>,
     /// Whether the UI pump timer is currently running at its fast (30 ms) rate.
     timer_fast: Cell<bool>,
-    /// A camera (cloud device id or name) to select once the hub's cameras
-    /// are listed.
-    pending_rec_camera: RefCell<Option<(String, String)>>,
+    /// A camera (cloud device id, name, optional seek Unix ms) to select once
+    /// the hub's cameras are listed.
+    pending_rec_camera: RefCell<Option<(String, String, Option<i64>)>>,
+    /// Selected clips in Playback batch export mode, keyed by (camera_device_id, start_unix_s).
+    batch_selected: RefCell<HashSet<(String, i64)>>,
+    /// Cancellation flag for an active sequential batch MP4 export.
+    batch_cancel: RefCell<Option<Arc<AtomicBool>>>,
+    /// Recognized faces cached from the selected H500 hub.
+    faces: RefCell<Vec<FaceInfo>>,
+    /// Device id of the hub `faces` were fetched from.
+    faces_loaded_hub: RefCell<Option<String>>,
+    faces_request: Cell<u64>,
+    selected_face: Cell<Option<i64>>,
+    face_track_date: Cell<NaiveDate>,
+    face_track_request: Cell<u64>,
+    face_tracks: RefCell<Vec<FaceTrackingEntry>>,
 }
 
 /// Wraps a method call in a closure that holds only a weak reference.
@@ -280,6 +295,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         }
         Err(e) => log::error!("Tapo cloud unavailable: {e}"),
     }
+    let today = Local::now().date_naive();
     let app = Rc::new(App {
         ui: ui.as_weak(),
         rt,
@@ -293,8 +309,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         hub: RefCell::default(),
         player_id: uuid::Uuid::new_v4().to_string(),
         watching: RefCell::default(),
-        rec_date: RefCell::new(Local::now().date_naive()),
-        rec_month: Cell::new(first_of_month(Local::now().date_naive())),
+        rec_date: RefCell::new(today),
+        rec_month: Cell::new(first_of_month(today)),
         timeline: RefCell::default(),
         speed: Cell::new(1),
         downloads: Rc::new(VecModel::default()),
@@ -315,6 +331,15 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         home_cards: Rc::new(VecModel::default()),
         return_page: Cell::new(Page::Home),
         pending_rec_camera: RefCell::default(),
+        batch_selected: RefCell::default(),
+        batch_cancel: RefCell::default(),
+        faces: RefCell::default(),
+        faces_loaded_hub: RefCell::default(),
+        faces_request: Cell::new(0),
+        selected_face: Cell::new(None),
+        face_track_date: Cell::new(today),
+        face_track_request: Cell::new(0),
+        face_tracks: RefCell::default(),
         homes: RefCell::default(),
         hub_info: RefCell::default(),
         hub_info_tried: Cell::default(),
@@ -404,6 +429,19 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_pick_day(cb!(&app, |a, i| a.pick_day(i)));
     b.on_play_clip(cb!(&app, |a, i| a.play_row(i as usize)));
     b.on_download(cb!(&app, |a, i| a.download(i as usize)));
+    b.on_jump_hour(cb!(&app, |a, h| a.jump_hour(h)));
+    b.on_batch_toggle_mode(cb!(&app, |a| a.batch_toggle_mode()));
+    b.on_batch_toggle_row(cb!(&app, |a, i| a.batch_toggle_row(i as usize)));
+    b.on_batch_select_all(cb!(&app, |a| a.batch_select_all()));
+    b.on_batch_clear(cb!(&app, |a| a.batch_clear()));
+    b.on_batch_export(cb!(&app, |a| a.batch_export()));
+    b.on_batch_cancel(cb!(&app, |a| a.batch_cancel()));
+    b.on_faces_refresh(cb!(&app, |a| a.load_faces()));
+    b.on_face_filter_changed(cb!(&app, |a, _i| a.face_filter_changed()));
+    b.on_face_select(cb!(&app, |a, id| a.face_select(id.as_str())));
+    b.on_face_save(cb!(&app, |a| a.face_save()));
+    b.on_face_track_day(cb!(&app, |a, d| a.face_track_day(d)));
+    b.on_face_track_play(cb!(&app, |a, i| a.face_track_play(i as usize)));
     b.on_player_stop(cb!(&app, |a| a.player_stop()));
     b.on_player_toggle_pause(cb!(&app, |a| a.player_toggle_pause()));
     b.on_player_toggle_audio(cb!(&app, |a| a.player_toggle_audio()));
@@ -439,6 +477,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     app.refresh_hub_lists();
     app.update_rec_date_label();
     app.update_calendar();
+    app.update_face_track_date_label();
     if app.signed_in_now() {
         // The hubs as the account has them now (names, new hubs), then their
         // details, homes and rooms.
@@ -880,6 +919,16 @@ impl App {
             } else if self.event_pictures.borrow().is_empty() && !self.hub.borrow().events.is_empty() {
                 // Reload cached event JPEGs from disk if they were cleared while away.
                 self.fetch_event_pictures();
+            }
+        }
+        if page == Page::People {
+            let hub_id = self.selected_hub().map(|h| h.device_id);
+            if self.faces_loaded_hub.borrow().as_ref() != hub_id.as_ref() && !b.get_faces_loading() {
+                self.load_faces();
+            } else {
+                self.update_face_track_date_label();
+                self.refresh_faces_ui();
+                self.refresh_face_tracks_ui();
             }
         }
         self.sync_timer();
@@ -1508,6 +1557,9 @@ impl App {
             self.update_calendar();
             self.rebuild_rec_rows();
             self.refresh_rec_rows();
+            self.update_face_track_date_label();
+            self.refresh_faces_ui();
+            self.refresh_face_tracks_ui();
         }
         self.load_settings_into_ui();
     }
@@ -2181,6 +2233,20 @@ impl App {
         *self.pending_mfa.borrow_mut() = None;
         self.streams.borrow_mut().clear();
         self.ptz.borrow_mut().clear();
+        self.batch_cancel();
+        self.batch_selected.borrow_mut().clear();
+        self.faces.borrow_mut().clear();
+        *self.faces_loaded_hub.borrow_mut() = None;
+        self.face_tracks.borrow_mut().clear();
+        self.selected_face.set(None);
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_batch_mode(false);
+        b.set_batch_selected_count(0);
+        b.set_faces(ModelRc::default());
+        b.set_face_tracks(ModelRc::default());
+        b.set_selected_face_id(SharedString::new());
+        b.set_selected_face_title(SharedString::new());
         self.release_playback_memory();
         self.clear_tile_frames();
         self.set_fullscreen(false);
@@ -2500,7 +2566,7 @@ impl App {
     /// A camera's recordings on the hub, from today.
     fn open_camera_playback(&self, id: u32) {
         let wanted = self.cfg.borrow().camera(id).map(|c| {
-            (c.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default(), c.name.clone())
+            (c.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default(), c.name.clone(), None)
         });
         self.navigate(Page::Recordings);
         if self.cfg.borrow().hubs.is_empty() {
@@ -2532,12 +2598,21 @@ impl App {
     }
 
     fn select_pending_rec_camera(&self) {
-        let Some((device_id, name)) = self.pending_rec_camera.borrow_mut().take() else { return };
+        let Some((device_id, name, play_at)) = self.pending_rec_camera.borrow_mut().take() else { return };
         match self.rec_camera_combo_index(&device_id, &name) {
             Some(i) => self.ui().global::<Bridge>().set_rec_camera(i),
             None => self.status(format!("{name} isn't paired with this hub; pick a camera.")),
         }
-        self.camera_picked();
+        self.player_stop();
+        {
+            let mut session = self.hub.borrow_mut();
+            session.days.clear();
+            session.months.clear();
+            session.pending_play_at = play_at;
+        }
+        self.update_calendar();
+        self.load_days(self.rec_month.get());
+        self.load_recordings();
     }
 
     fn all_cameras_mode(&self) -> bool {
@@ -2821,62 +2896,104 @@ impl App {
     }
 
     /// Recomputes `session.rows` from `all_events` / `events` / `clips` using
-    /// the active AI event filter chip.
+    /// the active AI event filter chip, and refreshes the 24-hour activity chart.
     fn rebuild_rec_rows(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         let filter = EventFilter::from_index(b.get_rec_filter());
         let all_mode = self.all_cameras_mode();
-        let mut session = self.hub.borrow_mut();
-        if all_mode {
-            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
-                .all_events
-                .iter()
-                .filter(|(_, e)| filter.matches(e))
-                .map(|(cam, e)| (e.start, e.end, e.kind, Some(cam.clone())))
-                .collect();
-            entries.reverse(); // newest first
-            let shown = entries.len();
-            let total = session.all_events.len();
-            b.set_rec_list_title(match (shown, total) {
-                (0, 0) => SharedString::new(),
-                (s, t) if s == t => format!("{} · {s}", i18n::pick("All events", "Tüm olaylar")).into(),
-                (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
-            });
-            session.rows = with_hours(&entries);
-        } else if !session.events.is_empty() {
-            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
-                .events
-                .iter()
-                .filter(|e| filter.matches(e))
-                .map(|e| (e.start, e.end, e.kind, None))
-                .collect();
-            entries.reverse(); // newest first
-            let shown = entries.len();
-            let total = session.events.len();
-            b.set_rec_list_title(match (shown, total) {
-                (s, t) if s == t => format!("{} · {s}", i18n::pick("Detected events", "Algılanan olaylar")).into(),
-                (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
-            });
-            session.rows = with_hours(&entries);
-        } else {
-            let mut entries: Vec<(i64, i64, i64, Option<HubCamera>)> = session
-                .clips
-                .iter()
-                .filter(|c| {
-                    filter == EventFilter::All
-                        || filter.matches(&Detection { start: c.start, end: c.end, kind: c.kind, kinds: vec![c.kind] })
-                })
-                .map(|c| (c.start, c.end, c.kind, None))
-                .collect();
-            entries.reverse();
-            let n = entries.len();
-            b.set_rec_list_title(if n == 0 {
-                SharedString::new()
+        let entries: Vec<(i64, i64, i64, Option<HubCamera>)> = {
+            let mut session = self.hub.borrow_mut();
+            let mut entries = if all_mode {
+                let list: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                    .all_events
+                    .iter()
+                    .filter(|(_, e)| filter.matches(e))
+                    .map(|(cam, e)| (e.start, e.end, e.kind, Some(cam.clone())))
+                    .collect();
+                let shown = list.len();
+                let total = session.all_events.len();
+                b.set_rec_list_title(match (shown, total) {
+                    (0, 0) => SharedString::new(),
+                    (s, t) if s == t => format!("{} · {s}", i18n::pick("All events", "Tüm olaylar")).into(),
+                    (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
+                });
+                list
+            } else if !session.events.is_empty() {
+                let list: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                    .events
+                    .iter()
+                    .filter(|e| filter.matches(e))
+                    .map(|e| (e.start, e.end, e.kind, None))
+                    .collect();
+                let shown = list.len();
+                let total = session.events.len();
+                b.set_rec_list_title(match (shown, total) {
+                    (s, t) if s == t => format!("{} · {s}", i18n::pick("Detected events", "Algılanan olaylar")).into(),
+                    (s, t) => format!("{} · {s}/{t}", i18n::pick("Events", "Olaylar")).into(),
+                });
+                list
             } else {
-                format!("{} · {n}", i18n::pick("Recordings", "Kayıtlar")).into()
-            });
+                let list: Vec<(i64, i64, i64, Option<HubCamera>)> = session
+                    .clips
+                    .iter()
+                    .filter(|c| {
+                        filter == EventFilter::All
+                            || filter.matches(&Detection { start: c.start, end: c.end, kind: c.kind, kinds: vec![c.kind] })
+                    })
+                    .map(|c| (c.start, c.end, c.kind, None))
+                    .collect();
+                let n = list.len();
+                b.set_rec_list_title(if n == 0 {
+                    SharedString::new()
+                } else {
+                    format!("{} · {n}", i18n::pick("Recordings", "Kayıtlar")).into()
+                });
+                list
+            };
+            entries.reverse(); // newest first
             session.rows = with_hours(&entries);
+            entries
+        };
+
+        // Update 24-hour activity summary chart from the filtered entries.
+        let starts: Vec<i64> = entries.iter().map(|(s, _, _, _)| *s).collect();
+        let (counts, peak) = hourly_activity(&starts);
+        let max_count = peak.map(|(_, c)| c).unwrap_or(0);
+        let bars: Vec<HourBar> = (0..24)
+            .map(|h| {
+                let count = counts[h];
+                let ratio = if max_count > 0 { count as f32 / max_count as f32 } else { 0.0 };
+                HourBar {
+                    hour: h as i32,
+                    count: count as i32,
+                    ratio,
+                    peak: max_count > 0 && count == max_count,
+                }
+            })
+            .collect();
+        b.set_hour_bars(ModelRc::new(VecModel::from(bars)));
+        let summary = match peak {
+            Some((h, c)) => format!("{} {:02}:00 ({c})", i18n::pick("Peak", "Zirve"), h),
+            None => String::new(),
+        };
+        b.set_hour_summary(summary.into());
+
+        // Drop selections for entries no longer visible after filtering/reload.
+        let selected_cam = self.selected_rec_camera();
+        let visible_keys: HashSet<(String, i64)> = {
+            let session = self.hub.borrow();
+            session
+                .rows
+                .iter()
+                .filter_map(|r| row_selection_key(r, selected_cam.as_ref()))
+                .collect()
+        };
+        let mut sel = self.batch_selected.borrow_mut();
+        sel.retain(|k| visible_keys.contains(k));
+        b.set_batch_selected_count(sel.len() as i32);
+        if visible_keys.is_empty() && !b.get_batch_busy() {
+            b.set_batch_mode(false);
         }
     }
 
@@ -2899,6 +3016,7 @@ impl App {
         let session = self.hub.borrow();
         let detected = all_mode || !session.events.is_empty();
         let pictures = self.event_pictures.borrow();
+        let batch_sel = self.batch_selected.borrow();
         let rows: Vec<RecRow> = session
             .rows
             .iter()
@@ -2913,6 +3031,7 @@ impl App {
                     let cam = row_cam.as_ref().or(selected.as_ref());
                     let picture = cam.and_then(|c| pictures.get(&(c.device_id.clone(), *start)));
                     let saved = cam.is_some_and(|c| is_saved(&clip_path(c, *start)));
+                    let is_selected = cam.is_some_and(|c| batch_sel.contains(&(c.device_id.clone(), *start)));
                     RecRow {
                         header: false,
                         time: if detected {
@@ -2927,6 +3046,7 @@ impl App {
                         duration: fmt_duration((*end - *start).max(0) as u64).into(),
                         playing: watched == Some(i),
                         saved,
+                        selected: is_selected,
                         has_thumb: picture.is_some(),
                         thumb: picture.cloned().map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                     }
@@ -2943,6 +3063,7 @@ impl App {
                         && o.kind == row.kind
                         && o.playing == row.playing
                         && o.saved == row.saved
+                        && o.selected == row.selected
                         && o.has_thumb == row.has_thumb
                         && o.header == row.header
                 });
@@ -2952,6 +3073,747 @@ impl App {
             }
         } else {
             self.rec_rows.set_vec(rows);
+        }
+    }
+
+    /// Click on a bar in the 24-hour activity chart: jump to the first event
+    /// in that hour.
+    fn jump_hour(&self, hour: i32) {
+        if !(0..24).contains(&hour) {
+            return;
+        }
+        // `session.rows` is newest-first, so `rposition` finds the earliest
+        // event/clip inside that hour.
+        let target = {
+            let session = self.hub.borrow();
+            session
+                .rows
+                .iter()
+                .rposition(|r| r.entry().is_some_and(|(s, _, _, _)| local_time(s).hour() as i32 == hour))
+        };
+        if let Some(idx) = target {
+            self.play_row(idx);
+        }
+    }
+
+    // --------------------------------------------------------- batch export
+
+    fn batch_toggle_mode(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_batch_busy() {
+            return;
+        }
+        let next = !b.get_batch_mode();
+        b.set_batch_mode(next);
+        if !next {
+            self.batch_selected.borrow_mut().clear();
+            b.set_batch_selected_count(0);
+        }
+        self.refresh_rec_rows();
+    }
+
+    fn batch_toggle_row(&self, index: usize) {
+        let selected_cam = self.selected_rec_camera();
+        let key = {
+            let session = self.hub.borrow();
+            session.rows.get(index).and_then(|r| row_selection_key(r, selected_cam.as_ref()))
+        };
+        let Some(key) = key else { return };
+        let count = {
+            let mut sel = self.batch_selected.borrow_mut();
+            if !sel.remove(&key) {
+                sel.insert(key);
+            }
+            sel.len()
+        };
+        self.ui().global::<Bridge>().set_batch_selected_count(count as i32);
+        self.refresh_rec_rows();
+    }
+
+    fn batch_select_all(&self) {
+        let selected_cam = self.selected_rec_camera();
+        let keys: Vec<(String, i64)> = {
+            let session = self.hub.borrow();
+            session
+                .rows
+                .iter()
+                .filter_map(|r| row_selection_key(r, selected_cam.as_ref()))
+                .collect()
+        };
+        let count = {
+            let mut sel = self.batch_selected.borrow_mut();
+            sel.extend(keys);
+            sel.len()
+        };
+        self.ui().global::<Bridge>().set_batch_selected_count(count as i32);
+        self.refresh_rec_rows();
+    }
+
+    fn batch_clear(&self) {
+        self.batch_selected.borrow_mut().clear();
+        self.ui().global::<Bridge>().set_batch_selected_count(0);
+        self.refresh_rec_rows();
+    }
+
+    fn batch_cancel(&self) {
+        if let Some(flag) = self.batch_cancel.borrow().as_ref() {
+            flag.store(true, Ordering::Relaxed);
+            self.ui()
+                .global::<Bridge>()
+                .set_batch_status(i18n::pick("Cancelling…", "İptal ediliyor…").into());
+        }
+    }
+
+    /// Exports all selected clips sequentially as MP4 files to `Videos\Tapas`.
+    /// Runs one clip at a time because the H500 hub allows only a single active
+    /// download/playback session.
+    fn batch_export(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_batch_busy() {
+            return;
+        }
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+            self.status(i18n::pick(
+                "Sign in to your Tapo account first.",
+                "Önce Tapo hesabınızla giriş yapın.",
+            ));
+            return;
+        };
+        let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
+            self.status(i18n::pick(
+                "FFmpeg is missing; cannot export MP4.",
+                "FFmpeg bulunamadı; MP4 dışa aktarılamıyor.",
+            ));
+            return;
+        };
+        let Some(hub) = self.hub.borrow().hub.clone() else { return };
+        let selected_cam = self.selected_rec_camera();
+        let sel = self.batch_selected.borrow().clone();
+        let queue = {
+            let session = self.hub.borrow();
+            collect_batch_queue(&session.rows, selected_cam.as_ref(), &sel)
+        };
+        if queue.is_empty() {
+            return;
+        }
+        // Free the H500's single playback/download slot before starting the queue.
+        self.player_stop();
+        self.stop_event_pictures();
+
+        let total = queue.len();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.batch_cancel.borrow_mut() = Some(cancel.clone());
+        b.set_batch_busy(true);
+        b.set_batch_status(
+            if i18n::is_tr() {
+                format!("Dışa aktarılıyor 1/{total}…")
+            } else {
+                format!("Exporting 1/{total}…")
+            }
+            .into(),
+        );
+        let player_id = self.player_id.clone();
+
+        self.rt.spawn(async move {
+            let mut exported = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+            let mut auth_failed = false;
+
+            for (idx, (camera, clip_item)) in queue.into_iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let n = idx + 1;
+                let path = clip_path(&camera, clip_item.start);
+                let label = format!("{} · {}", camera.name, local_time(clip_item.start).format("%d %b %H:%M:%S"));
+                if is_saved(&path) {
+                    skipped += 1;
+                    let p = path.clone();
+                    let l = label.clone();
+                    on_ui(move |app| {
+                        app.push_download(l, i18n::pick("Already saved", "Zaten kaydedildi").into(), &p, true);
+                    });
+                    continue;
+                }
+
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let p_push = path.clone();
+                let l_push = label.clone();
+                on_ui(move |app| {
+                    let row = app.push_download(
+                        l_push,
+                        i18n::pick("Asking the hub for the recording…", "Hub'dan kayıt isteniyor…").into(),
+                        &p_push,
+                        false,
+                    );
+                    let status = if i18n::is_tr() {
+                        format!("Dışa aktarılıyor {n}/{total}…")
+                    } else {
+                        format!("Exporting {n}/{total}…")
+                    };
+                    app.ui().global::<Bridge>().set_batch_status(status.into());
+                    let _ = tx.send(row);
+                });
+                let Ok(row) = rx.await else { break };
+
+                let req = ClipRequest {
+                    hub: hub.clone(),
+                    camera: camera.clone(),
+                    clip: clip_item,
+                    player_id: player_id.clone(),
+                };
+                let clip_secs = clip_item.seconds().max(1) as u64;
+                let mut last = Instant::now();
+                let mut progress = |p: clip::Progress| {
+                    if last.elapsed() >= Duration::from_millis(500) {
+                        last = Instant::now();
+                        let pct = ((p.seconds as u64).min(clip_secs) * 100 / clip_secs).min(99);
+                        let row_text = if i18n::is_tr() {
+                            format!("İndiriliyor… {} / {}", fmt_duration(p.seconds as u64), fmt_duration(clip_secs))
+                        } else {
+                            format!("Downloading… {} of {}", fmt_duration(p.seconds as u64), fmt_duration(clip_secs))
+                        };
+                        let batch_text = if i18n::is_tr() {
+                            format!("Dışa aktarılıyor {n}/{total} (%{pct})…")
+                        } else {
+                            format!("Exporting {n}/{total} ({pct}%)…")
+                        };
+                        on_ui(move |app| {
+                            app.set_download_status(row, row_text, false);
+                            app.ui().global::<Bridge>().set_batch_status(batch_text.into());
+                        });
+                    }
+                };
+                let partial = clip::partial_path(&path);
+                let result = clip::save_clip(&client, &req, &path, &partial, Some(&ffmpeg), &mut progress, move || {
+                    let msg = i18n::pick("Converting to MP4…", "MP4'e dönüştürülüyor…").to_string();
+                    let batch_msg = if i18n::is_tr() {
+                        format!("MP4'e dönüştürülüyor {n}/{total}…")
+                    } else {
+                        format!("Converting {n}/{total} to MP4…")
+                    };
+                    on_ui(move |app| {
+                        app.set_download_status(row, msg, false);
+                        app.ui().global::<Bridge>().set_batch_status(batch_msg.into());
+                    });
+                })
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        exported += 1;
+                        let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+                        let text = format!("{} · {mb:.1} MB", i18n::pick("Saved", "Kaydedildi"));
+                        on_ui(move |app| {
+                            app.set_download_status(row, text, true);
+                            app.refresh_rec_rows();
+                        });
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        if e.downcast_ref::<cloud::CloudError>().is_some_and(|ce| ce.is_auth()) {
+                            auth_failed = true;
+                        }
+                        let text = format!("{}: {e:#}", i18n::pick("Failed", "Başarısız"));
+                        on_ui(move |app| app.set_download_status(row, text, false));
+                        if auth_failed {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let cancelled = cancel.load(Ordering::Relaxed);
+            on_ui(move |app| {
+                *app.batch_cancel.borrow_mut() = None;
+                let ui = app.ui();
+                let b = ui.global::<Bridge>();
+                b.set_batch_busy(false);
+                b.set_batch_mode(false);
+                b.set_batch_status(SharedString::new());
+                app.batch_selected.borrow_mut().clear();
+                b.set_batch_selected_count(0);
+                if auth_failed {
+                    app.cloud_auth_failed();
+                }
+                let summary = if cancelled {
+                    if i18n::is_tr() {
+                        format!("Toplu dışa aktarma iptal edildi ({exported} kaydedildi).")
+                    } else {
+                        format!("Batch export cancelled ({exported} saved).")
+                    }
+                } else if failed > 0 {
+                    if i18n::is_tr() {
+                        format!("Toplu aktarma bitti: {exported} kaydedildi, {skipped} zaten vardı, {failed} başarısız.")
+                    } else {
+                        format!("Batch export finished: {exported} saved, {skipped} already saved, {failed} failed.")
+                    }
+                } else if skipped > 0 {
+                    if i18n::is_tr() {
+                        format!("{exported} MP4 kaydedildi, {skipped} zaten kayıtlıydı.")
+                    } else {
+                        format!("Exported {exported} MP4 clip(s); {skipped} already saved.")
+                    }
+                } else if i18n::is_tr() {
+                    format!("{exported} MP4 klip Videolar\\Tapas klasörüne aktarıldı.")
+                } else {
+                    format!("Exported {exported} MP4 clip(s) to Videos\\Tapas.")
+                };
+                app.status(summary);
+                app.refresh_rec_rows();
+            });
+        });
+    }
+
+    // --------------------------------------------- H500 People / Faces page
+
+    fn update_face_track_date_label(&self) {
+        let date = self.face_track_date.get();
+        let today = Local::now().date_naive();
+        let label = if date == today {
+            format!("{}, {:02} {}", i18n::pick("Today", "Bugün"), date.day(), i18n::short_month(date.month()))
+        } else {
+            format!("{:02} {} {}", date.day(), i18n::short_month(date.month()), date.year())
+        };
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_face_track_date(label.into());
+        b.set_face_track_is_today(date >= today);
+    }
+
+    fn load_faces(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
+            b.set_faces_message(
+                i18n::pick("Sign in to your Tapo account first.", "Önce Tapo hesabınızla giriş yapın.").into(),
+            );
+            return;
+        };
+        let Some(hub) = self.selected_hub() else {
+            b.set_faces_message(
+                i18n::pick(
+                    "No H500 HomeBase found on your Tapo account.",
+                    "Tapo hesabınızda H500 HomeBase bulunamadı.",
+                )
+                .into(),
+            );
+            return;
+        };
+        let req = self.faces_request.get() + 1;
+        self.faces_request.set(req);
+        let hub_id = hub.device_id.clone();
+        let need_cameras = {
+            let session = self.hub.borrow();
+            session.hub.as_ref().map(|h| &h.device_id) != Some(&hub_id) || session.cameras.is_empty()
+        };
+        b.set_faces_loading(true);
+        b.set_faces_message(
+            i18n::pick("Loading recognized faces from the hub…", "Hub'daki tanınan yüzler yükleniyor…").into(),
+        );
+        self.update_face_track_date_label();
+        self.rt.spawn(async move {
+            let cams = if need_cameras { client.hub_cameras(&hub).await.ok() } else { None };
+            let faces = client.hub_faces(&hub).await;
+            on_ui(move |app| app.faces_loaded(req, hub, cams, faces));
+        });
+    }
+
+    fn faces_loaded(
+        &self,
+        req: u64,
+        hub: CloudCamera,
+        cameras: Option<Vec<HubCamera>>,
+        result: cloud::Result<Vec<FaceInfo>>,
+    ) {
+        if self.faces_request.get() != req {
+            return;
+        }
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_faces_loading(false);
+        if let Some(cams) = cameras
+            && !cams.is_empty()
+            && self.hub.borrow().hub.is_none()
+        {
+            let mut session = self.hub.borrow_mut();
+            session.hub = Some(hub.clone());
+            session.cameras = cams;
+        }
+        *self.faces_loaded_hub.borrow_mut() = Some(hub.device_id);
+        match result {
+            Ok(list) => {
+                *self.faces.borrow_mut() = list;
+                if let Some(sel_id) = self.selected_face.get()
+                    && !self.faces.borrow().iter().any(|f| f.face_id == sel_id)
+                {
+                    self.selected_face.set(None);
+                }
+                self.refresh_faces_ui();
+                self.load_face_tracks();
+            }
+            Err(e) => {
+                if e.is_auth() {
+                    self.cloud_auth_failed();
+                }
+                self.faces.borrow_mut().clear();
+                self.refresh_faces_ui();
+                b.set_faces_message(
+                    if i18n::is_tr() {
+                        format!(
+                            "Yüz tanıma verisi alınamadı ({e}). H500 ayarlarında Yüz Tanıma'nın açık olduğundan emin olun."
+                        )
+                    } else {
+                        format!(
+                            "Could not load faces ({e}). Make sure Facial Recognition is enabled on your H500 in the Tapo app."
+                        )
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    fn face_display_name(face: &FaceInfo) -> String {
+        if !face.name.trim().is_empty() {
+            face.name.trim().to_string()
+        } else if face.tag.is_familiar() {
+            format!("{} #{}", i18n::pick("Person", "Kişi"), face.face_id)
+        } else {
+            format!("{} #{}", i18n::pick("Stranger", "Yabancı"), face.face_id)
+        }
+    }
+
+    fn refresh_faces_ui(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let filter = FaceFilter::from_index(b.get_face_filter());
+        let selected_id = self.selected_face.get();
+        let faces = self.faces.borrow();
+        let rows: Vec<FaceRow> = faces
+            .iter()
+            .filter(|f| filter.matches(f))
+            .map(|f| {
+                let name = Self::face_display_name(f);
+                let initial = name
+                    .chars()
+                    .find(|c| c.is_alphanumeric())
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_else(|| "?".into());
+                let ts = f.last_seen();
+                let last_seen = if ts > 0 {
+                    let dt = local_time(ts);
+                    format!("{:02} {} {}", dt.day(), i18n::short_month(dt.month()), dt.format("%H:%M"))
+                } else {
+                    String::new()
+                };
+                FaceRow {
+                    face_id: f.face_id.to_string().into(),
+                    name: name.into(),
+                    initial: initial.into(),
+                    familiar: f.tag.is_familiar(),
+                    last_seen: last_seen.into(),
+                    selected: selected_id == Some(f.face_id),
+                }
+            })
+            .collect();
+        let empty = rows.is_empty();
+        b.set_faces(ModelRc::new(VecModel::from(rows)));
+        if empty {
+            let msg = if faces.is_empty() {
+                i18n::pick(
+                    "No recognized faces yet. Enable Facial Recognition on your H500 HomeBase in the Tapo app.",
+                    "Henüz tanınan yüz yok. Tapo uygulamasından H500 HomeBase için Yüz Tanıma'yı etkinleştirin.",
+                )
+            } else {
+                i18n::pick("No people match this filter.", "Bu filtreye uyan kişi yok.")
+            };
+            b.set_faces_message(msg.into());
+        } else {
+            b.set_faces_message(SharedString::new());
+        }
+
+        if let Some(id) = selected_id
+            && let Some(face) = faces.iter().find(|f| f.face_id == id)
+        {
+            b.set_selected_face_id(id.to_string().into());
+            b.set_selected_face_title(Self::face_display_name(face).into());
+        } else {
+            b.set_selected_face_id(SharedString::new());
+            b.set_selected_face_title(SharedString::new());
+        }
+    }
+
+    fn face_filter_changed(&self) {
+        self.refresh_faces_ui();
+        self.load_face_tracks();
+    }
+
+    fn face_select(&self, face_id: &str) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let parsed = face_id.trim().parse::<i64>().ok();
+        // Clicking the already-selected person clears selection back to "All people".
+        let next = if parsed.is_some() && parsed == self.selected_face.get() { None } else { parsed };
+        self.selected_face.set(next);
+        if let Some(id) = next
+            && let Some(face) = self.faces.borrow().iter().find(|f| f.face_id == id)
+        {
+            b.set_face_edit_name(face.name.as_str().into());
+            b.set_face_edit_familiar(face.tag.is_familiar());
+        } else {
+            b.set_face_edit_name(SharedString::new());
+            b.set_face_edit_familiar(false);
+        }
+        self.refresh_faces_ui();
+        self.load_face_tracks();
+    }
+
+    fn face_save(&self) {
+        let Some(face_id) = self.selected_face.get() else { return };
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        let Some(hub) = self.selected_hub() else { return };
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let name = b.get_face_edit_name().trim().to_string();
+        let familiar = b.get_face_edit_familiar();
+        if familiar && name.is_empty() {
+            self.status(i18n::pick(
+                "Enter a name before marking as Familiar.",
+                "Tanıdık olarak işaretlemeden önce bir ad girin.",
+            ));
+            return;
+        }
+        b.set_face_saving(true);
+        self.rt.spawn(async move {
+            let result = client.set_face_info(&hub, face_id, &name, familiar).await;
+            on_ui(move |app| {
+                app.ui().global::<Bridge>().set_face_saving(false);
+                match result {
+                    Ok(()) => {
+                        if let Some(f) = app.faces.borrow_mut().iter_mut().find(|f| f.face_id == face_id) {
+                            f.name = name;
+                            f.tag = if familiar { FaceTag::Familiar } else { FaceTag::Stranger };
+                            f.user_verified = true;
+                        }
+                        app.refresh_faces_ui();
+                        app.refresh_face_tracks_ui();
+                        app.status(i18n::pick("Person updated on H500.", "Kişi bilgisi H500 üzerinde güncellendi."));
+                    }
+                    Err(e) => {
+                        if e.is_auth() {
+                            app.cloud_auth_failed();
+                        }
+                        app.status(if i18n::is_tr() {
+                            format!("Kişi güncellenemedi: {e}")
+                        } else {
+                            format!("Could not update person: {e}")
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    fn face_track_day(&self, delta: i32) {
+        let today = Local::now().date_naive();
+        let next = if delta == 0 {
+            today
+        } else {
+            (self.face_track_date.get() + chrono::Duration::days(delta as i64)).min(today)
+        };
+        if next != self.face_track_date.get() {
+            self.face_track_date.set(next);
+            self.update_face_track_date_label();
+            self.load_face_tracks();
+        }
+    }
+
+    fn load_face_tracks(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let (Some(client), Some(hub)) = (self.cloud_client().filter(|c| c.session().is_some()), self.selected_hub()) else {
+            return;
+        };
+        let req = self.face_track_request.get() + 1;
+        self.face_track_request.set(req);
+        let (start, end) = local_day(self.face_track_date.get());
+        let face_id = self.selected_face.get();
+        let tag = if face_id.is_some() {
+            None
+        } else {
+            FaceFilter::from_index(b.get_face_filter()).tag_param()
+        };
+        b.set_face_track_loading(true);
+        b.set_face_track_message(
+            i18n::pick("Loading cross-camera tracking…", "Kameralar arası takip yükleniyor…").into(),
+        );
+        self.rt.spawn(async move {
+            let result = client.hub_face_tracking(&hub, start, end, face_id, tag).await;
+            on_ui(move |app| app.face_tracks_loaded(req, result));
+        });
+    }
+
+    fn face_tracks_loaded(&self, req: u64, result: cloud::Result<Vec<FaceTrackingEntry>>) {
+        if self.face_track_request.get() != req {
+            return;
+        }
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_face_track_loading(false);
+        match result {
+            Ok(entries) => {
+                *self.face_tracks.borrow_mut() = entries;
+                self.refresh_face_tracks_ui();
+            }
+            Err(e) => {
+                if e.is_auth() {
+                    self.cloud_auth_failed();
+                }
+                self.face_tracks.borrow_mut().clear();
+                self.refresh_face_tracks_ui();
+                b.set_face_track_message(
+                    if i18n::is_tr() {
+                        format!("Yüz takip geçmişi alınamadı: {e}")
+                    } else {
+                        format!("Could not load face tracking timeline: {e}")
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    fn resolve_camera_by_mac(&self, normalized_mac: &str) -> Option<(String, String)> {
+        if normalized_mac.is_empty() {
+            return None;
+        }
+        if let Some(cam) = self
+            .hub
+            .borrow()
+            .cameras
+            .iter()
+            .find(|c| cloud::normalize_mac(&c.mac) == normalized_mac)
+        {
+            return Some((cam.device_id.clone(), cam.name.clone()));
+        }
+        if let Some(cam) = self.cfg.borrow().cameras.iter().find(|c| {
+            c.cloud
+                .as_ref()
+                .is_some_and(|l| cloud::normalize_mac(&l.mac) == normalized_mac)
+        }) {
+            let id = cam.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default();
+            return Some((id, cam.name.clone()));
+        }
+        None
+    }
+
+    fn refresh_face_tracks_ui(&self) {
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let tracks = self.face_tracks.borrow();
+        let faces = self.faces.borrow();
+        let show_face_name = self.selected_face.get().is_none();
+        let rows: Vec<FaceTrackRow> = tracks
+            .iter()
+            .map(|t| {
+                let face = faces.iter().find(|f| f.face_id == t.face_id);
+                let familiar = face.is_some_and(|f| f.tag.is_familiar());
+                let face_name = if show_face_name {
+                    face.map(Self::face_display_name)
+                        .unwrap_or_else(|| format!("{} #{}", i18n::pick("Face", "Yüz"), t.face_id))
+                } else {
+                    String::new()
+                };
+                let resolved = self.resolve_camera_by_mac(&t.snapshot_mac);
+                let camera = resolved
+                    .as_ref()
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| {
+                        if t.snapshot_mac.is_empty() {
+                            i18n::pick("Camera", "Kamera").to_string()
+                        } else {
+                            t.snapshot_mac.clone()
+                        }
+                    });
+                let time = if t.end_time > t.start_time {
+                    format!(
+                        "{} – {}",
+                        local_time(t.start_time).format("%H:%M:%S"),
+                        local_time(t.end_time).format("%H:%M:%S")
+                    )
+                } else {
+                    local_time(t.start_time).format("%H:%M:%S").to_string()
+                };
+                let clips = if t.device_count > 1 {
+                    if i18n::is_tr() {
+                        format!("{} kamera · {} klip", t.device_count, t.clip_count)
+                    } else {
+                        format!("{} cameras · {} clips", t.device_count, t.clip_count)
+                    }
+                } else if t.clip_count > 1 {
+                    if i18n::is_tr() {
+                        format!("{} klip", t.clip_count)
+                    } else {
+                        format!("{} clips", t.clip_count)
+                    }
+                } else {
+                    String::new()
+                };
+                FaceTrackRow {
+                    time: time.into(),
+                    camera: camera.into(),
+                    clips: clips.into(),
+                    face_name: face_name.into(),
+                    familiar,
+                    playable: resolved.is_some(),
+                }
+            })
+            .collect();
+        let count = rows.len();
+        b.set_face_tracks(ModelRc::new(VecModel::from(rows)));
+        b.set_face_track_message(
+            if count == 0 {
+                i18n::pick(
+                    "No cross-camera face appearances on this day.",
+                    "Bu gün için kameralar arası yüz kaydı yok.",
+                )
+            } else {
+                i18n::pick(
+                    "Click any appearance to jump directly to Playback at that moment.",
+                    "O anın kaydını izlemek için herhangi bir satıra tıklayın.",
+                )
+            }
+            .into(),
+        );
+    }
+
+    fn face_track_play(&self, index: usize) {
+        let entry = self.face_tracks.borrow().get(index).cloned();
+        let Some(entry) = entry else { return };
+        let Some((device_id, name)) = self.resolve_camera_by_mac(&entry.snapshot_mac) else {
+            self.status(i18n::pick(
+                "Could not match this appearance to a camera on the hub.",
+                "Bu kayıt hub üzerindeki bir kamerayla eşleştirilemedi.",
+            ));
+            return;
+        };
+        let target_date = local_time(entry.start_time).date_naive();
+        *self.rec_date.borrow_mut() = target_date;
+        self.rec_month.set(first_of_month(target_date));
+        self.update_rec_date_label();
+        *self.pending_rec_camera.borrow_mut() = Some((device_id, name, Some(entry.start_time * 1000)));
+        self.navigate(Page::Recordings);
+
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        if b.get_hub_connected() {
+            self.select_pending_rec_camera();
+        } else if !b.get_hub_busy() {
+            self.connect_hub();
         }
     }
 
@@ -3909,6 +4771,52 @@ fn show_in_folder(path: &Path) {
     }
 }
 
+/// Counts Unix timestamps into 24 local-hour buckets and returns the busiest
+/// hour `(hour, count)` when at least one timestamp is present.
+fn hourly_activity(starts: &[i64]) -> ([u32; 24], Option<(usize, u32)>) {
+    let mut counts = [0u32; 24];
+    for &ts in starts {
+        let h = local_time(ts).hour() as usize;
+        if h < 24 {
+            counts[h] += 1;
+        }
+    }
+    let peak = counts
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c > 0)
+        .max_by(|(h1, c1), (h2, c2)| c1.cmp(c2).then_with(|| h2.cmp(h1)))
+        .map(|(h, c)| (h, *c));
+    (counts, peak)
+}
+
+fn row_selection_key(row: &ListRow, fallback_cam: Option<&HubCamera>) -> Option<(String, i64)> {
+    let (start, _, _, row_cam) = row.entry()?;
+    let cam = row_cam.or(fallback_cam)?;
+    Some((cam.device_id.clone(), start))
+}
+
+/// Collects selected clips in chronological order (oldest first), deduplicated
+/// by `(camera.device_id, clip.start)`.
+fn collect_batch_queue(
+    rows: &[ListRow],
+    fallback_cam: Option<&HubCamera>,
+    selected: &HashSet<(String, i64)>,
+) -> Vec<(HubCamera, Clip)> {
+    let mut seen = HashSet::new();
+    let mut queue = Vec::new();
+    for row in rows {
+        let Some((start, end, kind, row_cam)) = row.entry() else { continue };
+        let Some(cam) = row_cam.or(fallback_cam) else { continue };
+        let key = (cam.device_id.clone(), start);
+        if selected.contains(&key) && seen.insert(key) {
+            queue.push((cam.clone(), Clip { start, end: end.max(start + 1), kind }));
+        }
+    }
+    queue.sort_by_key(|(cam, clip)| (clip.start, cam.device_id.clone()));
+    queue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3928,6 +4836,44 @@ mod tests {
         assert_eq!(hub_detail(&hub), "H500");
         assert_eq!(fmt_duration(3700), "1h 01m");
         assert_eq!(file_safe("Front door/1"), "Front_door_1");
+    }
+
+    #[test]
+    fn hourly_activity_aggregates_and_finds_peak() {
+        assert_eq!(hourly_activity(&[]), ([0u32; 24], None));
+        let day = NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+        let at = |h: u32, m: u32| {
+            Local.from_local_datetime(&day.and_hms_opt(h, m, 0).unwrap()).earliest().unwrap().timestamp()
+        };
+        let (counts, peak) = hourly_activity(&[at(9, 10), at(14, 5), at(14, 30), at(14, 55), at(22, 0)]);
+        assert_eq!(counts[9], 1);
+        assert_eq!(counts[14], 3);
+        assert_eq!(counts[22], 1);
+        assert_eq!(counts[0], 0);
+        assert_eq!(peak, Some((14, 3)));
+    }
+
+    #[test]
+    fn batch_queue_orders_chronologically_and_dedups() {
+        let cam1 = HubCamera { device_id: "C1".into(), name: "Gate".into(), ..Default::default() };
+        let cam2 = HubCamera { device_id: "C2".into(), name: "Hall".into(), ..Default::default() };
+        let rows = vec![
+            ListRow::Hour(2000),
+            ListRow::Entry(2050, 2080, 6, Some(cam2.clone())),
+            ListRow::Entry(2010, 2040, 2, Some(cam1.clone())),
+            ListRow::Entry(2010, 2040, 2, Some(cam1.clone())), // duplicate
+            ListRow::Entry(1900, 1920, 8, None),
+        ];
+        let mut selected = HashSet::new();
+        selected.insert(("C2".into(), 2050));
+        selected.insert(("C1".into(), 2010));
+        selected.insert(("C1".into(), 1900));
+        let queue = collect_batch_queue(&rows, Some(&cam1), &selected);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue[0].1.start, 1900);
+        assert_eq!(queue[1].1.start, 2010);
+        assert_eq!(queue[2].1.start, 2050);
+        assert_eq!(queue[2].0.device_id, "C2");
     }
 
     #[test]

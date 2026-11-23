@@ -210,6 +210,7 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
     tr.set_nav_home(t("Home", "Ana sayfa"));
     tr.set_nav_live(t("Live view", "Canlı izleme"));
     tr.set_nav_playback(t("Playback", "Kayıtlar"));
+    tr.set_nav_people(t("People", "Yüzler"));
     tr.set_nav_settings(t("Settings", "Ayarlar"));
     tr.set_win_minimize(t("Minimize", "Simge durumuna küçült"));
     tr.set_win_maximize(t("Maximize", "Ekranı kapla"));
@@ -346,6 +347,29 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
     } else {
         model(&["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"])
     });
+    tr.set_activity_24h(t("24h activity", "24 saatlik hareketlilik"));
+    tr.set_batch_select(t("Select", "Seç"));
+    tr.set_batch_done(t("Done", "Bitti"));
+    tr.set_batch_all(t("All", "Tümü"));
+    tr.set_batch_clear(t("Clear", "Temizle"));
+    tr.set_batch_export_prefix(t("Export ", ""));
+    tr.set_batch_export_suffix(t(" MP4", " MP4 Dışa Aktar"));
+
+    // People / H500 facial recognition page
+    tr.set_people_subtitle(t(
+        "Recognized faces and cross-camera tracking on your H500 HomeBase.",
+        "H500 HomeBase üzerindeki tanınan yüzler ve kameralar arası takip.",
+    ));
+    tr.set_people_all_option(t("All people", "Tüm kişiler"));
+    tr.set_people_familiar(t("Familiar", "Tanıdık"));
+    tr.set_people_stranger(t("Stranger", "Yabancı"));
+    tr.set_people_edit_title(t("Edit person", "Kişiyi düzenle"));
+    tr.set_people_name_placeholder(t("Enter name", "Ad girin"));
+    tr.set_people_mark_familiar(t("Mark as familiar", "Tanıdık olarak işaretle"));
+    tr.set_people_timeline_title(t("Cross-camera timeline", "Kameralar arası zaman çizelgesi"));
+    tr.set_people_prev_day(t("Previous day", "Önceki gün"));
+    tr.set_people_next_day(t("Next day", "Sonraki gün"));
+    tr.set_people_watch(t("Watch", "İzle"));
 
     // Settings page
     tr.set_sec_account(t("Tapo account", "Tapo hesabı"));
@@ -439,6 +463,11 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         model(&["Tümü", "Kişi", "Araç", "Evcil", "Hareket", "Uyarılar"])
     } else {
         model(&["All", "Person", "Vehicle", "Pet", "Motion", "Alerts"])
+    });
+    b.set_face_filter_labels(if lang == Lang::Tr {
+        model(&["Tümü", "Tanıdık", "Yabancı"])
+    } else {
+        model(&["All", "Familiar", "Stranger"])
     });
 }
 

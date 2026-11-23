@@ -383,6 +383,118 @@ pub struct Detection {
     pub kinds: Vec<i64>,
 }
 
+/// Classification tag assigned by the H500 HomeBase face recognition engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FaceTag {
+    Familiar,
+    Stranger,
+    #[default]
+    Unknown,
+}
+
+impl FaceTag {
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "familiar" => Self::Familiar,
+            "stranger" => Self::Stranger,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Familiar => "familiar",
+            Self::Stranger => "stranger",
+            Self::Unknown => "",
+        }
+    }
+
+    pub fn is_familiar(self) -> bool {
+        self == Self::Familiar
+    }
+}
+
+/// A face profile stored on the H500 HomeBase (`searchFacesInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceInfo {
+    pub face_id: i64,
+    pub name: String,
+    pub tag: FaceTag,
+    pub create_time: i64,
+    pub fresh_time: i64,
+    pub modify_time: i64,
+    pub user_verified: bool,
+}
+
+impl FaceInfo {
+    /// Most recent timestamp associated with this face (fresh, else modify, else create).
+    pub fn last_seen(&self) -> i64 {
+        [self.fresh_time, self.modify_time, self.create_time]
+            .into_iter()
+            .find(|&t| t > 0)
+            .unwrap_or(0)
+    }
+}
+
+/// Filter pill for the People / Faces page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FaceFilter {
+    #[default]
+    All,
+    Familiar,
+    Stranger,
+}
+
+impl FaceFilter {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::Familiar,
+            2 => Self::Stranger,
+            _ => Self::All,
+        }
+    }
+
+    pub fn matches(self, face: &FaceInfo) -> bool {
+        match self {
+            Self::All => true,
+            Self::Familiar => face.tag == FaceTag::Familiar,
+            Self::Stranger => face.tag != FaceTag::Familiar,
+        }
+    }
+
+    pub fn tag_param(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Familiar => Some("familiar"),
+            Self::Stranger => Some("stranger"),
+        }
+    }
+}
+
+/// One cross-camera face tracking trajectory returned by `doSearchFaceTrackingList`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceTrackingEntry {
+    pub face_id: i64,
+    pub start_time: i64,
+    pub end_time: i64,
+    /// Normalized uppercase hex MAC (no separators) of the camera that captured the snapshot.
+    pub snapshot_mac: String,
+    pub channel_id: i32,
+    pub clip_count: i32,
+    pub device_count: i32,
+}
+
+/// One camera clip belonging to a face tracking trajectory (`doSearchFaceTrackingClips`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceTrackingClip {
+    pub start_time: i64,
+    pub end_time: i64,
+    /// Normalized uppercase hex MAC resolved from `traj_macs[mac_idx]`.
+    pub mac: String,
+    pub channel_id: i32,
+    pub codec: String,
+}
+
 /// Whether a `SMART.TAPOHUB` model stores camera video (the H500 HomeBase and
 /// the H200), unlike the smart-home hubs (H100, H110).
 pub fn is_camera_hub(model: &str) -> bool {
@@ -1411,6 +1523,64 @@ impl CloudClient {
         clips.dedup();
         Ok(clips)
     }
+
+    // --------------------------------------------------- hub face recognition
+
+    /// Lists all Familiar & Stranger face profiles stored on the H500 HomeBase.
+    pub async fn hub_faces(&self, hub: &CloudCamera) -> Result<Vec<FaceInfo>> {
+        let request = search_faces_request();
+        let result = first_result(&self.camera_requests(hub, vec![request]).await?, "searchFacesInfo")?;
+        Ok(parse_faces_info(&result))
+    }
+
+    /// Renames a recognized face and marks it as Familiar or Stranger on the H500.
+    pub async fn set_face_info(&self, hub: &CloudCamera, face_id: i64, name: &str, familiar: bool) -> Result<()> {
+        let request = set_face_info_request(face_id, name, familiar);
+        first_result(&self.camera_requests(hub, vec![request]).await?, "setFaceInfo")?;
+        Ok(())
+    }
+
+    /// Cross-camera face tracking trajectories overlapping `start..=end` (Unix seconds),
+    /// newest first. Optionally narrowed to one `face_id` or `tag` (`"familiar"` / `"stranger"`).
+    pub async fn hub_face_tracking(
+        &self,
+        hub: &CloudCamera,
+        start: i64,
+        end: i64,
+        face_id: Option<i64>,
+        tag: Option<&str>,
+    ) -> Result<Vec<FaceTrackingEntry>> {
+        const PAGE: i32 = 50;
+        let mut entries = Vec::new();
+        let mut index = 0;
+        while index < 250 {
+            let request = search_face_tracking_request(start, end, index, index + PAGE - 1, face_id, tag);
+            let result = first_result(&self.camera_requests(hub, vec![request]).await?, "doSearchFaceTrackingList")?;
+            let page = parse_face_tracking_list(&result);
+            let full = page.len() as i32 >= PAGE;
+            entries.extend(page);
+            if !full {
+                break;
+            }
+            index += PAGE;
+        }
+        entries.sort_by(|a, b| b.start_time.cmp(&a.start_time).then_with(|| b.end_time.cmp(&a.end_time)));
+        entries.dedup();
+        Ok(entries)
+    }
+
+    /// Detailed per-camera clips inside a single cross-camera face trajectory.
+    #[allow(dead_code)]
+    pub async fn hub_face_tracking_clips(
+        &self,
+        hub: &CloudCamera,
+        face_id: i64,
+        start_time: i64,
+    ) -> Result<Vec<FaceTrackingClip>> {
+        let request = search_face_tracking_clips_request(face_id, start_time, 0, 49);
+        let result = first_result(&self.camera_requests(hub, vec![request]).await?, "doSearchFaceTrackingClips")?;
+        Ok(parse_face_tracking_clips(&result))
+    }
 }
 
 
@@ -1565,6 +1735,232 @@ fn parse_detections(result: &Value) -> Vec<Detection> {
             let mask = e.get("events_1").and_then(int_value).unwrap_or(0);
             let kinds = (0..63).filter(|bit| mask & (1 << bit) != 0).map(|bit| bit + 1).collect();
             Some(Detection { start, end: end.max(start), kind, kinds })
+        })
+        .collect()
+}
+
+fn search_faces_request() -> Value {
+    json!({
+        "method": "searchFacesInfo",
+        "params": {
+            "face_detection": {
+                "search_faces_info": {
+                    "update_time": 0,
+                    "tag": ["familiar", "stranger"],
+                    "sort_by": "fresh_time",
+                    "trans_limit": 200,
+                }
+            }
+        }
+    })
+}
+
+fn set_face_info_request(face_id: i64, name: &str, familiar: bool) -> Value {
+    let tag = if familiar { FaceTag::Familiar } else { FaceTag::Stranger }.as_str();
+    json!({
+        "method": "setFaceInfo",
+        "params": {
+            "face_detection": {
+                "set_face_info": {
+                    "commands": [{
+                        "operate": "set",
+                        "ori_face_id": face_id,
+                        "cover": {
+                            "face_id": face_id,
+                            "name": name.trim(),
+                            "tag": tag,
+                        }
+                    }]
+                }
+            }
+        }
+    })
+}
+
+fn search_face_tracking_request(
+    start: i64,
+    end: i64,
+    start_index: i32,
+    end_index: i32,
+    face_id: Option<i64>,
+    tag: Option<&str>,
+) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("start_time".into(), json!(start));
+    body.insert("end_time".into(), json!(end));
+    body.insert("start_index".into(), json!(start_index));
+    body.insert("end_index".into(), json!(end_index));
+    body.insert("mode".into(), json!("detailed"));
+    body.insert("order".into(), json!("reverse"));
+    body.insert("version".into(), json!(2));
+    if let Some(id) = face_id {
+        body.insert("face_id".into(), json!([id]));
+    }
+    if let Some(t) = tag.filter(|t| !t.is_empty()) {
+        body.insert("tag".into(), json!([t]));
+    }
+    json!({
+        "method": "doSearchFaceTrackingList",
+        "params": {
+            "face_detection": {
+                "action_search_face_tracking_list": Value::Object(body),
+            }
+        }
+    })
+}
+
+fn search_face_tracking_clips_request(face_id: i64, start_time: i64, start_index: i32, end_index: i32) -> Value {
+    json!({
+        "method": "doSearchFaceTrackingClips",
+        "params": {
+            "face_detection": {
+                "action_search_face_tracking_clips": {
+                    "face_id": face_id,
+                    "start_time": start_time,
+                    "start_index": start_index,
+                    "end_index": end_index,
+                    "version": 2,
+                }
+            }
+        }
+    })
+}
+
+/// Parses `face_detection.search_faces_info_result` (plain array, wrapped hub
+/// section entries, or nested object holding `face_list` / `faces`).
+fn parse_faces_info(result: &Value) -> Vec<FaceInfo> {
+    let node = result
+        .pointer("/face_detection/search_faces_info_result")
+        .or_else(|| result.pointer("/face_detection/search_faces_info"))
+        .or_else(|| result.get("search_faces_info_result"));
+    let list = node.and_then(|n| {
+        if n.is_array() {
+            Some(n)
+        } else {
+            n.get("face_info_list")
+                .or_else(|| n.get("face_list"))
+                .or_else(|| n.get("faces"))
+                .or_else(|| n.get("list"))
+        }
+    });
+    let plain = list.and_then(Value::as_array).into_iter().flatten().filter(|e| e.get("face_id").is_some());
+    let wrapped = section_entries(list).filter(|e| e.get("face_id").is_some());
+    let mut faces: Vec<FaceInfo> = plain
+        .chain(wrapped)
+        .filter_map(|e| {
+            let face_id = e.get("face_id").and_then(int_value)?;
+            let raw_name = str_field(e, "name");
+            let name = decode_name(raw_name.trim());
+            let tag = FaceTag::parse(&str_field(e, "tag"));
+            let create_time = e.get("create_time").and_then(int_value).unwrap_or(0);
+            let fresh_time = e.get("fresh_time").and_then(int_value).unwrap_or(0);
+            let modify_time = e.get("modify_time").and_then(int_value).unwrap_or(0);
+            let user_verified = e.get("user_verified").and_then(Value::as_bool).unwrap_or(false);
+            Some(FaceInfo { face_id, name, tag, create_time, fresh_time, modify_time, user_verified })
+        })
+        .collect();
+    // Familiars first, then most recently seen.
+    faces.sort_by(|a, b| {
+        b.tag
+            .is_familiar()
+            .cmp(&a.tag.is_familiar())
+            .then_with(|| b.last_seen().cmp(&a.last_seen()))
+            .then_with(|| a.face_id.cmp(&b.face_id))
+    });
+    faces.dedup_by_key(|f| f.face_id);
+    faces
+}
+
+/// Parses `face_detection.search_face_tracking_list_result.tracking_traj_list`
+/// of `doSearchFaceTrackingList`.
+fn parse_face_tracking_list(result: &Value) -> Vec<FaceTrackingEntry> {
+    let container = result
+        .pointer("/face_detection/search_face_tracking_list_result")
+        .or_else(|| result.pointer("/face_detection/action_search_face_tracking_list"))
+        .or_else(|| result.get("search_face_tracking_list_result"))
+        .or(Some(result));
+    let list = container.and_then(|c| {
+        if c.is_array() {
+            Some(c)
+        } else {
+            c.get("tracking_traj_list").or_else(|| c.get("face_tracking_list"))
+        }
+    });
+    let plain = list
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.get("traj_start_time").is_some() || e.get("start_time").is_some());
+    let wrapped = section_entries(list)
+        .filter(|e| e.get("traj_start_time").is_some() || e.get("start_time").is_some());
+    plain
+        .chain(wrapped)
+        .filter_map(|e| {
+            let start_time = e
+                .get("traj_start_time")
+                .or_else(|| e.get("start_time"))
+                .and_then(int_value)?;
+            let end_time = e
+                .get("traj_end_time")
+                .or_else(|| e.get("end_time"))
+                .and_then(int_value)
+                .unwrap_or(start_time)
+                .max(start_time);
+            let face_id = e.get("face_id").and_then(int_value).unwrap_or(0);
+            let snapshot_mac = normalize_mac(&str_field(e, "snapshot_mac"));
+            let channel_id = e.get("chn_id").and_then(int_value).unwrap_or(0) as i32;
+            let clip_count = e.get("clip_cnt").and_then(int_value).unwrap_or(1) as i32;
+            let device_count = e.get("dev_cnt").and_then(int_value).unwrap_or(1) as i32;
+            Some(FaceTrackingEntry {
+                face_id,
+                start_time,
+                end_time,
+                snapshot_mac,
+                channel_id,
+                clip_count,
+                device_count,
+            })
+        })
+        .collect()
+}
+
+/// Parses `face_detection.action_search_face_tracking_clips` /
+/// `search_face_tracking_clips_result` and resolves each clip's `mac_idx`
+/// through `traj_macs`.
+fn parse_face_tracking_clips(result: &Value) -> Vec<FaceTrackingClip> {
+    let container = result
+        .pointer("/face_detection/action_search_face_tracking_clips")
+        .or_else(|| result.pointer("/face_detection/search_face_tracking_clips_result"))
+        .or_else(|| result.get("face_detection"))
+        .unwrap_or(result);
+    let macs: Vec<String> = container
+        .get("traj_macs")
+        .or_else(|| result.pointer("/face_detection/traj_macs"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).map(normalize_mac).collect())
+        .unwrap_or_default();
+    let list = if container.is_array() {
+        Some(container)
+    } else {
+        container
+            .get("search_face_tracking_clips_result")
+            .or_else(|| result.pointer("/face_detection/search_face_tracking_clips_result"))
+    };
+    let plain = list.and_then(Value::as_array).into_iter().flatten().filter(|e| e.get("start_time").is_some());
+    let wrapped = section_entries(list).filter(|e| e.get("start_time").is_some());
+    plain
+        .chain(wrapped)
+        .filter_map(|e| {
+            let start_time = e.get("start_time").and_then(int_value)?;
+            let end_time = e.get("end_time").and_then(int_value).unwrap_or(start_time).max(start_time);
+            let mac_idx = e.get("mac_idx").and_then(int_value).unwrap_or(-1);
+            let mac = usize::try_from(mac_idx)
+                .ok()
+                .and_then(|i| macs.get(i).cloned())
+                .unwrap_or_default();
+            let channel_id = e.get("chn_id").and_then(int_value).unwrap_or(0) as i32;
+            let codec = str_field(e, "codec_type");
+            Some(FaceTrackingClip { start_time, end_time, mac, channel_id, codec })
         })
         .collect()
 }
@@ -2256,6 +2652,99 @@ mod tests {
         assert!(is_camera_hub("h200(EU)"));
         assert!(!is_camera_hub("H100"));
         assert!(!is_camera_hub(""));
+    }
+
+    #[test]
+    fn face_recognition_requests_and_parsers() {
+        let req = search_faces_request();
+        assert_eq!(req["method"], "searchFacesInfo");
+        assert_eq!(req["params"]["face_detection"]["search_faces_info"]["sort_by"], "fresh_time");
+
+        let set_req = set_face_info_request(42, "  Ahmet ", true);
+        assert_eq!(set_req["method"], "setFaceInfo");
+        let cmd = &set_req["params"]["face_detection"]["set_face_info"]["commands"][0];
+        assert_eq!(cmd["operate"], "set");
+        assert_eq!(cmd["ori_face_id"], 42);
+        assert_eq!(cmd["cover"]["name"], "Ahmet");
+        assert_eq!(cmd["cover"]["tag"], "familiar");
+
+        let tr_req = search_face_tracking_request(100, 200, 0, 49, Some(42), Some("familiar"));
+        assert_eq!(tr_req["method"], "doSearchFaceTrackingList");
+        let tr_body = &tr_req["params"]["face_detection"]["action_search_face_tracking_list"];
+        assert_eq!(tr_body["face_id"], json!([42]));
+        assert_eq!(tr_body["tag"], json!(["familiar"]));
+        assert_eq!(tr_body["version"], 2);
+
+        let faces_json = json!({
+            "face_detection": {
+                "search_faces_info_result": [
+                    {"face_id": 2, "name": "", "tag": "stranger", "fresh_time": 1700000500},
+                    {"face_id": 1, "name": "QWh tZXQ=", "tag": "familiar", "fresh_time": 1700000100, "user_verified": true},
+                    {"face_id": 3, "name": "Zeynep", "tag": "familiar", "fresh_time": 1700000900}
+                ]
+            }
+        });
+        let faces = parse_faces_info(&faces_json);
+        assert_eq!(faces.len(), 3);
+        // Familiars sorted before Strangers, newest first
+        assert_eq!(faces[0].face_id, 3);
+        assert_eq!(faces[0].name, "Zeynep");
+        assert!(faces[0].tag.is_familiar());
+        assert_eq!(faces[1].face_id, 1);
+        assert_eq!(faces[2].face_id, 2);
+        assert_eq!(faces[2].tag, FaceTag::Stranger);
+        assert!(FaceFilter::Familiar.matches(&faces[0]));
+        assert!(!FaceFilter::Familiar.matches(&faces[2]));
+        assert!(FaceFilter::Stranger.matches(&faces[2]));
+
+        // Wrapped section format also parses cleanly
+        let wrapped_faces = json!({
+            "face_detection": {
+                "search_faces_info_result": [
+                    {"face_1": {"face_id": 7, "name": "Ali", "tag": "familiar", "create_time": 10}}
+                ]
+            }
+        });
+        assert_eq!(parse_faces_info(&wrapped_faces)[0].name, "Ali");
+
+        let tracking_json = json!({
+            "face_detection": {
+                "search_face_tracking_list_result": {
+                    "traj_cnt": 1,
+                    "tracking_traj_list": [
+                        {
+                            "face_id": 3,
+                            "traj_start_time": 1700001000,
+                            "traj_end_time": 1700001045,
+                            "snapshot_mac": "a8-42-a1-00-11-22",
+                            "chn_id": 0,
+                            "clip_cnt": 2,
+                            "dev_cnt": 2
+                        }
+                    ]
+                }
+            }
+        });
+        let tracks = parse_face_tracking_list(&tracking_json);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].snapshot_mac, "A842A1001122");
+        assert_eq!(tracks[0].clip_count, 2);
+        assert_eq!(tracks[0].device_count, 2);
+
+        let clips_json = json!({
+            "face_detection": {
+                "action_search_face_tracking_clips": {
+                    "traj_macs": ["A8-42-A1-00-11-22", "A8:42:A1:00:11:33"],
+                    "search_face_tracking_clips_result": [
+                        {"start_time": 1000, "end_time": 1020, "mac_idx": 1, "chn_id": 0, "codec_type": "h264"}
+                    ]
+                }
+            }
+        });
+        let clips = parse_face_tracking_clips(&clips_json);
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].mac, "A842A1001133");
+        assert_eq!(clips[0].codec, "h264");
     }
 
     #[test]

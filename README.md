@@ -8,13 +8,15 @@ works from anywhere with internet: no VPN, port forwarding or camera passwords.
 - **Camera controls**: pan & tilt, pan/tilt patrol, saved presets (go to, save, delete), privacy mode,
   spotlight, night vision mode, auto-tracking, siren/alarm, reboot, SD/HD, and snapshots.
 - **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16× with 1× audio,
-  AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`), an **All cameras** cross-camera
-  events feed with pictures, a calendar, recording clips, and saving them.
+  AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`), a clickable **24-hour activity chart**,
+  an **All cameras** cross-camera events feed with pictures, a calendar, recording clips, and single or **batch lossless MP4 exports**.
+- **People (H500 Facial Recognition)**: browse Familiar and Stranger faces recognized by your H500 HomeBase,
+  name or mark people as Familiar, explore their **cross-camera tracking timeline** by day, and jump straight into Playback.
 - **Full screen** for live view and playback.
 - Your **homes and rooms** from the Tapo app, and the H500 hub's firmware, storage, HDD health
   (temperature & power-on hours), loop recording, and hub alarm/ring.
 - **Integrated Windows 11 Fluent window** (light or dark, OpenGL default with software fallback),
-  an **installer**, and **automatic updates**.
+  **English & Turkish (`Türkçe`)** interface with instant live switching, an **installer**, and **automatic updates**.
 
 Tapas is written in Rust with [Slint](https://slint.dev). It isn't made or supported by TP-Link.
 
@@ -95,6 +97,7 @@ picture shows the day: recordings in blue, detected events in amber.
   **All cameras** jumps straight to that camera's recording at that moment). Playback carries on
   through the day's recordings, skipping the gaps.
 - **Filter events** with the chips above the list (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`).
+- **24-hour activity chart**: hover any hourly bar to see its event count and click to jump straight to that hour.
 - **Drag the white playhead** to a moment: its label shows the time it will play from.
 - **Drag** anywhere else on the timeline to move along it, and **scroll** (or the zoom buttons) to
   zoom between the whole day and five minutes. It follows the picture while playing.
@@ -104,8 +107,9 @@ picture shows the day: recordings in blue, detected events in amber.
   picture; the list button at the top hides the list instead.
 - **Record**: press it, watch on (or jump ahead), press it again, and that stretch is saved to
   `Videos\Tapas`.
-- **↓** next to an event or recording saves it to `Videos\Tapas`. **Take Photo** saves the
-  picture.
+- **↓** next to an event or recording saves it to `Videos\Tapas`, or click **Select** to pick multiple
+  clips and export them sequentially as lossless `.mp4` files with live progress and cancel support.
+  **Take Photo** saves the picture.
 
 The list has the day's **detected events** (person, vehicle, animal, motion…) by hour, with the
 picture the hub keeps for each. The pictures come while you watch, whenever playback isn't using
@@ -120,12 +124,22 @@ back, or forward into it, starts at once. A jump elsewhere takes a few seconds w
 answers. Days are in this PC's time zone. Saved recordings are standard `.mp4` files (lossless
 video copy with AAC audio and `+faststart`), ready to play anywhere or share in Slack, Teams, or email.
 
+### People
+
+When your account has an H500 HomeBase with Facial Recognition enabled, **People** lists every
+**Familiar** and **Stranger** face recognized by the hub:
+
+- Filter by `All`, `Familiar`, or `Stranger`.
+- Select any person to rename them or mark a stranger as Familiar directly on the H500.
+- Browse the **Cross-camera timeline** by day and click any appearance to jump straight into
+  Playback on that camera at that exact timestamp.
+
 ### Settings
 
 - **Tapo account**: who is signed in; update the list of cameras and hubs; sign out.
 - **Cameras**: rename, reorder, remove or add back a camera, and choose its live view stream.
-- **Appearance and video**: light, dark or as Windows; the graphics renderer; a different ffmpeg;
-  where the settings file is. Changes apply as you make them.
+- **General**: light, dark or as Windows; display language (**System (Auto)**, **English**, **Türkçe**);
+  the graphics renderer; where the settings file is. Changes apply as you make them.
 - **About and updates**: the version, *Check for updates*, and whether to check at start-up.
 
 ## Updates
