@@ -382,7 +382,7 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "Buradan kaldırılan veya listede eksik kalan kameralar tekrar eklenebilir.",
     ));
     tr.set_add(t("Add", "Ekle"));
-    tr.set_sec_appearance(t("Appearance and video", "Görünüm ve video"));
+    tr.set_sec_appearance(t("General", "Genel"));
     tr.set_appearance_title(t("Appearance", "Görünüm"));
     tr.set_appearance_desc(t("Light, dark, or the same as Windows.", "Açık, koyu veya Windows ile aynı."));
     tr.set_language_title(t("Language", "Dil"));
@@ -395,9 +395,6 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "How the window is drawn, from the next start.",
         "Pencere çizim motoru (sonraki açılışta geçerli olur).",
     ));
-    tr.set_decoder_title(t("Video decoder", "Video çözücü"));
-    tr.set_decoder_placeholder(t("Built-in ffmpeg", "Dahili ffmpeg"));
-    tr.set_apply(t("Apply", "Uygula"));
     tr.set_settings_file(t("Settings file", "Ayar dosyası"));
     tr.set_sec_about(t("About and updates", "Hakkında ve güncellemeler"));
     tr.set_about_default(t(
@@ -407,14 +404,13 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
     tr.set_update_to_prefix(t("Update to ", "Güncelle: "));
     tr.set_check_updates(t("Check for updates", "Güncellemeleri denetle"));
     tr.set_auto_update_title(t("Check for updates at start-up", "Açılışta güncellemeleri denetle"));
-    tr.set_auto_update_desc_prefix(t("From ", "Kaynak: "));
-    tr.set_auto_update_desc_suffix(t(
-        ". A new version installs by itself and Tapas restarts.",
-        ". Yeni sürüm otomatik kurulur ve Tapas yeniden başlar.",
+    tr.set_auto_update_desc(t(
+        "When a new version is available, it installs automatically and Tapas restarts.",
+        "Yeni sürüm çıktığında otomatik olarak kurulur ve Tapas yeniden başlar.",
     ));
     tr.set_credits_note(t(
-        "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).",
-        "Tapas'ın bulut istemcisi MIT lisanslı Topo ve Topo TV projelerinden, hub kayıt protokolü ise Mihai Dinculescu'nun tapo paketinden uyarlanmıştır. Video çözme ve MP4 dışa aktarma FFmpeg (LGPL) ile yapılır.",
+        "Uses FFmpeg (LGPL) and open-source Tapo protocol libraries (MIT).",
+        "FFmpeg (LGPL) ve açık kaynaklı Tapo protokol kütüphanelerini (MIT) kullanır.",
     ));
 
     // Localized ComboBox & filter chip models

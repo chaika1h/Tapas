@@ -419,7 +419,6 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     }));
     b.set_app_version(crate::update::CURRENT.into());
     b.set_check_updates(!app.cfg.borrow().skip_update_checks);
-    b.set_update_source(format!("github.com/{}/releases", app.update_repo()).into());
     b.set_recordings(app.rec_rows.clone().into());
     b.on_tl_click(cb!(&app, |a, f| a.tl_click(f)));
     let weak = Rc::downgrade(&app);
@@ -1276,7 +1275,7 @@ impl App {
         }
         b.set_update_busy(asked);
         if asked {
-            b.set_update_status("Checking for updates…".into());
+            b.set_update_status(i18n::pick("Checking for updates…", "Güncellemeler denetleniyor…").into());
         }
         let repo = self.update_repo();
         self.rt.spawn(async move {
@@ -1297,7 +1296,13 @@ impl App {
                 let notes = release.notes.lines().next().unwrap_or("").to_string();
                 b.set_update_status(
                     if notes.is_empty() {
-                        format!("Version {} is available.", release.version)
+                        if i18n::is_tr() {
+                            format!("Sürüm {} mevcut.", release.version)
+                        } else {
+                            format!("Version {} is available.", release.version)
+                        }
+                    } else if i18n::is_tr() {
+                        format!("Sürüm {} mevcut: {notes}", release.version)
                     } else {
                         format!("Version {} is available: {notes}", release.version)
                     }
@@ -1307,12 +1312,15 @@ impl App {
             }
             Ok(None) => {
                 b.set_update_available(false);
-                b.set_update_status("This is the newest version.".into());
+                b.set_update_status(i18n::pick("This is the newest version.", "En güncel sürümü kullanıyorsunuz.").into());
             }
             Err(e) => {
                 log::info!("update check: {e:#}");
                 if asked {
-                    b.set_update_status(format!("Couldn't check for updates: {e:#}").into());
+                    b.set_update_status(
+                        format!("{}: {e:#}", i18n::pick("Couldn't check for updates", "Güncellemeler denetlenemedi"))
+                            .into(),
+                    );
                 }
             }
         }
@@ -1326,15 +1334,23 @@ impl App {
         let b = ui.global::<Bridge>();
         b.set_update_busy(true);
         b.set_update_failed(false);
-        b.set_update_status(format!("Downloading version {}…", release.version).into());
+        b.set_update_status(
+            if i18n::is_tr() {
+                format!("Sürüm {} indiriliyor…", release.version)
+            } else {
+                format!("Downloading version {}…", release.version)
+            }
+            .into(),
+        );
         self.rt.spawn(async move {
             let mut last = Instant::now();
             let mut progress = |got: u64, total: u64| {
                 if last.elapsed() >= Duration::from_millis(300) {
                     last = Instant::now();
+                    let label = i18n::pick("Downloading the update…", "Güncelleme indiriliyor…");
                     let text = match (got * 100).checked_div(total) {
-                        Some(percent) => format!("Downloading the update… {percent}%"),
-                        None => format!("Downloading the update… {:.1} MB", got as f64 / 1_048_576.0),
+                        Some(percent) => format!("{label} {percent}%"),
+                        None => format!("{label} {:.1} MB", got as f64 / 1_048_576.0),
                     };
                     on_ui(move |app| app.ui().global::<Bridge>().set_update_status(text.into()));
                 }
@@ -1350,7 +1366,13 @@ impl App {
         let started = result.and_then(|path| crate::update::install(&path));
         match started {
             Ok(()) => {
-                b.set_update_status("Installing the update; the app will start again…".into());
+                b.set_update_status(
+                    i18n::pick(
+                        "Installing the update; the app will start again…",
+                        "Güncelleme kuruluyor; uygulama yeniden başlatılacak…",
+                    )
+                    .into(),
+                );
                 // Let the installer start, then make way for it.
                 slint::Timer::single_shot(Duration::from_millis(600), || {
                     let _ = slint::quit_event_loop();
@@ -1359,7 +1381,7 @@ impl App {
             Err(e) => {
                 b.set_update_busy(false);
                 b.set_update_failed(true);
-                b.set_update_status(format!("Couldn't update: {e:#}").into());
+                b.set_update_status(format!("{}: {e:#}", i18n::pick("Couldn't update", "Güncelleme başarısız")).into());
             }
         }
     }
@@ -1442,35 +1464,18 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         let cfg = self.cfg.borrow();
-        b.set_ffmpeg_path(cfg.ffmpeg_path.as_str().into());
         b.set_renderer_index(cfg.renderer.index());
         b.set_theme_index(cfg.theme.index());
         b.set_language_index(cfg.language.index());
         b.set_config_path(config::config_path().display().to_string().into());
-        b.set_ffmpeg_found(
-            match &*self.ffmpeg.borrow() {
-                Some(p) if crate::ffmpeg::is_bundled(p) => {
-                    i18n::pick("Using the built-in ffmpeg.", "Dahili ffmpeg kullanılıyor.").to_string()
-                }
-                Some(p) => format!("{} {}", i18n::pick("Using", "Kullanılan:"), p.display()),
-                None => i18n::pick(
-                    "ffmpeg not found: live view needs it. Download ffmpeg (e.g. gyan.dev or BtbN builds) \
-                     and put ffmpeg.exe next to Tapas.exe.",
-                    "ffmpeg bulunamadı: canlı izleme için gereklidir. ffmpeg.exe dosyasını Tapas.exe yanına koyun.",
-                )
-                .into(),
-            }
-            .into(),
-        );
     }
 
-    /// "Save" under Video & display.
-    /// Applies the Settings page's appearance and video choices as they're
-    /// made.
+    /// Applies the Settings page's appearance, language and renderer choices as
+    /// they're made.
     fn save_settings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let (ffmpeg_changed, lang_changed) = {
+        let lang_changed = {
             let mut cfg = self.cfg.borrow_mut();
             let renderer = Renderer::from_index(b.get_renderer_index());
             if renderer != cfg.renderer {
@@ -1484,10 +1489,7 @@ impl App {
             let language = Language::from_index(b.get_language_index());
             let lang_changed = language != cfg.language;
             cfg.language = language;
-            let path = b.get_ffmpeg_path().trim().to_string();
-            let changed = path != cfg.ffmpeg_path;
-            cfg.ffmpeg_path = path;
-            (changed, lang_changed)
+            lang_changed
         };
         self.persist();
         let theme_index = self.cfg.borrow().theme.index();
@@ -1496,6 +1498,9 @@ impl App {
         if lang_changed {
             let lang = i18n::set(self.cfg.borrow().language);
             i18n::apply_to_ui(&ui, lang);
+            if !b.get_update_available() && !b.get_update_busy() && !b.get_update_status().is_empty() {
+                b.set_update_status(i18n::pick("This is the newest version.", "En güncel sürümü kullanıyorsunuz.").into());
+            }
             self.refresh_home_cards();
             self.refresh_camera_lists();
             self.refresh_hub_lists();
@@ -1503,13 +1508,6 @@ impl App {
             self.update_calendar();
             self.rebuild_rec_rows();
             self.refresh_rec_rows();
-        }
-        if ffmpeg_changed {
-            *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
-            // A different ffmpeg: reconnect the streams.
-            self.streams.borrow_mut().clear();
-            self.sync_streams();
-            self.status(i18n::pick("Video decoder changed.", "Video çözücü değiştirildi."));
         }
         self.load_settings_into_ui();
     }

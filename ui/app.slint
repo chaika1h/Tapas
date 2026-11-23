@@ -166,8 +166,6 @@ export global Bridge {
     callback mfa-back();
 
     // settings: app
-    in-out property <string> ffmpeg-path;
-    in property <string> ffmpeg-found;
     in-out property <int> renderer-index;
     in-out property <int> theme-index; // 0 system, 1 light, 2 dark
     in-out property <int> language-index; // 0 system, 1 English, 2 Turkish
@@ -273,7 +271,6 @@ export global Bridge {
     in property <bool> update-busy;
     // The last update attempt failed; `update-status` says why.
     in property <bool> update-failed;
-    in property <string> update-source;
     in-out property <bool> check-updates: true;
     in-out property <bool> update-dismissed;
     callback check-update();
@@ -411,25 +408,21 @@ export global Tr {
     in-out property <string> stream-quality-note: "SD is light on the network and the PC, for the grid; HD is the camera's full picture. A camera opened on its own is always HD to start with.";
     in-out property <string> add-camera-desc: "Cameras removed here, or ones the list missed, can be added back.";
     in-out property <string> add: "Add";
-    in-out property <string> sec-appearance: "Appearance and video";
+    in-out property <string> sec-appearance: "General";
     in-out property <string> appearance-title: "Appearance";
     in-out property <string> appearance-desc: "Light, dark, or the same as Windows.";
     in-out property <string> language-title: "Language";
     in-out property <string> language-desc: "Display language; applies immediately.";
     in-out property <string> renderer-title: "Graphics renderer";
     in-out property <string> renderer-desc: "How the window is drawn, from the next start.";
-    in-out property <string> decoder-title: "Video decoder";
-    in-out property <string> decoder-placeholder: "Built-in ffmpeg";
-    in-out property <string> apply: "Apply";
     in-out property <string> settings-file: "Settings file";
     in-out property <string> sec-about: "About and updates";
     in-out property <string> about-default: "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.";
     in-out property <string> update-to-prefix: "Update to ";
     in-out property <string> check-updates: "Check for updates";
     in-out property <string> auto-update-title: "Check for updates at start-up";
-    in-out property <string> auto-update-desc-prefix: "From ";
-    in-out property <string> auto-update-desc-suffix: ". A new version installs by itself and Tapas restarts.";
-    in-out property <string> credits-note: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
+    in-out property <string> auto-update-desc: "When a new version is available, it installs automatically and Tapas restarts.";
+    in-out property <string> credits-note: "Uses FFmpeg (LGPL) and open-source Tapo protocol libraries (MIT).";
     in-out property <[string]> appearance-labels: ["Same as Windows", "Light", "Dark"];
     in-out property <[string]> language-labels: ["System (Auto)", "English", "Türkçe"];
     in-out property <[string]> renderer-labels: ["OpenGL (recommended)", "Software (CPU)"];
@@ -3187,24 +3180,6 @@ component SettingsPage inherits Rectangle {
                         }
                     }
                     SettingRow {
-                        icon: Icons.video;
-                        title: Tr.decoder-title;
-                        description: Bridge.ffmpeg-found;
-                        VerticalLayout {
-                            alignment: center;
-                            LineEdit {
-                                width: 220px;
-                                text <=> Bridge.ffmpeg-path;
-                                placeholder-text: Tr.decoder-placeholder;
-                                accepted => { Bridge.save-settings(); }
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Button { text: Tr.apply; clicked => { Bridge.save-settings(); } }
-                        }
-                    }
-                    SettingRow {
                         icon: Icons.folder;
                         title: Tr.settings-file;
                         description: Bridge.config-path;
@@ -3247,7 +3222,7 @@ component SettingsPage inherits Rectangle {
                     SettingRow {
                         icon: Icons.download;
                         title: Tr.auto-update-title;
-                        description: Tr.auto-update-desc-prefix + Bridge.update-source + Tr.auto-update-desc-suffix;
+                        description: Tr.auto-update-desc;
                         VerticalLayout {
                             alignment: center;
                             Switch {

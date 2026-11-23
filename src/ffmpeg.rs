@@ -39,11 +39,6 @@ pub fn find(configured: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
 }
 
-/// Whether `path` is the copy unpacked from this exe.
-pub fn is_bundled(path: &Path) -> bool {
-    bundled::extract().is_some_and(|p| p == path)
-}
-
 /// The minimal ffmpeg embedded at build time (see `build.rs`), unpacked on
 /// first use to `%LOCALAPPDATA%\Tapas`.
 #[cfg(bundled_ffmpeg)]
