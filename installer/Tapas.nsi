@@ -64,30 +64,62 @@ VIAddVersionKey "LegalCopyright" "MIT licence"
 
 !insertmacro MUI_LANGUAGE "English"
 
-; The app may still be closing (after starting an update) or be open (when
-; installing by hand): wait for its file to be free.
-!macro WaitForApp
-  StrCpy $0 0
-  ${Do}
+; Whether the installed app is running ($R9 = 1): a running program's file
+; can't be opened for writing. (Renaming it is no test: Windows lets a running
+; program's file be renamed.)
+!macro AppRunning
+  StrCpy $R9 0
+  ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
     ClearErrors
-    ${If} ${FileExists} "$INSTDIR\${APP_EXE}"
-      Rename "$INSTDIR\${APP_EXE}" "$INSTDIR\${APP_EXE}.old"
+    FileOpen $R8 "$INSTDIR\${APP_EXE}" a
+    ${If} ${Errors}
+      StrCpy $R9 1
+    ${Else}
+      FileClose $R8
     ${EndIf}
-    ${IfNot} ${Errors}
-      ${Break}
+  ${EndIf}
+!macroend
+
+; The app may still be closing (after starting an update) or be open (when
+; installing or uninstalling by hand): close it and wait until its file is
+; free. `what` finishes the question: "install the new version".
+!macro WaitForApp what
+  ; Left by earlier installers, which renamed the app's file out of the way.
+  Delete "$INSTDIR\${APP_EXE}.old"
+  !insertmacro AppRunning
+  ${If} $R9 == 1
+  ${AndIfNot} ${Silent}
+    MessageBox MB_OKCANCEL|MB_ICONINFORMATION "${APP_NAME} is open. Press OK to close it and ${what}." IDOK +2
+    Abort
+  ${EndIf}
+  StrCpy $R7 0
+  ${DoWhile} $R9 == 1
+    ${If} $R7 == 0
+      DetailPrint "Closing ${APP_NAME}…"
+      ; Asks it to close, as its window's close button does. (An update
+      ; needn't: the app is closing by itself.)
+      ${IfNot} ${Silent}
+        nsExec::Exec 'taskkill /IM "${APP_EXE}"'
+        Pop $R6
+      ${EndIf}
     ${EndIf}
-    IntOp $0 $0 + 1
-    ${If} $0 > 40
+    ; Still running after 8 s: end it.
+    ${If} $R7 == 32
+      nsExec::Exec 'taskkill /F /IM "${APP_EXE}"'
+      Pop $R6
+    ${EndIf}
+    ${If} $R7 > 80
       ${If} ${Silent}
         Abort
       ${EndIf}
-      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP_NAME} is still open. Close it, then press Retry." IDRETRY +2
+      MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "${APP_NAME} couldn't be closed. Close it, then press Retry." IDRETRY +2
       Abort
-      StrCpy $0 0
+      StrCpy $R7 1
     ${EndIf}
+    IntOp $R7 $R7 + 1
     Sleep 250
+    !insertmacro AppRunning
   ${Loop}
-  Delete "$INSTDIR\${APP_EXE}.old"
 !macroend
 
 ; The app was called Tapo Viewer: an installed Tapo Viewer is closed (by the
@@ -98,6 +130,9 @@ Function RemoveTapoViewer
   ${If} $R0 == ""
     Return
   ${EndIf}
+  ; Close it if it's open.
+  nsExec::Exec 'taskkill /IM "TapoViewer.exe"'
+  Pop $R2
   StrCpy $R1 0
   ${Do}
     ClearErrors
@@ -106,6 +141,10 @@ Function RemoveTapoViewer
       ${Break}
     ${EndIf}
     IntOp $R1 $R1 + 1
+    ${If} $R1 == 20
+      nsExec::Exec 'taskkill /F /IM "TapoViewer.exe"'
+      Pop $R2
+    ${EndIf}
     ${If} $R1 > 40
       ${Break}
     ${EndIf}
@@ -126,7 +165,7 @@ FunctionEnd
 Section "${APP_NAME}" SecApp
   SectionIn RO
   SetOutPath "$INSTDIR"
-  !insertmacro WaitForApp
+  !insertmacro WaitForApp "install the new version"
   Call RemoveTapoViewer
   File "/oname=${APP_EXE}" "${OUT_DIR}\${APP_EXE}"
   File "/oname=README.md" "..\README.md"
@@ -176,6 +215,7 @@ Function .onInstSuccess
 FunctionEnd
 
 Section "Uninstall"
+  !insertmacro WaitForApp "uninstall it"
   Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\Uninstall.exe"
