@@ -35,8 +35,9 @@ const WINDOW: i64 = 120;
 /// The next window is fetched when less than this many seconds (times the
 /// speed) are left to show.
 const AHEAD: i64 = 45;
-/// How much fetched video is kept in memory, across recordings.
-const CACHE_BYTES: usize = 200 << 20;
+/// How much fetched video is kept in memory, across recordings: several
+/// minutes of a camera's HD video.
+const CACHE_BYTES: usize = 128 << 20;
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 

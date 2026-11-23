@@ -6,6 +6,7 @@ mod clip;
 mod cloud;
 mod config;
 mod ffmpeg;
+mod pictures;
 mod playback;
 mod ptz;
 mod relay;

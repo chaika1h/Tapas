@@ -18,4 +18,4 @@ cloud.
     playback at a chosen speed);
   - the rawvideo encoder and muxer, for frames out.
 
-To use a different ffmpeg, set its path in the app under *Settings › Video & display*.
+To use a different ffmpeg, set its path in the app under *Settings › Appearance and video*.

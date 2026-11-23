@@ -214,6 +214,31 @@ pub struct HubInfo {
     pub storage: Vec<String>,
     /// A disk's state when it isn't "normal", e.g. "HDD: unformatted".
     pub storage_status: String,
+    /// The same disks, largest first, for the storage bar.
+    pub disks: Vec<Disk>,
+}
+
+/// One of a hub's disks.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Disk {
+    /// "HDD", "Internal", "SD card"...
+    pub label: String,
+    /// As the hub says them, spaced: "931.5 GB".
+    pub total: String,
+    pub free: String,
+    /// The same in bytes, 0 when unknown.
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// "normal", "unformatted"...
+    pub status: String,
+}
+
+impl Disk {
+    /// How full it is, 0 to 1, if known.
+    pub fn used(&self) -> Option<f32> {
+        (self.total_bytes > 0 && !self.free.is_empty())
+            .then(|| 1.0 - (self.free_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0) as f32)
+    }
 }
 
 /// The Tapo app's homes ("families") and rooms.
@@ -1211,7 +1236,7 @@ fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
     };
     // A hub lists each disk: its own storage and, in an H500, the hard disk.
     let list = disks.pointer("/harddisk_manage/hd_info");
-    let mut found: Vec<(f64, String)> = Vec::new();
+    let mut found: Vec<(f64, String, Disk)> = Vec::new();
     for disk in section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()) {
         let total = str_field(disk, "total_space");
         if total.is_empty() {
@@ -1223,14 +1248,23 @@ fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
             false => format!("{label} {} free of {}", spaced(&free), spaced(&total)),
             true => format!("{label} {}", spaced(&total)),
         };
-        found.push((size_bytes(&total), text));
         let status = str_field(disk, "status");
         if !status.is_empty() && !status.eq_ignore_ascii_case("normal") {
             parsed.storage_status = format!("{label}: {status}");
         }
+        let entry = Disk {
+            label,
+            total: spaced(&total),
+            free: if free.is_empty() { String::new() } else { spaced(&free) },
+            total_bytes: size_bytes(&total) as u64,
+            free_bytes: size_bytes(&free) as u64,
+            status,
+        };
+        found.push((size_bytes(&total), text, entry));
     }
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
-    parsed.storage = found.into_iter().map(|(_, t)| t).collect();
+    parsed.storage = found.iter().map(|(_, t, _)| t.clone()).collect();
+    parsed.disks = found.into_iter().map(|(_, _, d)| d).collect();
     parsed
 }
 
@@ -1652,7 +1686,27 @@ mod tests {
             ip: "192.168.1.40".into(),
             storage: vec!["HDD 812.0 GB free of 931.5 GB".into(), "Internal 7.44 GB free of 10.00 GB".into()],
             storage_status: String::new(),
+            disks: vec![
+                Disk {
+                    label: "HDD".into(),
+                    total: "931.5 GB".into(),
+                    free: "812.0 GB".into(),
+                    total_bytes: 931_500_000_000,
+                    free_bytes: 812_000_000_000,
+                    status: "normal".into(),
+                },
+                Disk {
+                    label: "Internal".into(),
+                    total: "10.00 GB".into(),
+                    free: "7.44 GB".into(),
+                    total_bytes: 10_000_000_000,
+                    free_bytes: 7_440_000_000,
+                    status: "normal".into(),
+                },
+            ],
         });
+        let used = parse_hub_info(&info, &disks).disks[0].used().unwrap();
+        assert!((used - 0.128).abs() < 0.01, "{used}");
         let broken = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "hdd", "total_space": "1TB", "status": "unformatted"}}]}});
         assert_eq!(parse_hub_info(&json!({}), &broken).storage_status, "HDD: unformatted");
         assert_eq!(parse_hub_info(&json!({}), &json!({})), HubInfo::default());
