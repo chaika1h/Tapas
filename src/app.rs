@@ -340,8 +340,14 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     app.update_rec_date_label();
     app.update_calendar();
     if app.signed_in_now() {
-        let hubs = app.cfg.borrow().hubs.clone();
-        app.load_account_details(&hubs);
+        // The hubs as the account has them now (names, new hubs), then their
+        // details, homes and rooms.
+        if let Some(client) = app.cloud_client() {
+            app.rt.spawn(async move {
+                let hubs = client.list_hubs().await;
+                on_ui(move |app| app.cloud_hubs_loaded(hubs));
+            });
+        }
     }
     app.reset_timeline();
     app.sync_streams();
@@ -1188,12 +1194,9 @@ impl App {
                 if !info.firmware.is_empty() {
                     detail += &format!(" · firmware {}", info.firmware.split_whitespace().next().unwrap_or(""));
                 }
-                let mut storage = match info.storage.as_str() {
-                    "" => String::new(),
-                    s => format!("Storage: {s}"),
-                };
-                if !info.storage_status.is_empty() && !info.storage_status.eq_ignore_ascii_case("normal") {
-                    storage += &format!(" ({})", info.storage_status);
+                let mut storage = info.storage.join("\n");
+                if !info.storage_status.is_empty() {
+                    storage += &format!("\n{}", info.storage_status);
                 }
                 HubRow { id: i as i32, name: h.name.as_str().into(), detail: detail.into(), storage: storage.into() }
             })

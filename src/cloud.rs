@@ -210,9 +210,9 @@ impl Clip {
 pub struct HubInfo {
     pub firmware: String,
     pub ip: String,
-    /// e.g. "1.2TB free of 1.8TB", if it said.
-    pub storage: String,
-    /// The storage's state, e.g. "normal", if it said.
+    /// Its disks, largest first: e.g. "HDD 812 GB free of 931 GB".
+    pub storage: Vec<String>,
+    /// A disk's state when it isn't "normal", e.g. "HDD: unformatted".
     pub storage_status: String,
 }
 
@@ -1209,19 +1209,67 @@ fn parse_hub_info(info: &Value, disks: &Value) -> HubInfo {
         ip: first(&["local_ip", "ip"]),
         ..Default::default()
     };
+    // A hub lists each disk: its own storage and, in an H500, the hard disk.
     let list = disks.pointer("/harddisk_manage/hd_info");
-    let disk = section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()).find(|d| d.get("total_space").is_some());
-    if let Some(disk) = disk {
+    let mut found: Vec<(f64, String)> = Vec::new();
+    for disk in section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()) {
         let total = str_field(disk, "total_space");
+        if total.is_empty() {
+            continue;
+        }
+        let label = disk_label(&str_field(disk, "type"), &str_field(disk, "disk_name"));
         let free = str_field(disk, "free_space");
-        parsed.storage = match (free.is_empty(), total.is_empty()) {
-            (false, false) => format!("{free} free of {total}"),
-            (true, false) => total,
-            _ => String::new(),
+        let text = match free.is_empty() {
+            false => format!("{label} {} free of {}", spaced(&free), spaced(&total)),
+            true => format!("{label} {}", spaced(&total)),
         };
-        parsed.storage_status = str_field(disk, "status");
+        found.push((size_bytes(&total), text));
+        let status = str_field(disk, "status");
+        if !status.is_empty() && !status.eq_ignore_ascii_case("normal") {
+            parsed.storage_status = format!("{label}: {status}");
+        }
     }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    parsed.storage = found.into_iter().map(|(_, t)| t).collect();
     parsed
+}
+
+/// "HDD", "Internal", "SD card" from a disk's `type`, else its name.
+fn disk_label(kind: &str, name: &str) -> String {
+    let k = kind.to_ascii_lowercase();
+    if k.contains("hdd") || k.contains("sata") || k.contains("hard") {
+        "HDD".into()
+    } else if k.contains("emmc") || k.contains("local") || k.contains("internal") || k.contains("flash") {
+        "Internal".into()
+    } else if k.contains("sd") {
+        "SD card".into()
+    } else if !kind.is_empty() {
+        kind.to_string()
+    } else if !name.is_empty() {
+        format!("Disk {name}")
+    } else {
+        "Disk".into()
+    }
+}
+
+/// "931.5GB" → "931.5 GB".
+fn spaced(size: &str) -> String {
+    let at = size.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(size.len());
+    format!("{} {}", &size[..at], &size[at..]).trim().to_string()
+}
+
+/// "1.8TB" → bytes, for putting the largest disk first.
+fn size_bytes(size: &str) -> f64 {
+    let at = size.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(size.len());
+    let number: f64 = size[..at].trim().parse().unwrap_or(0.0);
+    let scale = match size[at..].trim().to_ascii_uppercase().chars().next() {
+        Some('K') => 1e3,
+        Some('M') => 1e6,
+        Some('G') => 1e9,
+        Some('T') => 1e12,
+        _ => 1.0,
+    };
+    number * scale
 }
 
 /// Objects anywhere in `value` that have one of `id_keys`.
@@ -1594,13 +1642,19 @@ mod tests {
     #[test]
     fn hub_info_and_homes() {
         let info = json!({"device_info": {"basic_info": {"sw_version": "1.2.3 Build 250101", "local_ip": "192.168.1.40"}}});
-        let disks = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"total_space": "1.8TB", "free_space": "1.2TB", "status": "normal"}}]}});
+        // An H500: its own storage, then the hard disk.
+        let disks = json!({"harddisk_manage": {"hd_info": [
+            {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.44GB", "status": "normal"}},
+            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931.5GB", "free_space": "812.0GB", "status": "normal"}}
+        ]}});
         assert_eq!(parse_hub_info(&info, &disks), HubInfo {
             firmware: "1.2.3 Build 250101".into(),
             ip: "192.168.1.40".into(),
-            storage: "1.2TB free of 1.8TB".into(),
-            storage_status: "normal".into(),
+            storage: vec!["HDD 812.0 GB free of 931.5 GB".into(), "Internal 7.44 GB free of 10.00 GB".into()],
+            storage_status: String::new(),
         });
+        let broken = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "hdd", "total_space": "1TB", "status": "unformatted"}}]}});
+        assert_eq!(parse_hub_info(&json!({}), &broken).storage_status, "HDD: unformatted");
         assert_eq!(parse_hub_info(&json!({}), &json!({})), HubInfo::default());
 
         let rooms = json!({"data": {"rooms": [
