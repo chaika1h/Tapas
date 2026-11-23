@@ -49,10 +49,31 @@ fn select_backend(renderer: Renderer) {
         return;
     }
     let base = || slint::BackendSelector::new().backend_name("winit".into());
+    let wgpu_config = |backends: slint::wgpu_30::wgpu::Backends| {
+        use slint::wgpu_30::{WGPUConfiguration, WGPUSettings, wgpu};
+        let mut settings = WGPUSettings::default();
+        settings.backends = backends;
+        // Prefer the integrated GPU so a discrete GPU driver isn't spun up just
+        // for a 2D UI + video viewer.
+        settings.power_preference = wgpu::PowerPreference::LowPower;
+        // Keep gpu-allocator D3D12/Vulkan heap blocks small (4..16 MiB device,
+        // 4..8 MiB host) instead of growing up to 64 MiB and holding them idle.
+        const MB: u64 = 1024 * 1024;
+        settings.device_memory_hints = wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: (4 * MB)..(16 * MB),
+        };
+        WGPUConfiguration::Automatic(settings)
+    };
     let selector = match renderer {
-        Renderer::Direct3D if cfg!(windows) => base().renderer_name("femtovg-wgpu".into()).require_d3d(),
-        Renderer::Direct3D => base().renderer_name("femtovg-wgpu".into()),
-        Renderer::Vulkan => base().renderer_name("femtovg-wgpu".into()).require_vulkan(),
+        Renderer::Direct3D if cfg!(windows) => base()
+            .renderer_name("femtovg-wgpu".into())
+            .require_wgpu_30(wgpu_config(slint::wgpu_30::wgpu::Backends::DX12)),
+        Renderer::Direct3D => base()
+            .renderer_name("femtovg-wgpu".into())
+            .require_wgpu_30(wgpu_config(slint::wgpu_30::wgpu::Backends::PRIMARY)),
+        Renderer::Vulkan => base()
+            .renderer_name("femtovg-wgpu".into())
+            .require_wgpu_30(wgpu_config(slint::wgpu_30::wgpu::Backends::VULKAN)),
         Renderer::Software => base().renderer_name("software".into()),
         Renderer::OpenGL => base().renderer_name("femtovg".into()),
     };

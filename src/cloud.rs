@@ -1293,51 +1293,76 @@ fn parse_hub_info(info: &Value, disk_answers: &[Value]) -> HubInfo {
         ..Default::default()
     };
     // The disks: a hub's own storage and, in an H500, the hard disk, from
-    // both answers (a disk in both counts once).
-    let mut found: Vec<(f64, String, Disk)> = Vec::new();
+    // both answers. An H500 reports its built-in eMMC in both getSdCardStatus
+    // and getHardDiskStatus (sometimes with different reported sizes, e.g.
+    // 10.00 GB vs 9.00 GB with 0 GB free), so deduplicate built-in storage
+    // by label and external disks by (label, disk_name), keeping the entry
+    // with the larger capacity (or more complete free-space info on ties).
     let entries = disk_answers.iter().flat_map(|answer| {
         let list = answer.pointer("/harddisk_manage/hd_info");
         section_entries(list).chain(list.and_then(Value::as_array).into_iter().flatten()).collect::<Vec<_>>()
     });
-    let mut seen = std::collections::HashSet::new();
+    let mut by_key: HashMap<(String, String), (f64, String, Disk)> = HashMap::new();
     for disk in entries {
-        if !seen.insert((str_field(disk, "type"), str_field(disk, "disk_name"), str_field(disk, "total_space"))) {
-            continue;
-        }
         let total = str_field(disk, "total_space");
         if total.is_empty() {
             continue;
         }
-        let label = disk_label(&str_field(disk, "type"), &str_field(disk, "disk_name"));
+        let disk_name = str_field(disk, "disk_name");
+        let label = disk_label(&str_field(disk, "type"), &disk_name);
         let free = str_field(disk, "free_space");
+        let total_f = size_bytes(&total);
+        let total_bytes = total_f as u64;
+        let free_bytes = size_bytes(&free) as u64;
         let text = match free.is_empty() {
             false => format!("{label} {} free of {}", spaced(&free), spaced(&total)),
             true => format!("{label} {}", spaced(&total)),
         };
         let status = str_field(disk, "status");
-        if !status.is_empty() && !status.eq_ignore_ascii_case("normal") {
-            parsed.storage_status = format!("{label}: {status}");
-        }
         let entry = Disk {
-            label,
+            label: label.clone(),
             total: spaced(&total),
             free: if free.is_empty() { String::new() } else { spaced(&free) },
-            total_bytes: size_bytes(&total) as u64,
-            free_bytes: size_bytes(&free) as u64,
+            total_bytes,
+            free_bytes,
             status,
         };
-        found.push((size_bytes(&total), text, entry));
+        let key = if label == "Internal" {
+            (label, String::new())
+        } else if !disk_name.is_empty() {
+            (label, disk_name)
+        } else {
+            (label, total_bytes.to_string())
+        };
+        let replace = match by_key.get(&key) {
+            None => true,
+            Some((_, _, existing)) => {
+                // Prefer the entry with the larger reported total size, or
+                // non-empty / larger free space when total sizes match.
+                (entry.total_bytes, !entry.free.is_empty(), entry.free_bytes)
+                    > (existing.total_bytes, !existing.free.is_empty(), existing.free_bytes)
+            }
+        };
+        if replace {
+            by_key.insert(key, (total_f, text, entry));
+        }
     }
+    let mut found: Vec<(f64, String, Disk)> = by_key.into_values().collect();
     found.sort_by(|a, b| b.0.total_cmp(&a.0));
+    if let Some((_, _, d)) = found.iter().find(|(_, _, d)| !d.status.is_empty() && !d.status.eq_ignore_ascii_case("normal")) {
+        parsed.storage_status = format!("{}: {}", d.label, d.status);
+    }
     parsed.storage = found.iter().map(|(_, t, _)| t.clone()).collect();
     parsed.disks = found.into_iter().map(|(_, _, d)| d).collect();
     parsed
 }
 
-/// "HDD", "Internal", "SD card" from a disk's `type`, else its name.
+/// "HDD", "SSD", "Internal", "SD card" from a disk's `type`, else its name.
 fn disk_label(kind: &str, name: &str) -> String {
     let k = kind.to_ascii_lowercase();
-    if k.contains("hdd") || k.contains("sata") || k.contains("hard") {
+    if k.contains("ssd") {
+        "SSD".into()
+    } else if k.contains("hdd") || k.contains("sata") || k.contains("hard") {
         "HDD".into()
     } else if k.contains("emmc") || k.contains("local") || k.contains("internal") || k.contains("flash") {
         "Internal".into()
@@ -1522,10 +1547,22 @@ pub fn decode_name(name: &str) -> String {
     if looks_encoded
         && let Ok(bytes) = B64.decode(name)
         && let Ok(text) = String::from_utf8(bytes)
-        && !text.trim().is_empty()
-        && !text.chars().any(char::is_control)
     {
-        return text.trim().to_string();
+        let trimmed = text.trim();
+        let has_padding = name.ends_with('=');
+        let plausible = !trimmed.is_empty()
+            && !text.chars().any(char::is_control)
+            // Unpadded 4-char ASCII strings like "T200" or "P100" decode to
+            // short gibberish ("Om4", "?]4"); require clean name characters
+            // when there is no base64 `=` padding.
+            && (has_padding
+                || (name.len() > 4
+                    && trimmed.chars().all(|c| {
+                        c.is_alphanumeric() || c.is_whitespace() || matches!(c, '-' | '_' | '\'' | '(' | ')' | '.' | '&' | '/' | ',' | ':')
+                    })));
+        if plausible {
+            return trimmed.to_string();
+        }
     }
     name.to_string()
 }
@@ -1749,8 +1786,12 @@ mod tests {
     #[test]
     fn base64_names_are_decoded() {
         assert_eq!(decode_name("VGFwbyBINTAw"), "Tapo H500");
+        assert_eq!(decode_name("SG9tZUJhc2U="), "HomeBase");
         assert_eq!(decode_name("Üst Kat"), "Üst Kat");
         assert_eq!(decode_name("Door"), "Door");
+        assert_eq!(decode_name("T200"), "T200");
+        assert_eq!(decode_name("S200"), "S200");
+        assert_eq!(decode_name("P100"), "P100");
         assert_eq!(decode_name("Garage"), "Garage");
         assert_eq!(decode_name("Front door"), "Front door");
         let hub = camera_from(&json!({"deviceId": "H", "alias": "VGFwbyBINTAw", "deviceType": "SMART.TAPOHUB"}));
@@ -1791,16 +1832,20 @@ mod tests {
             loop_recording: None,
         });
         let used = parse_hub_info(&info, std::slice::from_ref(&disks)).disks[0].used().unwrap();
-        // An H500: its built-in storage from getSdCardStatus, the hard disk
-        // (and the built-in storage again) from getHardDiskStatus.
-        let sd = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.45GB", "status": "normal"}}]}});
+        // An H500: getSdCardStatus reports built-in storage as 10.00 GB (7.45 GB free),
+        // while getHardDiskStatus reports it again with a smaller quota (9.00 GB, 0 GB free)
+        // alongside the SATA hard disk. Both collapse to one Built-in storage entry.
+        let sd = json!({"harddisk_manage": {"hd_info": [
+            {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.45GB", "status": "normal"}}
+        ]}});
         let hdd = json!({"harddisk_manage": {"hd_info": [
-            {"hd_info_1": {"type": "local", "disk_name": "1", "total_space": "10.00GB", "free_space": "7.45GB", "status": "normal"}},
-            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "942.50GB", "free_space": "0.00GB", "status": "normal", "temperature": 38}}
+            {"hd_info_1": {"type": "emmc", "disk_name": "1", "total_space": "9.00GB", "free_space": "0GB", "status": "normal"}},
+            {"hd_info_2": {"type": "hdd", "disk_name": "2", "total_space": "931GB", "free_space": "163.00GB", "status": "normal", "temperature": 38}}
         ]}});
         let both = parse_hub_info(&json!({}), &[hdd, sd]);
         assert_eq!(both.disks.len(), 2);
-        assert_eq!((both.disks[0].label.as_str(), both.disks[0].total.as_str()), ("HDD", "942.50 GB"));
+        assert_eq!((both.disks[0].label.as_str(), both.disks[0].total.as_str()), ("HDD", "931 GB"));
+        assert_eq!((both.disks[1].label.as_str(), both.disks[1].total.as_str(), both.disks[1].free.as_str()), ("Internal", "10.00 GB", "7.45 GB"));
         assert!((used - 0.128).abs() < 0.01, "{used}");
         let broken = json!({"harddisk_manage": {"hd_info": [{"hd_info_1": {"type": "hdd", "total_space": "1TB", "status": "unformatted"}}]}});
         assert_eq!(parse_hub_info(&json!({}), &[broken]).storage_status, "HDD: unformatted");

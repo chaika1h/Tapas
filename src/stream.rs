@@ -8,13 +8,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use slint::{Rgb8Pixel, SharedPixelBuffer};
+use slint::{Rgba8Pixel, SharedPixelBuffer};
 
 use crate::cloud::{CloudCamera, CloudClient, CloudError};
 use crate::config::Quality;
 use crate::ffmpeg;
 
-pub type Frame = SharedPixelBuffer<Rgb8Pixel>;
+pub type Frame = SharedPixelBuffer<Rgba8Pixel>;
 
 /// One camera's live video through the Tapo cloud relay.
 #[derive(Clone)]

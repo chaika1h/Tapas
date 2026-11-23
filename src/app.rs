@@ -44,8 +44,11 @@ pub fn on_ui(f: impl FnOnce(&Rc<App>) + Send + 'static) {
 pub fn shutdown() {
     if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
         app.timer.stop();
+        app.stop_event_pictures();
+        app.watching.borrow_mut().take();
         app.streams.borrow_mut().clear();
         app.ptz.borrow_mut().clear();
+        crate::playback::clear_cache();
     }
 }
 
@@ -62,6 +65,10 @@ struct Live {
 
 /// How long a stream no page needs keeps running.
 const STREAM_LINGER: Duration = Duration::from_secs(20);
+/// How long playback state and cached video stay warm after leaving Playback.
+const PLAYBACK_LINGER: Duration = Duration::from_secs(30);
+/// Maximum decoded event thumbnails kept in RAM at once (disk cache holds the rest).
+const MAX_EVENT_PICTURES: usize = 100;
 /// Home refreshes a camera's picture when it's older than this...
 const PICTURE_FRESH: Duration = Duration::from_secs(10 * 60);
 /// ...a couple of cameras at a time.
@@ -218,6 +225,11 @@ pub struct App {
     hub_info: RefCell<HashMap<String, HubInfo>>,
     /// Whether the hubs have been asked (whatever they answered).
     hub_info_tried: Cell<bool>,
+    /// When the user last left Playback, so cached recordings and thumbnails
+    /// are freed once idle elsewhere.
+    playback_left_at: Cell<Option<Instant>>,
+    /// Whether the UI pump timer is currently running at its fast (30 ms) rate.
+    timer_fast: Cell<bool>,
     /// A camera (cloud device id or name) to select once the hub's cameras
     /// are listed.
     pending_rec_camera: RefCell<Option<(String, String)>>,
@@ -289,6 +301,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         homes: RefCell::default(),
         hub_info: RefCell::default(),
         hub_info_tried: Cell::default(),
+        playback_left_at: Cell::default(),
+        timer_fast: Cell::new(true),
         rec_rows: Rc::new(VecModel::default()),
         event_pictures: RefCell::default(),
         picture_task: RefCell::default(),
@@ -415,7 +429,9 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         }
     }
 
+    keep_app_accent(ui);
     app.timer.start(slint::TimerMode::Repeated, Duration::from_millis(30), cb!(&app, |a| a.pump()));
+    app.sync_timer();
     if !app.cfg.borrow().skip_update_checks {
         slint::Timer::single_shot(Duration::from_secs(4), cb!(&app, |a| a.check_update(false)));
     }
@@ -450,14 +466,30 @@ impl App {
         }
     }
 
+    /// Runs the UI pump fast (30 ms) while video streams or playback are
+    /// active, and slow (500 ms) while idle so the app doesn't wake 33x/sec
+    /// on Home or Settings.
+    fn sync_timer(&self) {
+        let active_playback = self
+            .watching
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| !w.playback.state.lock().unwrap().paused);
+        let fast = !self.streams.borrow().is_empty() || active_playback;
+        if self.timer_fast.replace(fast) != fast {
+            self.timer.set_interval(Duration::from_millis(if fast { 30 } else { 500 }));
+        }
+    }
+
     // ---------------------------------------------------------------- frames
 
-    /// Runs every ~30 ms: moves new frames and status into the UI.
+    /// Runs every ~30 ms while active (500 ms while idle): moves new frames
+    /// and status into the UI, and sweeps unused streams and caches.
     fn pump(&self) {
         let Some(ui) = self.ui.upgrade() else { return };
-        keep_app_accent(&ui);
         let b = ui.global::<Bridge>();
-        match b.get_page() {
+        let page = b.get_page();
+        match page {
             Page::Home => self.pump_home(),
             Page::Live => {
                 self.update_columns(&ui);
@@ -469,16 +501,39 @@ impl App {
         }
         if self.last_memory_log.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(120)) {
             self.last_memory_log.set(Some(Instant::now()));
-            self.log_memory(b.get_page());
+            self.log_memory(page);
         }
         if self.last_sweep.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
             self.last_sweep.set(Some(Instant::now()));
+            keep_app_accent(&ui);
             self.streams.borrow_mut().retain(|_, l| l.unused_since.is_none_or(|t| t.elapsed() < STREAM_LINGER));
+            // Release playback cache, player frame and event thumbnails after
+            // lingering off the Playback page, so sitting on Home/Settings
+            // holds no recording buffers in RAM.
+            if page != Page::Recordings
+                && self.playback_left_at.get().is_some_and(|t| t.elapsed() >= PLAYBACK_LINGER)
+            {
+                self.playback_left_at.set(None);
+                self.release_playback_memory();
+            }
+            self.sync_timer();
         }
         let expired = self.status_until.borrow().is_some_and(|t| Instant::now() >= t);
         if expired {
             *self.status_until.borrow_mut() = None;
             b.set_status_text(SharedString::new());
+        }
+    }
+
+    /// Drops cached recordings, parked playback and decoded event thumbnails
+    /// after leaving the Playback page (event pictures stay on disk as JPEGs).
+    fn release_playback_memory(&self) {
+        self.stop_event_pictures();
+        self.player_stop();
+        crate::playback::clear_cache();
+        if !self.event_pictures.borrow().is_empty() {
+            self.event_pictures.borrow_mut().clear();
+            self.refresh_rec_rows();
         }
     }
 
@@ -489,10 +544,11 @@ impl App {
         let streams = self.streams.borrow().len();
         let watching = self.watching.borrow().is_some();
         log::info!(
-            "memory: {private} MB in use (working set {working} MB) · {:?} renderer · {page:?} page · {streams} video stream(s) · playback {} · {} MB of recordings cached",
+            "memory: {private} MB in use (working set {working} MB) · {:?} renderer · {page:?} page · {streams} video stream(s) · playback {} · {} MB of recordings cached · {} event picture(s)",
             self.cfg.borrow().renderer,
             if watching { "open" } else { "closed" },
             crate::playback::cached_bytes() >> 20,
+            self.event_pictures.borrow().len(),
         );
     }
 
@@ -511,7 +567,7 @@ impl App {
             }
             let Some(mut tile) = self.tiles.row_data(i) else { continue };
             if let Some(frame) = frame {
-                tile.frame = Image::from_rgb8(frame);
+                tile.frame = Image::from_rgba8_premultiplied(frame);
                 tile.has_frame = true;
                 live.shown_version = version;
             }
@@ -532,7 +588,7 @@ impl App {
         let slot = live.handle.slot.lock().unwrap();
         if slot.version != shown.0 {
             if let Some(frame) = slot.frame.clone() {
-                b.set_single_frame(Image::from_rgb8(frame));
+                b.set_single_frame(Image::from_rgba8_premultiplied(frame));
                 b.set_single_has_frame(true);
             }
             shown.0 = slot.version;
@@ -622,6 +678,8 @@ impl App {
                 streams.insert(key, Live { handle, shown_version: 0, shown_status: String::new(), unused_since: None });
             }
         }
+        drop(streams);
+        self.sync_timer();
     }
 
     fn spec(&self, cam: &CameraConfig, quality: Quality) -> Option<StreamSpec> {
@@ -658,6 +716,19 @@ impl App {
         self.ptz.borrow_mut().remove(&id);
     }
 
+    /// Releases Live-view tile textures while away from the Live page
+    /// (`tiles_from_pictures` restores them immediately when returning).
+    fn clear_tile_frames(&self) {
+        for i in 0..self.tiles.row_count() {
+            let Some(mut tile) = self.tiles.row_data(i) else { continue };
+            if tile.has_frame {
+                tile.frame = Image::default();
+                tile.has_frame = false;
+                self.tiles.set_row_data(i, tile);
+            }
+        }
+    }
+
     // ------------------------------------------------------------ navigation
 
     fn navigate(&self, page: Page) {
@@ -670,16 +741,27 @@ impl App {
         if matches!(from, Page::Live | Page::Single) {
             self.capture_thumbnails();
         }
-        // Leaving Playback pauses the recording, so it isn't fetched and
-        // decoded out of sight; ❚❚ (or a click on the picture) goes on.
-        if from == Page::Recordings
-            && page != Page::Recordings
-            && let Some(w) = self.watching.borrow().as_ref()
-        {
-            w.playback.set_paused(true);
+        if from == Page::Live && page != Page::Live {
+            self.clear_tile_frames();
+        }
+        // Leaving Playback pauses the recording and starts the linger timer
+        // so its cache and thumbnails are freed once idle elsewhere.
+        if from == Page::Recordings && page != Page::Recordings {
+            if let Some(w) = self.watching.borrow().as_ref() {
+                w.playback.set_paused(true);
+            }
+            self.stop_event_pictures();
+            self.playback_left_at.set(Some(Instant::now()));
+        }
+        if page == Page::Recordings {
+            self.playback_left_at.set(None);
         }
         if page != Page::Single {
             *self.single.borrow_mut() = None;
+            if b.get_single_has_frame() {
+                b.set_single_frame(Image::default());
+                b.set_single_has_frame(false);
+            }
         }
         if page == Page::Home {
             self.home_skip.borrow_mut().clear();
@@ -691,9 +773,15 @@ impl App {
         b.set_page(page);
         ui.invoke_focus_keys();
         self.sync_streams();
-        if page == Page::Recordings && self.hub.borrow().hub.is_none() && !b.get_hub_busy() {
-            self.connect_hub();
+        if page == Page::Recordings {
+            if self.hub.borrow().hub.is_none() && !b.get_hub_busy() {
+                self.connect_hub();
+            } else if self.event_pictures.borrow().is_empty() && !self.hub.borrow().events.is_empty() {
+                // Reload cached event JPEGs from disk if they were cleared while away.
+                self.fetch_event_pictures();
+            }
         }
+        self.sync_timer();
     }
 
     fn set_fullscreen(&self, on: bool) {
@@ -735,6 +823,7 @@ impl App {
             self.return_page.set(b.get_page());
             if b.get_page() == Page::Live {
                 self.capture_thumbnails();
+                self.clear_tile_frames();
             }
         }
         *self.single.borrow_mut() = Some((id, quality));
@@ -746,7 +835,7 @@ impl App {
         let placeholder = self.picture_of(id);
         b.set_single_has_frame(placeholder.is_some());
         b.set_single_stale(true);
-        b.set_single_frame(placeholder.map(Image::from_rgb8).unwrap_or_default());
+        b.set_single_frame(placeholder.map(Image::from_rgba8_premultiplied).unwrap_or_default());
         b.set_single_status(self.tile_status(&cam).into());
         // The pan/tilt and privacy tiles work once the camera has answered.
         b.set_single_ptz(false);
@@ -795,9 +884,9 @@ impl App {
         self.rt.spawn_blocking(move || {
             let result = (|| -> anyhow::Result<()> {
                 std::fs::create_dir_all(path.parent().unwrap())?;
-                let img = image::RgbImage::from_raw(frame.width(), frame.height(), frame.as_bytes().to_vec())
+                let img = image::RgbaImage::from_raw(frame.width(), frame.height(), frame.as_bytes().to_vec())
                     .ok_or_else(|| anyhow::anyhow!("bad frame"))?;
-                img.save(&path)?;
+                image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path)?;
                 Ok(())
             })();
             on_ui(move |app| match result {
@@ -845,7 +934,7 @@ impl App {
                     },
                     room: room.into(),
                     has_thumb: thumb.is_some(),
-                    thumb: thumb.map(Image::from_rgb8).unwrap_or_default(),
+                    thumb: thumb.map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                     state: states.get(&c.id).map(String::as_str).unwrap_or("").into(),
                     playback: has_hub && c.cloud.is_some(),
                 }
@@ -940,15 +1029,18 @@ impl App {
         for i in 0..self.tiles.row_count() {
             let Some(mut tile) = self.tiles.row_data(i) else { continue };
             let id = tile.id as u32;
-            let streaming = qualities.get(&id).is_some_and(|q| {
-                self.streams.borrow().get(&(id, *q)).is_some_and(|l| l.handle.latest_frame().is_some())
+            let live_frame = qualities.get(&id).and_then(|q| {
+                self.streams.borrow().get(&(id, *q)).and_then(|l| l.handle.latest_frame())
             });
-            if streaming {
+            if let Some(frame) = live_frame {
+                tile.frame = Image::from_rgba8_premultiplied(frame);
+                tile.has_frame = true;
+                self.tiles.set_row_data(i, tile);
                 continue;
             }
             let picture = self.thumbnails.borrow().get(&id).map(|t| t.frame.clone());
             tile.has_frame = picture.is_some();
-            tile.frame = picture.map(Image::from_rgb8).unwrap_or_default();
+            tile.frame = picture.map(Image::from_rgba8_premultiplied).unwrap_or_default();
             tile.stale = true;
             tile.live = false;
             self.tiles.set_row_data(i, tile);
@@ -1779,8 +1871,11 @@ impl App {
         *self.pending_mfa.borrow_mut() = None;
         self.streams.borrow_mut().clear();
         self.ptz.borrow_mut().clear();
+        self.release_playback_memory();
+        self.clear_tile_frames();
         self.set_fullscreen(false);
         self.refresh_cloud_ui();
+        self.sync_timer();
     }
 
     /// "Sign out" in Settings: forgets the session and the password, keeps
@@ -2267,6 +2362,7 @@ impl App {
         };
         self.rec_rows.set_vec(Vec::new());
         self.stop_event_pictures();
+        self.event_pictures.borrow_mut().clear();
         b.set_rec_message(SharedString::new());
         self.reset_timeline();
         let (Some(client), Some(hub), Some(camera)) = (
@@ -2386,7 +2482,7 @@ impl App {
                         playing: watched == Some(i),
                         saved: is_saved(&clip_path(&camera, start)),
                         has_thumb: picture.is_some(),
-                        thumb: picture.cloned().map(Image::from_rgb8).unwrap_or_default(),
+                        thumb: picture.cloned().map(Image::from_rgba8_premultiplied).unwrap_or_default(),
                     }
                 }
             })
@@ -2437,6 +2533,7 @@ impl App {
             self.pictures_after_video();
             w.playback.seek(at_ms);
             w.playback.set_paused(false);
+            self.sync_timer();
             return;
         }
         let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
@@ -2483,6 +2580,7 @@ impl App {
         b.set_player_title(format!("{} · {}", camera.name, date.format("%a %d %b %Y")).into());
         b.set_player_paused(false);
         self.timeline.borrow_mut().touched = None;
+        self.sync_timer();
     }
 
     /// Runs every ~30 ms on the Playback page.
@@ -2494,7 +2592,7 @@ impl App {
                 let slot = w.playback.slot.lock().unwrap();
                 if slot.version != w.shown_version {
                     if let Some(frame) = slot.frame.clone() {
-                        b.set_player_frame(Image::from_rgb8(frame));
+                        b.set_player_frame(Image::from_rgba8_premultiplied(frame));
                         b.set_player_has_frame(true);
                     }
                     w.shown_version = slot.version;
@@ -2545,6 +2643,7 @@ impl App {
             return;
         }
         drop(was);
+        crate::playback::clear_cache();
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         b.set_player_open(false);
@@ -2559,7 +2658,10 @@ impl App {
             self.set_fullscreen(false);
         }
         self.refresh_rec_rows();
-        self.fetch_event_pictures();
+        if b.get_page() == Page::Recordings {
+            self.fetch_event_pictures();
+        }
+        self.sync_timer();
     }
 
     /// Play/pause; after the day's last recording, play from its first.
@@ -2578,6 +2680,8 @@ impl App {
                 _ => w.playback.set_paused(!paused),
             }
         }
+        self.pump_player(&self.ui().global::<Bridge>());
+        self.sync_timer();
     }
 
     fn player_speed(&self, index: i32) {
@@ -2606,13 +2710,24 @@ impl App {
 
     // ------------------------------------------------------- event pictures
 
-    /// Fetches the pictures of the day's newest events (the hub keeps one per
-    /// event), one at a time and only while nothing plays: the hub serves
-    /// one session at a time, and watching comes first.
+    fn insert_event_picture(&self, key: (String, i64), frame: Frame) {
+        let mut pics = self.event_pictures.borrow_mut();
+        if pics.len() >= MAX_EVENT_PICTURES && !pics.contains_key(&key) {
+            // Drop the oldest timestamped entry to keep RAM bounded.
+            if let Some(oldest) = pics.keys().min_by_key(|(_, ts)| *ts).cloned() {
+                pics.remove(&oldest);
+            }
+        }
+        pics.insert(key, frame);
+    }
+
     /// Fetches the day's event pictures, newest first. They take the hub
     /// only while playback doesn't need it.
     fn fetch_event_pictures(&self) {
         self.stop_event_pictures();
+        if self.ui().global::<Bridge>().get_page() != Page::Recordings {
+            return;
+        }
         let (Some(client), Some(ffmpeg), Some(hub), Some(camera)) = (
             self.cloud_client().filter(|c| c.session().is_some()),
             self.ffmpeg.borrow().clone(),
@@ -2626,7 +2741,11 @@ impl App {
             let pictures = self.event_pictures.borrow();
             let mut events: Vec<(i64, i64)> = session.events.iter().map(|e| (e.start, e.kind)).collect();
             events.reverse(); // newest first
-            events.into_iter().filter(|(start, _)| !pictures.contains_key(&(camera.device_id.clone(), *start))).take(100).collect()
+            events
+                .into_iter()
+                .filter(|(start, _)| !pictures.contains_key(&(camera.device_id.clone(), *start)))
+                .take(MAX_EVENT_PICTURES)
+                .collect()
         };
         if wanted.is_empty() {
             return;
@@ -2641,7 +2760,7 @@ impl App {
                 if let Ok(Some(frame)) = saved {
                     let key = (camera.device_id.clone(), start);
                     on_ui(move |app| {
-                        app.event_pictures.borrow_mut().insert(key, frame);
+                        app.insert_event_picture(key, frame);
                         app.refresh_rec_rows();
                     });
                     continue;
@@ -2669,7 +2788,7 @@ impl App {
                         tokio::task::spawn_blocking(move || crate::pictures::save_event(&device_id, start, &keep));
                         let key = (camera.device_id.clone(), start);
                         on_ui(move |app| {
-                            app.event_pictures.borrow_mut().insert(key, frame);
+                            app.insert_event_picture(key, frame);
                             app.refresh_rec_rows();
                         });
                     }
@@ -3161,7 +3280,7 @@ fn shrink(frame: &Frame, width: u32) -> Frame {
         return frame.clone();
     }
     let height = (frame.height() as u64 * width as u64 / frame.width() as u64).max(1) as u32;
-    let Some(full) = image::RgbImage::from_raw(frame.width(), frame.height(), frame.as_bytes().to_vec()) else {
+    let Some(full) = image::RgbaImage::from_raw(frame.width(), frame.height(), frame.as_bytes().to_vec()) else {
         return frame.clone();
     };
     let small = image::imageops::resize(&full, width, height, image::imageops::FilterType::Triangle);
