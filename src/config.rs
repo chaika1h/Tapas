@@ -137,6 +137,11 @@ pub struct AppConfig {
     pub renderer: Renderer,
     pub theme: Theme,
     pub cloud: CloudConfig,
+    /// Don't look for a new version at start-up.
+    pub skip_update_checks: bool,
+    /// The GitHub repository ("owner/name") whose releases are the updates;
+    /// empty for the default.
+    pub update_repo: String,
 }
 
 impl AppConfig {

@@ -59,6 +59,8 @@ for _camera in CAMERAS:
     _camera["deviceType"] = "SMART.IPCAMERA"
 OFFLINE = {"FAKE0003"}
 PATTERNS = {"FAKE0001": "testsrc2", "FAKE0002": "testsrc"}
+# The fake update's "installer".
+FAKE_SETUP = b"MZ fake installer " * 50000
 # Download sessions the hub serves at once: an H500 serves one, and the relay
 # answers HTTP 500 to another.
 MAX_CLIP_SESSIONS = 1
@@ -236,8 +238,21 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):
-        # The IoT service's homes and rooms: /iot/v1/families[/<id>/rooms]
         url = urlsplit(self.path)
+        # A GitHub release for the updater (TAPO_VIEWER_UPDATE_URL=<base>/github/releases/latest).
+        if url.path == "/github/releases/latest":
+            setup = FAKE_SETUP
+            return self.reply({"tag_name": "v9.9.9", "body": "A fake update from fake_cloud.py.", "assets": [
+                {"name": "TapoViewer-Setup-9.9.9.exe", "size": len(setup),
+                 "browser_download_url": self.base + "/github/TapoViewer-Setup-9.9.9.exe",
+                 "digest": "sha256:" + hashlib.sha256(setup).hexdigest()}]})
+        if url.path == "/github/TapoViewer-Setup-9.9.9.exe":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(FAKE_SETUP)))
+            self.end_headers()
+            self.wfile.write(FAKE_SETUP)
+            return
+        # The IoT service's homes and rooms: /iot/v1/families[/<id>/rooms]
         auth = self.headers.get("Authorization", "")
         if not url.path.startswith("/iot/v1/families"):
             return self.reply({"message": "not found"}, 404)
