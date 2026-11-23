@@ -1,4 +1,4 @@
-import { AboutSlint, Button, LineEdit, ComboBox, CheckBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView } from "std-widgets.slint";
+import { AboutSlint, Button, LineEdit, ComboBox, CheckBox, Slider, ScrollView, GroupBox, Spinner, Palette, ListView, Switch } from "std-widgets.slint";
 
 export enum Page { home, live, single, recordings, settings }
 
@@ -9,11 +9,18 @@ export struct Tile {
     has-frame: bool,
     status: string,
     live: bool,
+    // The frame is the camera's last picture, shown until live video comes.
+    stale: bool,
 }
 
-export struct HomeCard { id: int, name: string, detail: string, thumb: image, has-thumb: bool, state: string }
+// A camera on Home: `detail` is its model, `room` its room in the Tapo
+// app; `playback` when a hub records it.
+export struct HomeCard { id: int, name: string, detail: string, room: string, thumb: image, has-thumb: bool, state: string, playback: bool }
 export struct CameraRow { id: int, name: string, detail: string }
-export struct HubRow { id: int, name: string, detail: string, storage: string }
+// A hub: `detail` is its model and firmware; `disk` names its main disk,
+// `space` how full that is (`used` 0-1, or -1 when unknown) and `note` the
+// other disks or a problem; `loaded` once the hub has answered.
+export struct HubRow { id: int, name: string, detail: string, storage: string, room: string, disk: string, space: string, used: float, note: string, loaded: bool }
 export struct PresetRow { id: string, name: string }
 export struct RecRow {
     // A heading for the hour (`time`) rather than a recording or event.
@@ -48,17 +55,22 @@ export global Bridge {
     in property <string> account-name;
     // The Tapo app's home name, or "Home".
     in property <string> home-title: "Home";
+    in property <string> home-subtitle;
     callback open-hub(int);
 
     // live grid
     in property <[Tile]> tiles;
     in property <int> columns: 1;
     callback open-camera(int);
+    // A camera's recordings on the hub, from its Home card.
+    callback open-camera-playback(int);
 
     // single camera
     in property <string> single-name;
     in property <image> single-frame;
     in property <bool> single-has-frame;
+    // The picture is the grid's or the last one, until the HD video comes.
+    in property <bool> single-stale;
     in property <string> single-status;
     in-out property <int> single-quality;
     in property <[string]> quality-labels: ["SD", "HD"];
@@ -114,6 +126,9 @@ export global Bridge {
     in property <bool> cloud-signed-in;
     in property <bool> cloud-busy;
     in property <string> cloud-status;
+    // The signed-in account, its first letter and its cloud server.
+    in property <string> account-initial;
+    in property <string> account-server;
     in property <string> cloud-message;
     // First entry is "Not linked"; the rest are the cameras on the account.
     in property <[string]> cloud-camera-labels: ["Not linked"];
@@ -188,6 +203,8 @@ export global Bridge {
     callback tl-click(float);
     callback tl-drag(float);
     callback tl-drag-end();
+    // The time at a point of the timeline (a part of its width), as HH:MM:SS.
+    pure callback tl-time-at(float) -> string;
     callback tl-zoom(float, float);
     callback tl-whole-day();
     callback open-file(string);
@@ -779,16 +796,27 @@ component Sidebar inherits Rectangle {
 
 component PageHeader inherits HorizontalLayout {
     in property <string> title;
+    in property <string> subtitle;
     height: 76px;
     padding-left: 28px;
     padding-right: 24px;
     padding-top: 12px;
     spacing: 10px;
-    Text {
-        text: root.title;
-        font-size: 28px;
-        font-weight: 700;
-        vertical-alignment: center;
+    VerticalLayout {
+        alignment: center;
+        spacing: 0px;
+        Text {
+            text: root.title;
+            font-size: 28px;
+            font-weight: 700;
+            overflow: elide;
+        }
+        if root.subtitle != "": Text {
+            text: root.subtitle;
+            font-size: 13px;
+            color: Palette.foreground.transparentize(0.45);
+            overflow: elide;
+        }
     }
     Rectangle { horizontal-stretch: 1; }
     @children
@@ -856,6 +884,35 @@ component StatusBar inherits Rectangle {
     }
 }
 
+// Over a picture that isn't live yet: dimmed, with what's happening.
+component ConnectingVeil inherits Rectangle {
+    in property <string> text;
+    background: #00000078;
+    Rectangle {
+        width: min(parent.width - 24px, row.preferred-width + 28px);
+        height: 34px;
+        border-radius: 17px;
+        background: #000000b8;
+        row := HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 8px;
+            alignment: center;
+            VerticalLayout {
+                alignment: center;
+                Spinner { width: 16px; height: 16px; indeterminate: true; }
+            }
+            Text {
+                text: root.text;
+                color: white;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
 component VideoTile inherits Rectangle {
     in property <Tile> tile;
     callback clicked();
@@ -868,6 +925,7 @@ component VideoTile inherits Rectangle {
         source: root.tile.frame;
         image-fit: contain;
     }
+    if root.tile.has-frame && root.tile.stale: ConnectingVeil { text: root.tile.status; }
     if !root.tile.has-frame: Text {
         x: 16px;
         width: parent.width - 32px;
@@ -899,7 +957,7 @@ component VideoTile inherits Rectangle {
             Text { text: root.tile.name; color: white; font-weight: 600; vertical-alignment: center; }
             Text {
                 // With no picture yet the message is shown in the middle instead.
-                text: root.tile.has-frame ? root.tile.status : "";
+                text: root.tile.has-frame && !root.tile.stale ? root.tile.status : "";
                 color: #c8c8c8;
                 horizontal-stretch: 1;
                 horizontal-alignment: right;
@@ -919,6 +977,7 @@ component VideoTile inherits Rectangle {
 component CameraCard inherits Rectangle {
     in property <HomeCard> card;
     callback clicked();
+    callback playback();
     border-radius: 16px;
     background: Palette.control-background;
     border-width: 1px;
@@ -927,6 +986,11 @@ component CameraCard inherits Rectangle {
     accessible-role: button;
     accessible-label: "Open " + root.card.name;
     accessible-action-default => { root.clicked(); }
+    // Under the buttons, so they get their own clicks.
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
     preview := Rectangle {
         x: 0;
         y: 0;
@@ -969,12 +1033,36 @@ component CameraCard inherits Rectangle {
         VerticalLayout {
             alignment: center;
             spacing: 2px;
+            horizontal-stretch: 1;
             Text { text: root.card.name; font-size: 16px; font-weight: 600; overflow: elide; }
-            Text {
-                text: root.card.detail;
-                font-size: 13px;
-                color: Palette.foreground.transparentize(0.4);
-                overflow: elide;
+            HorizontalLayout {
+                spacing: 6px;
+                if root.card.room != "": Text {
+                    text: root.card.room;
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.25);
+                    overflow: elide;
+                }
+                if root.card.room != "" && root.card.detail != "": Text {
+                    text: "·";
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.55);
+                }
+                Text {
+                    text: root.card.detail;
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.45);
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+        if root.card.playback: VerticalLayout {
+            alignment: center;
+            RoundIconButton {
+                icon: Icons.playback;
+                label: "Recordings of " + root.card.name;
+                clicked => { root.playback(); }
             }
         }
         VerticalLayout {
@@ -988,23 +1076,18 @@ component CameraCard inherits Rectangle {
             }
         }
     }
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
-    }
 }
 
 component HubCard inherits Rectangle {
     in property <HubRow> hub;
     callback open();
-    min-height: 148px;
     border-radius: 16px;
     background: Palette.control-background;
     border-width: 1px;
     border-color: Palette.border;
     VerticalLayout {
         padding: 18px;
-        spacing: 16px;
+        spacing: 14px;
         HorizontalLayout {
             spacing: 14px;
             Rectangle {
@@ -1017,25 +1100,73 @@ component HubCard inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 spacing: 2px;
+                horizontal-stretch: 1;
                 Text { text: root.hub.name; font-size: 16px; font-weight: 600; overflow: elide; }
-                Text {
-                    text: root.hub.detail;
-                    font-size: 13px;
-                    color: Palette.foreground.transparentize(0.4);
-                    overflow: elide;
+                HorizontalLayout {
+                    spacing: 6px;
+                    if root.hub.room != "": Text {
+                        text: root.hub.room;
+                        font-size: 13px;
+                        color: Palette.foreground.transparentize(0.25);
+                    }
+                    if root.hub.room != "": Text { text: "·"; font-size: 13px; color: Palette.foreground.transparentize(0.55); }
+                    Text {
+                        text: root.hub.detail;
+                        font-size: 13px;
+                        color: Palette.foreground.transparentize(0.45);
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
                 }
-                if root.hub.storage != "": Text {
-                    text: root.hub.storage;
-                    font-size: 13px;
-                    color: Palette.foreground.transparentize(0.4);
-                    overflow: elide;
+            }
+            VerticalLayout {
+                alignment: center;
+                AccentChip {
+                    text: "Playback";
+                    icon: Icons.playback;
+                    clicked => { root.open(); }
                 }
             }
         }
-        AccentChip {
-            text: "Playback";
-            icon: Icons.playback;
-            clicked => { root.open(); }
+        // Its main disk: how full, as in the Tapo app's Hub Storage.
+        if root.hub.loaded && root.hub.disk != "": VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                Text { text: root.hub.disk; font-size: 13px; font-weight: 600; }
+                Rectangle { horizontal-stretch: 1; }
+                Text {
+                    text: root.hub.space;
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.35);
+                }
+            }
+            if root.hub.used >= 0: Rectangle {
+                height: 8px;
+                border-radius: 4px;
+                background: Palette.foreground.transparentize(0.9);
+                Rectangle {
+                    x: 0;
+                    width: max(8px, parent.width * root.hub.used);
+                    border-radius: 4px;
+                    background: root.hub.used > 0.97 ? #e8a317 : Palette.accent-background;
+                }
+            }
+        }
+        if root.hub.loaded && root.hub.note != "": Text {
+            text: root.hub.note;
+            font-size: 12px;
+            color: Palette.foreground.transparentize(0.45);
+            wrap: word-wrap;
+        }
+        if !root.hub.loaded: HorizontalLayout {
+            spacing: 8px;
+            Spinner { width: 14px; height: 14px; indeterminate: true; }
+            Text {
+                text: "Asking the hub about its storage…";
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.45);
+                vertical-alignment: center;
+            }
         }
     }
 }
@@ -1050,13 +1181,14 @@ component HomePage inherits Rectangle {
     property <length> gap: 16px;
     // The width the cards share: the page minus its padding and a scroll bar.
     property <length> avail: root.width - 28px - 24px - 14px;
-    property <int> cols: max(1, Math.floor((self.avail + self.gap) / (230px + self.gap)));
+    property <int> cols: max(1, Math.floor((self.avail + self.gap) / (280px + self.gap)));
     property <length> card-w: (self.avail - (self.cols - 1) * self.gap) / self.cols;
     property <length> card-h: self.card-w * 9 / 16 + 74px;
     property <int> rows: Math.ceil(Bridge.home-cameras.length / self.cols);
     VerticalLayout {
         PageHeader {
             title: Bridge.home-title;
+            subtitle: Bridge.home-subtitle;
             if Bridge.cloud-busy: VerticalLayout {
                 alignment: center;
                 Spinner { width: 22px; height: 22px; indeterminate: true; }
@@ -1135,7 +1267,7 @@ component HomePage inherits Rectangle {
                     spacing: root.gap;
                     alignment: start;
                     for h[i] in Bridge.hubs: HubCard {
-                        width: min(380px, root.avail);
+                        width: min(560px, root.avail);
                         hub: h;
                         open => { Bridge.open-hub(i); }
                     }
@@ -1156,6 +1288,7 @@ component HomePage inherits Rectangle {
                         height: root.card-h;
                         card: c;
                         clicked => { Bridge.open-camera(c.id); }
+                        playback => { Bridge.open-camera-playback(c.id); }
                     }
                 }
             }
@@ -1394,6 +1527,7 @@ component SinglePage inherits Rectangle {
                 source: Bridge.single-frame;
                 image-fit: contain;
             }
+            if Bridge.single-has-frame && Bridge.single-stale && !Bridge.single-privacy: ConnectingVeil { text: Bridge.single-status; }
             if !Bridge.single-has-frame && !Bridge.single-privacy: Text {
                 x: 20px;
                 width: parent.width - 40px;
@@ -1523,7 +1657,7 @@ component SinglePage inherits Rectangle {
                             ActionTile {
                                 icon: Icons.photo;
                                 text: "Take Photo";
-                                enabled: Bridge.single-has-frame;
+                                enabled: Bridge.single-has-frame && !Bridge.single-stale;
                                 clicked => { Bridge.snapshot(); }
                             }
                             ActionTile {
@@ -1726,12 +1860,24 @@ component ClipRow inherits Rectangle {
     }
 }
 
-// The day under the video: recordings (blue) and events (amber); click to
-// watch from a moment, drag to move along, scroll to zoom.
+// The day under the video: recordings (blue) and events (amber). Click to
+// watch from a moment, drag the white playhead to a moment, drag elsewhere
+// to move along the day, scroll to zoom.
 component Timeline inherits Rectangle {
     // Over the picture in full screen.
     in property <bool> overlay;
+    // Moving along the day.
     property <bool> dragging;
+    // Dragging the playhead: where it is, as a part of the width (-1: not).
+    property <float> scrub: -1;
+    // Set when a press ended a playhead drag, so it isn't also a click.
+    property <bool> scrubbed;
+    property <float> head: root.scrub >= 0 ? root.scrub : Bridge.tl-playhead;
+    property <bool> head-shown: root.head >= 0 && root.head <= 1;
+    // How close to the playhead a press grabs it.
+    property <length> grab: 10px;
+    property <bool> near-head: Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1
+        && abs(ta.mouse-x - Bridge.tl-playhead * root.width) <= root.grab;
     height: 70px;
     border-radius: 10px;
     background: root.overlay ? #000000a8 : #121418;
@@ -1764,42 +1910,79 @@ component Timeline inherits Rectangle {
             background: seg.event ? #f2b134 : #2d6db4;
         }
     }
-    if Bridge.tl-playhead >= 0 && Bridge.tl-playhead <= 1: Rectangle {
-        x: Bridge.tl-playhead * root.width - 1px;
-        y: 20px;
+    if root.head-shown: Rectangle {
+        x: root.head * root.width - 1px;
+        y: 22px;
         width: 2px;
-        height: root.height - 20px;
+        height: root.height - 22px;
         background: white;
         Rectangle {
-            x: -3px;
+            x: -4px;
             y: 0;
-            width: 8px;
-            height: 8px;
-            border-radius: 4px;
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
             background: white;
+            border-width: root.scrub >= 0 || root.near-head ? 2px : 0px;
+            border-color: Palette.accent-background;
+        }
+    }
+    // The playhead's time, over the hour marks as in the Tapo app.
+    if root.head-shown: Rectangle {
+        property <length> w: bubble.preferred-width + 14px;
+        x: max(2px, min(root.width - self.w - 2px, root.head * root.width - self.w / 2));
+        y: 2px;
+        width: self.w;
+        height: 20px;
+        border-radius: 10px;
+        background: root.scrub >= 0 ? Palette.accent-background : #ffffff;
+        bubble := Text {
+            // While playing, the picture's own time (the playhead only
+            // moves a pixel at a time); while dragging, where it would go.
+            text: root.scrub < 0 && Bridge.player-time != "" ? Bridge.player-time : Bridge.tl-time-at(root.head);
+            color: root.scrub >= 0 ? Palette.accent-foreground : #111418;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
     ta := TouchArea {
-        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
+        mouse-cursor: root.scrub >= 0 || root.near-head ? MouseCursor.ew-resize
+            : root.dragging ? MouseCursor.grabbing : MouseCursor.pointer;
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.down) {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
                 root.dragging = false;
-            } else if (e.kind == PointerEventKind.up && root.dragging) {
-                Bridge.tl-drag-end();
+                root.scrubbed = false;
+                if (root.near-head) {
+                    root.scrub = max(0, min(1, self.mouse-x / root.width));
+                }
+            } else if (e.kind == PointerEventKind.up) {
+                if (root.scrub >= 0) {
+                    Bridge.tl-click(root.scrub);
+                    root.scrub = -1;
+                    root.scrubbed = true;
+                } else if (root.dragging) {
+                    Bridge.tl-drag-end();
+                }
             }
         }
         moved => {
             if (self.pressed) {
-                if (!root.dragging && abs(self.mouse-x - self.pressed-x) > 4px) {
-                    root.dragging = true;
-                }
-                if (root.dragging) {
-                    Bridge.tl-drag((self.mouse-x - self.pressed-x) / root.width);
+                if (root.scrub >= 0) {
+                    root.scrub = max(0, min(1, self.mouse-x / root.width));
+                } else {
+                    if (!root.dragging && abs(self.mouse-x - self.pressed-x) > 4px) {
+                        root.dragging = true;
+                    }
+                    if (root.dragging) {
+                        Bridge.tl-drag((self.mouse-x - self.pressed-x) / root.width);
+                    }
                 }
             }
         }
         clicked => {
-            if (!root.dragging) {
+            if (!root.dragging && !root.scrubbed) {
                 Bridge.tl-click(self.mouse-x / root.width);
             }
         }
@@ -2225,159 +2408,304 @@ component PlaybackPage inherits Rectangle {
     }
 }
 
+// Settings, in the style of Windows 11's: cards of rows, each a title, a
+// line about it and its control on the right.
+component SettingsCard inherits Rectangle {
+    border-radius: 10px;
+    background: Palette.control-background;
+    border-width: 1px;
+    border-color: Palette.border;
+    VerticalLayout {
+        @children
+    }
+}
+
+component SettingRow inherits Rectangle {
+    in property <string> icon;
+    in property <string> title;
+    in property <string> description;
+    // A line above it: every row but a card's first.
+    in property <bool> divider: true;
+    // A letter in a circle instead of the icon (the account's).
+    in property <string> avatar;
+    min-height: 62px;
+    if root.divider: Rectangle {
+        x: 16px;
+        y: 0;
+        width: parent.width - 32px;
+        height: 1px;
+        background: Palette.border;
+    }
+    HorizontalLayout {
+        padding-left: 18px;
+        padding-right: 16px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        spacing: 12px;
+        if root.avatar != "": VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 36px;
+                height: 36px;
+                border-radius: 18px;
+                background: Palette.accent-background;
+                Text {
+                    text: root.avatar;
+                    color: Palette.accent-foreground;
+                    font-size: 16px;
+                    font-weight: 700;
+                }
+            }
+        }
+        if root.icon != "" && root.avatar == "": VerticalLayout {
+            alignment: center;
+            Icon { commands: root.icon; width: 22px; height: 22px; color: Palette.foreground.transparentize(0.25); }
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text { text: root.title; font-size: 14px; overflow: elide; }
+            if root.description != "": Text {
+                text: root.description;
+                font-size: 12px;
+                color: Palette.foreground.transparentize(0.45);
+                wrap: word-wrap;
+            }
+        }
+        @children
+    }
+}
+
+component SettingsHeading inherits Text {
+    font-size: 14px;
+    font-weight: 600;
+}
+
 component SettingsPage inherits Rectangle {
+    // The settings' column: no wider than reads well.
+    property <length> column: min(880px, root.width - 28px - 24px - 14px);
     ScrollView {
         width: parent.width;
         height: parent.height;
-        VerticalLayout {
-            padding: 16px;
+        HorizontalLayout {
             padding-left: 28px;
             padding-right: 24px;
-            padding-top: 0px;
-            spacing: 16px;
+            padding-bottom: 32px;
             alignment: start;
-            PageHeader { title: "Settings"; padding-left: 0px; padding-right: 0px; }
+            VerticalLayout {
+                width: root.column;
+                spacing: 8px;
+                alignment: start;
+                PageHeader { title: "Settings"; padding-left: 0px; padding-right: 0px; }
 
-            GroupBox {
-                title: "Tapo account";
-                VerticalLayout {
-                    spacing: 8px;
-                    Muted {
-                        text: "Live video, pan/tilt and the H500's recordings go through TP-Link's cloud, the way the Tapo app does it, so this PC doesn't need to be on the cameras' network. This uses TP-Link's private service and may stop working if they change it.";
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
+                SettingsHeading { text: "Tapo account"; }
+                SettingsCard {
+                    SettingRow {
+                        divider: false;
+                        title: Bridge.cloud-signed-in ? Bridge.account-name : "Not signed in";
+                        description: Bridge.cloud-signed-in ? "Signed in to the Tapo cloud · " + Bridge.account-server : Bridge.cloud-status;
+                        avatar: Bridge.cloud-signed-in ? Bridge.account-initial : "";
+                        icon: Bridge.cloud-signed-in ? "" : Icons.person;
                         VerticalLayout {
                             alignment: center;
-                            horizontal-stretch: 1;
-                            Text { text: Bridge.cloud-status; font-weight: 600; overflow: elide; }
-                        }
-                        Spinner { width: 22px; height: 22px; indeterminate: true; visible: Bridge.cloud-busy; }
-                        Button {
-                            text: "Update camera list";
-                            enabled: !Bridge.cloud-busy;
-                            clicked => { Bridge.cloud-refresh(); }
-                        }
-                        Button {
-                            text: "Sign out";
-                            enabled: !Bridge.cloud-busy;
-                            clicked => { Bridge.cloud-sign-out(); }
+                            Button {
+                                text: "Sign out";
+                                enabled: Bridge.cloud-signed-in && !Bridge.cloud-busy;
+                                clicked => { Bridge.cloud-sign-out(); }
+                            }
                         }
                     }
-                    if Bridge.cloud-message != "": Muted { text: Bridge.cloud-message; }
+                    SettingRow {
+                        icon: Icons.refresh;
+                        title: "Cameras and hubs";
+                        description: Bridge.cloud-message != "" ? Bridge.cloud-message
+                            : "The cameras and hubs on your account are added by themselves. Update the list after adding one in the Tapo app.";
+                        if Bridge.cloud-busy: VerticalLayout {
+                            alignment: center;
+                            Spinner { width: 20px; height: 20px; indeterminate: true; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button {
+                                text: "Update list";
+                                enabled: Bridge.cloud-signed-in && !Bridge.cloud-busy;
+                                clicked => { Bridge.cloud-refresh(); }
+                            }
+                        }
+                    }
                 }
-            }
+                Muted {
+                    text: "Live video, pan/tilt and the hub's recordings go through TP-Link's cloud, as in the Tapo app, so this PC needn't be on the cameras' network. It's TP-Link's private service, which they can change.";
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 8px; }
 
-            GroupBox {
-                title: "Cameras";
-                VerticalLayout {
-                    spacing: 6px;
-                    if Bridge.cameras.length == 0: Muted { text: "No cameras yet: sign in above to add the cameras on your Tapo account."; }
-                    for c in Bridge.cameras: HorizontalLayout {
-                        spacing: 8px;
-                        VerticalLayout { alignment: center; Text { text: c.name; font-weight: 600; width: 170px; overflow: elide; } }
+                SettingsHeading { text: "Cameras"; }
+                SettingsCard {
+                    if Bridge.cameras.length == 0: SettingRow {
+                        divider: false;
+                        icon: Icons.video;
+                        title: "No cameras yet";
+                        description: "Sign in above: the cameras on your Tapo account are added by themselves.";
+                    }
+                    for c[i] in Bridge.cameras: SettingRow {
+                        divider: i > 0;
+                        icon: Icons.video;
+                        title: c.name;
+                        description: c.detail;
                         VerticalLayout {
                             alignment: center;
-                            horizontal-stretch: 1;
-                            Muted { text: c.detail; wrap: no-wrap; overflow: elide; }
+                            RoundIconButton {
+                                icon: Icons.chevron-up;
+                                label: "Move " + c.name + " up";
+                                enabled: i > 0;
+                                clicked => { Bridge.move-camera(c.id, -1); }
+                            }
                         }
-                        Button { text: "↑"; clicked => { Bridge.move-camera(c.id, -1); } }
-                        Button { text: "↓"; clicked => { Bridge.move-camera(c.id, 1); } }
-                        Button { text: "Edit"; clicked => { Bridge.edit-camera(c.id); } }
-                        Button { text: "Remove"; clicked => { Bridge.delete-camera(c.id); } }
-                    }
-                    if Bridge.cam-editing < 0: HorizontalLayout {
-                        alignment: start;
-                        Button { text: "Add camera"; clicked => { Bridge.new-camera(); } }
+                        VerticalLayout {
+                            alignment: center;
+                            RoundIconButton {
+                                icon: Icons.chevron-down;
+                                label: "Move " + c.name + " down";
+                                enabled: i < Bridge.cameras.length - 1;
+                                clicked => { Bridge.move-camera(c.id, 1); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Edit"; clicked => { Bridge.edit-camera(c.id); } }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            RoundIconButton {
+                                icon: Icons.close;
+                                label: "Remove " + c.name;
+                                clicked => { Bridge.delete-camera(c.id); }
+                            }
+                        }
                     }
                     if Bridge.cam-editing >= 0: Rectangle {
-                        border-width: 1px;
-                        border-color: Palette.accent-background;
-                        border-radius: 6px;
+                        Rectangle { x: 16px; y: 0; width: parent.width - 32px; height: 1px; background: Palette.border; }
                         VerticalLayout {
-                            padding: 12px;
-                            spacing: 8px;
-                            Heading { text: Bridge.cam-editing == 0 ? "New camera" : "Edit camera"; }
+                            padding: 18px;
+                            spacing: 10px;
+                            Text {
+                                text: Bridge.cam-editing == 0 ? "Add a camera" : "Edit camera";
+                                font-size: 14px;
+                                font-weight: 600;
+                            }
                             Field {
                                 label: "Tapo camera";
-                                ComboBox { width: 260px; model: Bridge.cloud-camera-labels; current-index <=> Bridge.cam-cloud; }
+                                ComboBox { width: 280px; model: Bridge.cloud-camera-labels; current-index <=> Bridge.cam-cloud; }
                                 Rectangle { horizontal-stretch: 1; }
                             }
                             Field {
                                 label: "Name";
-                                LineEdit { text <=> Bridge.cam-name; placeholder-text: "Same as in the Tapo app"; horizontal-stretch: 1; }
+                                LineEdit { text <=> Bridge.cam-name; placeholder-text: "Same as in the Tapo app"; width: 280px; }
+                                Rectangle { horizontal-stretch: 1; }
                             }
                             Field {
-                                label: "Grid stream";
-                                ComboBox { width: 200px; model: Bridge.quality-labels; current-index <=> Bridge.cam-quality; }
+                                label: "Live view stream";
+                                ComboBox { width: 280px; model: Bridge.quality-labels; current-index <=> Bridge.cam-quality; }
                                 Rectangle { horizontal-stretch: 1; }
+                            }
+                            Muted {
+                                text: "SD is light on the network and the PC, for the grid; HD is the camera's full picture. A camera opened on its own is always HD to start with.";
+                                font-size: 12px;
+                                wrap: word-wrap;
                             }
                             if Bridge.cam-error != "": Text { text: Bridge.cam-error; color: #e5484d; }
                             HorizontalLayout {
                                 spacing: 8px;
                                 alignment: end;
                                 Button { text: "Cancel"; clicked => { Bridge.cam-editing = -1; } }
-                                Button { text: "Save camera"; primary: true; clicked => { Bridge.save-camera(); } }
+                                Button { text: "Save"; primary: true; clicked => { Bridge.save-camera(); } }
                             }
                         }
                     }
-                }
-            }
-
-            GroupBox {
-                title: "Video & display";
-                VerticalLayout {
-                    spacing: 8px;
-                    Field {
-                        label: "ffmpeg.exe";
-                        LineEdit {
-                            text <=> Bridge.ffmpeg-path;
-                            placeholder-text: "Automatic (built-in)";
-                            horizontal-stretch: 1;
-                        }
-                    }
-                    Muted { text: Bridge.ffmpeg-found; }
-                    Field {
-                        label: "Appearance";
-                        ComboBox {
-                            width: 260px;
-                            model: ["Same as Windows", "Light", "Dark"];
-                            current-index <=> Bridge.theme-index;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    Field {
-                        label: "Renderer";
-                        ComboBox {
-                            width: 260px;
-                            model: ["Direct3D 12 (recommended)", "Vulkan", "Software (CPU)", "OpenGL"];
-                            current-index <=> Bridge.renderer-index;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                    Muted { text: "A renderer change applies after restarting the app. Settings file: " + Bridge.config-path; }
-                    HorizontalLayout {
-                        alignment: end;
-                        Button { text: "Save"; primary: true; clicked => { Bridge.save-settings(); } }
-                    }
-                }
-            }
-
-            GroupBox {
-                title: "About & updates";
-                VerticalLayout {
-                    spacing: 10px;
-                    HorizontalLayout {
-                        spacing: 8px;
+                    if Bridge.cam-editing < 0 && Bridge.cameras.length > 0: SettingRow {
+                        title: "Add a camera";
+                        description: "Cameras removed here, or ones the list missed, can be added back.";
                         VerticalLayout {
                             alignment: center;
-                            horizontal-stretch: 1;
-                            Text { text: "Tapas " + Bridge.app-version; font-weight: 600; }
-                            Muted { text: Bridge.update-status; wrap: word-wrap; }
+                            Button { text: "Add"; clicked => { Bridge.new-camera(); } }
                         }
+                    }
+                }
+                Rectangle { height: 8px; }
+
+                SettingsHeading { text: "Appearance and video"; }
+                SettingsCard {
+                    SettingRow {
+                        divider: false;
+                        icon: Icons.settings;
+                        title: "Appearance";
+                        description: "Light, dark, or the same as Windows.";
+                        VerticalLayout {
+                            alignment: center;
+                            ComboBox {
+                                width: 220px;
+                                model: ["Same as Windows", "Light", "Dark"];
+                                current-index <=> Bridge.theme-index;
+                                selected => { Bridge.save-settings(); }
+                            }
+                        }
+                    }
+                    SettingRow {
+                        icon: Icons.grid;
+                        title: "Graphics renderer";
+                        description: "How the window is drawn; applies after restarting Tapas. Software works everywhere, e.g. over remote desktop.";
+                        VerticalLayout {
+                            alignment: center;
+                            ComboBox {
+                                width: 220px;
+                                model: ["Direct3D 12 (recommended)", "Vulkan", "Software (CPU)", "OpenGL"];
+                                current-index <=> Bridge.renderer-index;
+                                selected => { Bridge.save-settings(); }
+                            }
+                        }
+                    }
+                    SettingRow {
+                        icon: Icons.video;
+                        title: "Video decoder";
+                        description: Bridge.ffmpeg-found;
+                        VerticalLayout {
+                            alignment: center;
+                            LineEdit {
+                                width: 220px;
+                                text <=> Bridge.ffmpeg-path;
+                                placeholder-text: "Built-in ffmpeg";
+                                accepted => { Bridge.save-settings(); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Apply"; clicked => { Bridge.save-settings(); } }
+                        }
+                    }
+                    SettingRow {
+                        icon: Icons.folder;
+                        title: "Settings file";
+                        description: Bridge.config-path;
+                        VerticalLayout {
+                            alignment: center;
+                            Button { text: "Show in folder"; clicked => { Bridge.show-in-folder(Bridge.config-path); } }
+                        }
+                    }
+                }
+                Rectangle { height: 8px; }
+
+                SettingsHeading { text: "About and updates"; }
+                SettingsCard {
+                    SettingRow {
+                        divider: false;
+                        title: "Tapas " + Bridge.app-version;
+                        description: Bridge.update-status != "" ? Bridge.update-status : "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.";
                         if Bridge.update-busy: VerticalLayout {
                             alignment: center;
-                            Spinner { width: 22px; height: 22px; indeterminate: true; }
+                            Spinner { width: 20px; height: 20px; indeterminate: true; }
                         }
                         if Bridge.update-available: VerticalLayout {
                             alignment: center;
@@ -2397,20 +2725,27 @@ component SettingsPage inherits Rectangle {
                             }
                         }
                     }
-                    CheckBox {
-                        text: "Check for updates when the app starts";
-                        checked <=> Bridge.check-updates;
-                        toggled => { Bridge.check-updates-changed(); }
-                    }
-                    Muted { text: "Updates come from " + Bridge.update-source + ". The new version installs by itself and the app restarts."; wrap: word-wrap; }
-                    HorizontalLayout {
-                        spacing: 16px;
-                        AboutSlint { max-width: 200px; }
-                        Muted {
-                            horizontal-stretch: 1;
-                            text: "Tapas: TP-Link Tapo cameras and the H500 HomeBase through the Tapo cloud. Its cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu.";
+                    SettingRow {
+                        icon: Icons.download;
+                        title: "Check for updates at start-up";
+                        description: "From " + Bridge.update-source + ". A new version installs by itself and Tapas restarts.";
+                        VerticalLayout {
+                            alignment: center;
+                            Switch {
+                                checked <=> Bridge.check-updates;
+                                toggled => { Bridge.check-updates-changed(); }
+                            }
                         }
                     }
+                    SettingRow {
+                        title: "Credits";
+                        description: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    padding-top: 8px;
+                    AboutSlint { width: 150px; }
                 }
             }
         }

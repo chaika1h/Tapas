@@ -47,14 +47,20 @@ cameras added in the Tapo app later.
 
 ### Home
 
-Home is titled with your home's name from the Tapo app. It has a card for the hub, with its model,
-room, firmware and storage (each disk, e.g. the H500's hard disk and its own storage), and a card
-for each camera with a recent picture and its room. **Live view** shows every camera; a camera's
-card opens it on its own.
+Home is titled with your home's name from the Tapo app. The hub's card has its room, model and
+firmware, and how full its storage is (a bar for the hard disk, and a line for its own storage);
+**Playback** opens its recordings. Each camera's card has a recent picture, its room and model,
+a button for its recordings and one to watch it. **Live view** shows every camera.
+
+The pictures are kept from one run to the next, so Home has them at once. A camera's picture is
+taken again when it's more than ten minutes old, two cameras at a time, and whenever you've been
+watching it; ⟳ takes new ones of every camera.
 
 ### Live view and the camera view
 
-**Live view** shows all cameras in a grid that fits the window. Click a camera for its own view:
+**Live view** shows all cameras in a grid that fits the window. Until a camera's video comes, its
+tile shows its last picture, dimmed. Click a camera for its own view, which starts with the grid's
+picture while the HD video connects:
 
 - **Take Photo** saves the picture to `Pictures\Tapas`.
 - **Pan & Tilt** (cameras that have it): the pad or the arrow keys, and presets to go to or save.
@@ -66,6 +72,9 @@ card opens it on its own.
 - **Playback & Download** opens the camera's recordings on the hub.
 - **Full screen**: its button, F11 or a double-click; Esc leaves it.
 
+Video keeps coming for 20 seconds after you leave a page, so going back, e.g. from a camera to the
+grid, is instant.
+
 ### Playback
 
 **Playback** shows what the hub recorded. Pick the camera and a day; the calendar marks days with
@@ -74,8 +83,9 @@ amber.
 
 - **Click the timeline**, or an event in the list, to watch from there. Playback carries on through
   the day's recordings, skipping the gaps.
-- **Drag** the timeline to move along it, and **scroll** (or the zoom buttons) to zoom between the
-  whole day and five minutes. It follows the picture while playing.
+- **Drag the white playhead** to a moment: its label shows the time it will play from.
+- **Drag** anywhere else on the timeline to move along it, and **scroll** (or the zoom buttons) to
+  zoom between the whole day and five minutes. It follows the picture while playing.
 - **1× 2× 4× 8× 16×** set the speed. From 8×, only keyframes are shown, like fast-forward.
 - **Click the picture** (or ❚❚) to pause. **Full screen** puts the timeline and controls over the
   picture; the list button at the top hides the list instead.
@@ -88,17 +98,18 @@ The list has the day's **detected events** (person, vehicle, animal, motion…) 
 picture the hub keeps for each. On a day without events it lists the recordings.
 
 Recordings come from the hub through the cloud a couple of minutes at a time, just before they're
-needed, and nothing is saved unless you ask. What has arrived stays in memory for a while, so going
+needed, and nothing is saved unless you ask. Leaving the page pauses what's playing. What has arrived stays in memory for a while, so going
 back, or forward into it, starts at once. A jump elsewhere takes a few seconds while the hub
 answers. Days are in this PC's time zone. Saved recordings are `.ts` files, which VLC and Windows'
 media players play.
 
 ### Settings
 
-- **Tapo account**: who is signed in; update the camera list; sign out.
-- **Cameras**: rename, reorder, hide (remove) a camera, and choose its grid stream.
-- **Video & display**: light, dark or as Windows; the graphics renderer; a different ffmpeg.
-- **About & updates**: the version, *Check for updates*, and whether to check at start-up.
+- **Tapo account**: who is signed in; update the list of cameras and hubs; sign out.
+- **Cameras**: rename, reorder, remove or add back a camera, and choose its live view stream.
+- **Appearance and video**: light, dark or as Windows; the graphics renderer; a different ffmpeg;
+  where the settings file is. Changes apply as you make them.
+- **About and updates**: the version, *Check for updates*, and whether to check at start-up.
 
 ## Updates
 
@@ -117,13 +128,14 @@ checksum GitHub publishes, closes, installs it and starts again. Settings and th
 | Snapshots | `Pictures\Tapas` |
 | Saved recordings | `Videos\Tapas` |
 | The built-in ffmpeg, unpacked | `%LOCALAPPDATA%\Tapas\data` |
+| The cameras' last pictures, and event pictures | `%LOCALAPPDATA%\Tapas\data\pictures` |
 
-Uninstalling keeps settings, snapshots and recordings.
+Uninstalling keeps settings, snapshots and recordings. Event pictures are deleted after 45 days.
 
 ## Troubleshooting
 
 - **Tapas doesn't start, or the window stays blank**: run `Tapas.exe --software`, then choose
-  another renderer under *Settings › Video & display* (*Software* works everywhere, e.g. over
+  another renderer under *Settings › Appearance and video* (*Software* works everywhere, e.g. over
   remote desktop or on old graphics chips).
 - **"Camera is offline"**: the cloud can't reach the camera; check it in the Tapo app.
 - **The Tapo app says "No recordings", or Tapas's playback stops**: a hub serves only a few
@@ -134,6 +146,8 @@ Uninstalling keeps settings, snapshots and recordings.
   try. The log has the details.
 - **"Couldn't check for updates: No releases…"**: the releases repository is private or has no
   releases yet.
+- **Live view is slow to start**: the log's `live:` lines say how long each camera took, and
+  which part: the cloud's answer, the relay, or the first picture.
 - Anything else: the log (see *Where things are*) records every step with the cloud and the hub;
   playback lines start with `clip:` and `playback:`.
 
@@ -176,6 +190,7 @@ are encrypted with Windows DPAPI, so only your Windows user can read them.
 | `src/clip.rs` | Hub recordings and event pictures over the relay |
 | `src/playback.rs` | Timeline playback: fetching ahead, the in-memory cache, pacing, speeds |
 | `src/update.rs` | Updates from GitHub releases |
+| `src/pictures.rs` | Cameras' last pictures and event pictures, kept on disk |
 | `src/config.rs`, `src/secret.rs` | Settings, and DPAPI encryption of secrets |
 | `installer/Tapas.nsi` | The installer (NSIS) |
 | `tools/` | Build scripts, the icon, the fake cloud |
@@ -258,7 +273,7 @@ from the MIT-licensed [tapo](https://github.com/mihai-dinculescu/tapo) crate.
 them.
 
 - [Slint](https://slint.dev) is used under its Royalty-free License, which asks for the
-  attribution shown in *Settings › About & updates*.
+  attribution shown in *Settings › About and updates*.
 - The built-in ffmpeg is LGPL 2.1 (see `vendor/README.md`).
 
 Tapo is a trademark of TP-Link; Tapas isn't affiliated with TP-Link.

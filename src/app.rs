@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
@@ -55,6 +55,33 @@ struct Live {
     handle: StreamHandle,
     shown_version: u64,
     shown_status: String,
+    /// When the page stopped needing it. Streams stay a little while after,
+    /// so going back (e.g. from a camera to the grid) is instant.
+    unused_since: Option<Instant>,
+}
+
+/// How long a stream no page needs keeps running.
+const STREAM_LINGER: Duration = Duration::from_secs(20);
+/// Home refreshes a camera's picture when it's older than this...
+const PICTURE_FRESH: Duration = Duration::from_secs(10 * 60);
+/// ...a couple of cameras at a time.
+const HOME_STREAMS: usize = 2;
+/// The largest picture kept per camera.
+const PICTURE_WIDTH: u32 = 640;
+
+/// A camera's latest picture: its Home card, and its tile while live view
+/// connects. Also kept on disk (see `pictures`).
+struct Thumb {
+    frame: Frame,
+    taken: SystemTime,
+    /// When it was last written to disk.
+    saved: Option<Instant>,
+}
+
+impl Thumb {
+    fn is_fresh(&self) -> bool {
+        self.taken.elapsed().is_ok_and(|age| age < PICTURE_FRESH)
+    }
 }
 
 /// The Playback page: one hub's cameras and one day of a camera's recordings.
@@ -162,8 +189,12 @@ pub struct App {
     last_relogin: Cell<Option<Instant>>,
     /// The Tapo password for this run, when "Remember me" was off.
     password: RefCell<String>,
-    /// The latest picture of each camera, for its Home card.
-    thumbnails: RefCell<HashMap<u32, Frame>>,
+    /// The latest picture of each camera, by camera id.
+    thumbnails: RefCell<HashMap<u32, Thumb>>,
+    /// Cameras Home stopped asking for a picture this visit (offline, etc.).
+    home_skip: RefCell<HashSet<u32>>,
+    /// When unused streams were last looked at.
+    last_sweep: Cell<Option<Instant>>,
     /// Home card badges, e.g. "Offline".
     home_states: RefCell<HashMap<u32, String>>,
     home_cards: Rc<VecModel<HomeCard>>,
@@ -183,6 +214,8 @@ pub struct App {
     homes: RefCell<Homes>,
     /// What each hub (by device id) says about itself.
     hub_info: RefCell<HashMap<String, HubInfo>>,
+    /// Whether the hubs have been asked (whatever they answered).
+    hub_info_tried: Cell<bool>,
     /// A camera (cloud device id or name) to select once the hub's cameras
     /// are listed.
     pending_rec_camera: RefCell<Option<(String, String)>>,
@@ -244,12 +277,15 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         last_relogin: Cell::default(),
         password: RefCell::default(),
         thumbnails: RefCell::default(),
+        home_skip: RefCell::default(),
+        last_sweep: Cell::default(),
         home_states: RefCell::default(),
         home_cards: Rc::new(VecModel::default()),
         return_page: Cell::new(Page::Home),
         pending_rec_camera: RefCell::default(),
         homes: RefCell::default(),
         hub_info: RefCell::default(),
+        hub_info_tried: Cell::default(),
         rec_rows: Rc::new(VecModel::default()),
         event_pictures: RefCell::default(),
         picture_task: RefCell::default(),
@@ -276,6 +312,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_single_back(cb!(&app, |a| a.single_back()));
     b.on_privacy_toggle(cb!(&app, |a| a.privacy_toggle()));
     b.on_open_playback(cb!(&app, |a| a.open_playback()));
+    b.on_open_camera_playback(cb!(&app, |a, id| a.open_camera_playback(id as u32)));
     b.on_quality_changed(cb!(&app, |a, i| a.quality_changed(i)));
     b.on_snapshot(cb!(&app, |a| a.snapshot()));
     b.on_ptz_move(cb!(&app, |a, pan, tilt| a.ptz_send(PtzCmd::Move(pan, tilt))));
@@ -325,6 +362,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.set_update_source(format!("github.com/{}/releases", app.update_repo()).into());
     b.set_recordings(app.rec_rows.clone().into());
     b.on_tl_click(cb!(&app, |a, f| a.tl_click(f)));
+    let weak = Rc::downgrade(&app);
+    b.on_tl_time_at(move |at| weak.upgrade().map(|a| a.tl_time_at(at)).unwrap_or_default());
     b.on_tl_drag(cb!(&app, |a, f| a.tl_drag(f)));
     b.on_tl_drag_end(cb!(&app, |a| a.timeline.borrow_mut().drag_from = None));
     b.on_tl_zoom(cb!(&app, |a, factor, at| a.tl_zoom(factor, at)));
@@ -335,7 +374,9 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
 
     app.load_settings_into_ui();
     app.refresh_cloud_ui();
+    app.load_saved_pictures();
     app.refresh_camera_lists();
+    app.rt.spawn_blocking(crate::pictures::prune_events);
     app.refresh_hub_lists();
     app.update_rec_date_label();
     app.update_calendar();
@@ -423,6 +464,10 @@ impl App {
             Page::Recordings => self.pump_player(&b),
             _ => {}
         }
+        if self.last_sweep.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.last_sweep.set(Some(Instant::now()));
+            self.streams.borrow_mut().retain(|_, l| l.unused_since.is_none_or(|t| t.elapsed() < STREAM_LINGER));
+        }
         let expired = self.status_until.borrow().is_some_and(|t| Instant::now() >= t);
         if expired {
             *self.status_until.borrow_mut() = None;
@@ -451,6 +496,8 @@ impl App {
             }
             tile.status = status.as_str().into();
             tile.live = is_live;
+            // Not live (yet, or any more): the picture is dimmed, with why.
+            tile.stale = !is_live;
             live.shown_status = status;
             self.tiles.set_row_data(i, tile);
         }
@@ -468,6 +515,9 @@ impl App {
                 b.set_single_has_frame(true);
             }
             shown.0 = slot.version;
+        }
+        if b.get_single_stale() == slot.is_live() {
+            b.set_single_stale(!slot.is_live());
         }
         let status = slot.status_text();
         if status != shown.1 {
@@ -507,16 +557,23 @@ impl App {
 
     /// Starts the streams the current page needs and stops the rest.
     fn sync_streams(&self) {
+        if !self.signed_in_now() {
+            self.streams.borrow_mut().clear(); // nothing to show
+            return;
+        }
         let page = self.ui().global::<Bridge>().get_page();
         let cfg = self.cfg.borrow();
-        let page = if self.signed_in_now() { page } else { Page::Settings }; // nothing to show
         let wanted: Vec<StreamKey> = match page {
-            // Home only needs one picture per camera for its card.
+            // Home needs a picture per camera for its card: a short stream
+            // for those without a recent one, a couple at a time.
             Page::Home => {
                 let thumbs = self.thumbnails.borrow();
+                let skip = self.home_skip.borrow();
                 cfg.cameras
                     .iter()
-                    .filter(|c| c.cloud.is_some() && !thumbs.contains_key(&c.id))
+                    .filter(|c| c.cloud.is_some() && !skip.contains(&c.id))
+                    .filter(|c| !thumbs.get(&c.id).is_some_and(Thumb::is_fresh))
+                    .take(HOME_STREAMS)
                     .map(|c| (c.id, Quality::Sd))
                     .collect()
             }
@@ -525,7 +582,14 @@ impl App {
             _ => Vec::new(),
         };
         let mut streams = self.streams.borrow_mut();
-        streams.retain(|k, _| wanted.contains(k));
+        let now = Instant::now();
+        for (key, live) in streams.iter_mut() {
+            if wanted.contains(key) {
+                live.unused_since = None;
+            } else {
+                live.unused_since.get_or_insert(now);
+            }
+        }
         for key in wanted {
             if streams.contains_key(&key) {
                 continue;
@@ -534,7 +598,7 @@ impl App {
             // tile says so (see `tile_status`).
             if let Some(spec) = cfg.camera(key.0).and_then(|cam| self.spec(cam, key.1)) {
                 let handle = StreamHandle::spawn(&self.rt, spec);
-                streams.insert(key, Live { handle, shown_version: 0, shown_status: String::new() });
+                streams.insert(key, Live { handle, shown_version: 0, shown_status: String::new(), unused_since: None });
             }
         }
     }
@@ -585,18 +649,23 @@ impl App {
         if matches!(from, Page::Live | Page::Single) {
             self.capture_thumbnails();
         }
+        // Leaving Playback pauses the recording, so it isn't fetched and
+        // decoded out of sight; ❚❚ (or a click on the picture) goes on.
+        if from == Page::Recordings
+            && page != Page::Recordings
+            && let Some(w) = self.watching.borrow().as_ref()
+        {
+            w.playback.set_paused(true);
+        }
         if page != Page::Single {
             *self.single.borrow_mut() = None;
         }
         if page == Page::Home {
+            self.home_skip.borrow_mut().clear();
             self.refresh_home_cards();
         }
         if page == Page::Live {
-            // Force tiles to pick up the latest frame again.
-            for live in self.streams.borrow_mut().values_mut() {
-                live.shown_version = 0;
-                live.shown_status.clear();
-            }
+            self.tiles_from_pictures();
         }
         b.set_page(page);
         ui.invoke_focus_keys();
@@ -652,8 +721,11 @@ impl App {
 
         b.set_single_name(cam.name.as_str().into());
         b.set_single_quality(quality.index());
-        b.set_single_frame(Image::default());
-        b.set_single_has_frame(false);
+        // Until the HD video comes: the grid's picture, or the last one.
+        let placeholder = self.picture_of(id);
+        b.set_single_has_frame(placeholder.is_some());
+        b.set_single_stale(true);
+        b.set_single_frame(placeholder.map(Image::from_rgb8).unwrap_or_default());
         b.set_single_status(self.tile_status(&cam).into());
         // The pan/tilt and privacy tiles work once the camera has answered.
         b.set_single_ptz(false);
@@ -679,7 +751,8 @@ impl App {
         let quality = Quality::from_index(index);
         *self.single.borrow_mut() = Some((id, quality));
         *self.single_shown.borrow_mut() = (0, String::new());
-        self.ui().global::<Bridge>().set_single_has_frame(false);
+        // The current picture stays, dimmed, until the other stream's comes.
+        self.ui().global::<Bridge>().set_single_stale(true);
         self.sync_streams();
     }
 
@@ -725,62 +798,170 @@ impl App {
             [name, ..] => name.clone(),
             [] => "Home".to_string(),
         };
-        self.ui().global::<Bridge>().set_home_title(title.into());
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_home_title(title.into());
+        let plural = |n: usize, one: &str| if n == 1 { format!("1 {one}") } else { format!("{n} {one}s") };
+        let mut subtitle = vec![plural(cfg.cameras.len(), "camera")];
+        if !cfg.hubs.is_empty() {
+            subtitle.push(plural(cfg.hubs.len(), "hub"));
+        }
+        b.set_home_subtitle(subtitle.join(" · ").into());
+        let has_hub = !cfg.hubs.is_empty();
         let cards: Vec<HomeCard> = cfg
             .cameras
             .iter()
             .map(|c| {
-                let thumb = thumbs.get(&c.id).cloned();
-                let room = c.cloud.as_ref().and_then(|l| homes.rooms.get(&l.device_id));
+                let thumb = thumbs.get(&c.id).map(|t| t.frame.clone());
+                let room = c.cloud.as_ref().and_then(|l| homes.rooms.get(&l.device_id)).cloned().unwrap_or_default();
                 HomeCard {
                     id: c.id as i32,
                     name: c.name.as_str().into(),
-                    detail: match (&c.cloud, room) {
-                        (Some(link), Some(room)) if !link.model.is_empty() => format!("{} · {room}", link.model).into(),
-                        (Some(link), None) if !link.model.is_empty() => link.model.as_str().into(),
-                        (Some(_), Some(room)) => room.as_str().into(),
-                        (Some(_), None) => "Tapo camera".into(),
-                        (None, _) => "Not linked to your Tapo account".into(),
+                    detail: match &c.cloud {
+                        Some(link) if !link.model.is_empty() => link.model.as_str().into(),
+                        Some(_) => "Tapo camera".into(),
+                        None => "Not linked to your Tapo account".into(),
                     },
+                    room: room.into(),
                     has_thumb: thumb.is_some(),
                     thumb: thumb.map(Image::from_rgb8).unwrap_or_default(),
                     state: states.get(&c.id).map(String::as_str).unwrap_or("").into(),
+                    playback: has_hub && c.cloud.is_some(),
                 }
             })
             .collect();
         self.home_cards.set_vec(cards);
     }
 
-    /// Keeps the newest picture of each streaming camera for its Home card.
+    /// Keeps the newest picture of each streaming camera.
     fn capture_thumbnails(&self) {
-        let streams = self.streams.borrow();
+        let frames: Vec<(u32, Frame)> = self
+            .streams
+            .borrow()
+            .iter()
+            .filter_map(|(key, live)| Some((key.0, live.handle.latest_frame()?)))
+            .collect();
+        for (id, frame) in frames {
+            self.keep_picture(id, frame);
+        }
+    }
+
+    /// A camera's newest picture: kept for its card and tile, and written to
+    /// disk now and then. Big ones are made smaller first, off the UI thread.
+    fn keep_picture(&self, id: u32, frame: Frame) {
+        let device_id = self.cfg.borrow().camera(id).and_then(|c| c.cloud.as_ref()).map(|l| l.device_id.clone());
+        let save = {
+            let thumbs = self.thumbnails.borrow();
+            thumbs.get(&id).is_none_or(|t| t.saved.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)))
+        };
+        if frame.width() <= PICTURE_WIDTH {
+            self.thumbnails.borrow_mut().insert(
+                id,
+                Thumb { frame: frame.clone(), taken: SystemTime::now(), saved: save.then(Instant::now) },
+            );
+            if let (true, Some(device_id)) = (save, device_id) {
+                self.rt.spawn_blocking(move || crate::pictures::save_camera(&device_id, &frame));
+            }
+            return;
+        }
+        self.rt.spawn_blocking(move || {
+            let small = shrink(&frame, PICTURE_WIDTH);
+            if let (true, Some(device_id)) = (save, &device_id) {
+                crate::pictures::save_camera(device_id, &small);
+            }
+            on_ui(move |app| {
+                app.thumbnails.borrow_mut().insert(
+                    id,
+                    Thumb { frame: small, taken: SystemTime::now(), saved: save.then(Instant::now) },
+                );
+                app.refresh_home_cards();
+            });
+        });
+    }
+
+    /// The cameras' pictures from the last run, so Home and the tiles have
+    /// something to show at once.
+    fn load_saved_pictures(&self) {
+        let cameras: Vec<(u32, String)> = {
+            let thumbs = self.thumbnails.borrow();
+            self.cfg
+                .borrow()
+                .cameras
+                .iter()
+                .filter(|c| !thumbs.contains_key(&c.id))
+                .filter_map(|c| Some((c.id, c.cloud.as_ref()?.device_id.clone())))
+                .collect()
+        };
         let mut thumbs = self.thumbnails.borrow_mut();
-        for (key, live) in streams.iter() {
-            if let Some(frame) = live.handle.latest_frame() {
-                thumbs.insert(key.0, frame);
+        for (id, device_id) in cameras {
+            if let Some((frame, taken)) = crate::pictures::load_camera(&device_id) {
+                thumbs.insert(id, Thumb { frame, taken, saved: Some(Instant::now()) });
             }
         }
     }
 
-    /// On Home, each camera without a picture streams until its first frame,
-    /// which becomes its card's picture; cameras that can't be reached get a
-    /// badge instead.
+    /// What to show for a camera until its video comes: a stream's picture
+    /// (e.g. the grid's), else its last one.
+    fn picture_of(&self, id: u32) -> Option<Frame> {
+        let streams = self.streams.borrow();
+        let streamed = streams.iter().filter(|(k, _)| k.0 == id).find_map(|(_, l)| l.handle.latest_frame());
+        streamed.or_else(|| self.thumbnails.borrow().get(&id).map(|t| t.frame.clone()))
+    }
+
+    /// Live view's tiles: each camera's live picture if its stream is still
+    /// running, else its last picture, dimmed, while it connects.
+    fn tiles_from_pictures(&self) {
+        for live in self.streams.borrow_mut().values_mut() {
+            live.shown_version = 0; // the tiles pick up the latest frame again
+            live.shown_status.clear();
+        }
+        let qualities: HashMap<u32, Quality> = self.cfg.borrow().cameras.iter().map(|c| (c.id, c.grid_quality)).collect();
+        for i in 0..self.tiles.row_count() {
+            let Some(mut tile) = self.tiles.row_data(i) else { continue };
+            let id = tile.id as u32;
+            let streaming = qualities.get(&id).is_some_and(|q| {
+                self.streams.borrow().get(&(id, *q)).is_some_and(|l| l.handle.latest_frame().is_some())
+            });
+            if streaming {
+                continue;
+            }
+            let picture = self.thumbnails.borrow().get(&id).map(|t| t.frame.clone());
+            tile.has_frame = picture.is_some();
+            tile.frame = picture.map(Image::from_rgb8).unwrap_or_default();
+            tile.stale = true;
+            tile.live = false;
+            self.tiles.set_row_data(i, tile);
+        }
+    }
+
+    /// On Home, cameras without a recent picture stream until their first
+    /// frame, which becomes their card's picture; cameras that can't be
+    /// reached get a badge instead. Running streams (e.g. the grid's, a
+    /// moment after leaving it) keep the pictures fresh too.
     fn pump_home(&self) {
         let mut captured = Vec::new();
+        let mut gave_up = Vec::new();
         let mut changed = false;
         {
             let streams = self.streams.borrow();
+            let thumbs = self.thumbnails.borrow();
             let mut states = self.home_states.borrow_mut();
             for (key, live) in streams.iter() {
                 let slot = live.handle.slot.lock().unwrap();
                 if let Some(frame) = slot.frame.clone() {
-                    self.thumbnails.borrow_mut().insert(key.0, frame);
-                    states.remove(&key.0);
-                    captured.push(*key);
-                    changed = true;
+                    let recent = thumbs.get(&key.0).is_some_and(|t| t.taken.elapsed().is_ok_and(|a| a < Duration::from_secs(30)));
+                    if !recent {
+                        captured.push((key.0, frame));
+                    }
+                    if states.remove(&key.0).is_some() {
+                        changed = true;
+                    }
                     continue;
                 }
                 let status = slot.status_text();
+                if matches!(slot.status, crate::stream::Status::Retrying(_)) && live.unused_since.is_none() {
+                    gave_up.push(key.0);
+                }
                 let badge = if status.contains("offline") {
                     "Offline"
                 } else if status.contains("Privacy mode is on") {
@@ -798,14 +979,19 @@ impl App {
                 }
             }
         }
-        if !captured.is_empty() {
-            let mut streams = self.streams.borrow_mut();
-            for key in &captured {
-                streams.remove(key);
-            }
+        let resync = !captured.is_empty() || !gave_up.is_empty();
+        for (id, frame) in captured {
+            self.keep_picture(id, frame);
+            changed = true;
         }
+        // A camera that can't stream now waits for the next visit, so the
+        // others get their turn.
+        self.home_skip.borrow_mut().extend(gave_up);
         if changed {
             self.refresh_home_cards();
+        }
+        if resync {
+            self.sync_streams();
         }
     }
 
@@ -999,27 +1185,34 @@ impl App {
     }
 
     /// "Save" under Video & display.
+    /// Applies the Settings page's appearance and video choices as they're
+    /// made.
     fn save_settings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        {
+        let ffmpeg_changed = {
             let mut cfg = self.cfg.borrow_mut();
-            cfg.ffmpeg_path = b.get_ffmpeg_path().trim().to_string();
             let renderer = Renderer::from_index(b.get_renderer_index());
             if renderer != cfg.renderer {
                 cfg.renderer = renderer;
-                self.status("Renderer will change after restarting the app.");
+                self.status("The new renderer is used once Tapas restarts.");
             }
             cfg.theme = Theme::from_index(b.get_theme_index());
-        }
+            let path = b.get_ffmpeg_path().trim().to_string();
+            let changed = path != cfg.ffmpeg_path;
+            cfg.ffmpeg_path = path;
+            changed
+        };
         self.persist();
         ui.invoke_set_theme(self.cfg.borrow().theme.index());
-        *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
-        // A different ffmpeg: reconnect the streams.
-        self.streams.borrow_mut().clear();
+        if ffmpeg_changed {
+            *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
+            // A different ffmpeg: reconnect the streams.
+            self.streams.borrow_mut().clear();
+            self.sync_streams();
+            self.status("Video decoder changed.");
+        }
         self.load_settings_into_ui();
-        self.sync_streams();
-        self.status("Settings saved.");
     }
 
     fn refresh_camera_lists(&self) {
@@ -1032,11 +1225,17 @@ impl App {
             .map(|c| {
                 let mut detail = Vec::new();
                 match &c.cloud {
-                    Some(link) if link.model.is_empty() => detail.push(format!("Tapo: {}", link.name)),
-                    Some(link) => detail.push(format!("Tapo: {} ({})", link.name, link.model)),
-                    None => detail.push("⚠ not linked to your Tapo account".into()),
+                    Some(link) => {
+                        if !link.model.is_empty() {
+                            detail.push(link.model.clone());
+                        }
+                        if !same_name(&link.name, &c.name) {
+                            detail.push(format!("“{}” in the Tapo app", link.name));
+                        }
+                    }
+                    None => detail.push("Not linked to a camera on your Tapo account".into()),
                 }
-                detail.push(format!("grid: {}", Quality::LABELS[c.grid_quality.index() as usize]));
+                detail.push(format!("{} in live view", Quality::LABELS[c.grid_quality.index() as usize]));
                 CameraRow { id: c.id as i32, name: c.name.as_str().into(), detail: detail.join("  ·  ").into() }
             })
             .collect();
@@ -1052,9 +1251,12 @@ impl App {
                 has_frame: false,
                 status: self.tile_status(c).into(),
                 live: false,
+                stale: true,
             })
             .collect();
         self.tiles.set_vec(tiles);
+        self.load_saved_pictures();
+        self.tiles_from_pictures();
         drop(cfg);
         self.refresh_home_cards();
         *self.last_grid_size.borrow_mut() = Default::default();
@@ -1186,11 +1388,10 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, h)| {
-                let info = self.hub_info.borrow().get(&h.device_id).cloned().unwrap_or_default();
+                let known = self.hub_info.borrow().get(&h.device_id).cloned();
+                let loaded = known.is_some() || self.hub_info_tried.get();
+                let info = known.unwrap_or_default();
                 let mut detail = hub_detail(h);
-                if let Some(room) = self.homes.borrow().rooms.get(&h.device_id) {
-                    detail += &format!(" · {room}");
-                }
                 if !info.firmware.is_empty() {
                     detail += &format!(" · firmware {}", info.firmware.split_whitespace().next().unwrap_or(""));
                 }
@@ -1198,7 +1399,43 @@ impl App {
                 if !info.storage_status.is_empty() {
                     storage += &format!("\n{}", info.storage_status);
                 }
-                HubRow { id: i as i32, name: h.name.as_str().into(), detail: detail.into(), storage: storage.into() }
+                let room = self.homes.borrow().rooms.get(&h.device_id).cloned().unwrap_or_default();
+                // The main (largest) disk gets the bar; the rest, and any
+                // problem, a line under it.
+                let main = info.disks.first();
+                let disk = main.map(|d| disk_name(&d.label)).unwrap_or_default();
+                let space = match main {
+                    Some(d) if !d.free.is_empty() => format!("{} free of {}", d.free, d.total),
+                    Some(d) => d.total.clone(),
+                    None => String::new(),
+                };
+                let mut note: Vec<String> = info
+                    .disks
+                    .iter()
+                    .skip(1)
+                    .map(|d| match d.free.is_empty() {
+                        false => format!("{}: {} free of {}", disk_name(&d.label), d.free, d.total),
+                        true => format!("{}: {}", disk_name(&d.label), d.total),
+                    })
+                    .collect();
+                if !info.storage_status.is_empty() {
+                    note.push(info.storage_status.clone());
+                }
+                if known_none_after_try(loaded, main) {
+                    note.push("The hub didn't say how its storage is.".into());
+                }
+                HubRow {
+                    id: i as i32,
+                    name: h.name.as_str().into(),
+                    detail: detail.into(),
+                    storage: storage.into(),
+                    room: room.into(),
+                    disk: disk.into(),
+                    space: space.into(),
+                    used: main.and_then(cloud::Disk::used).unwrap_or(-1.0),
+                    note: note.join("  ·  ").into(),
+                    loaded,
+                }
             })
             .collect();
         b.set_hubs(ModelRc::new(VecModel::from(rows)));
@@ -1241,6 +1478,10 @@ impl App {
         };
         b.set_cloud_status(status.into());
         let account = if session.is_some() { self.cfg.borrow().cloud.account.clone() } else { String::new() };
+        let initial = account.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+        b.set_account_initial(initial.into());
+        let server = session.as_ref().and_then(|s| url::Url::parse(&s.base_url).ok()).and_then(|u| u.host_str().map(str::to_string));
+        b.set_account_server(server.unwrap_or_default().into());
         b.set_account_name(account.into());
     }
 
@@ -1532,6 +1773,14 @@ impl App {
         };
         self.set_cloud_busy(true);
         self.cloud_message("Loading the cameras on your Tapo account…");
+        // ⟳ on Home also takes new pictures of the cameras.
+        if self.ui().global::<Bridge>().get_page() == Page::Home {
+            for thumb in self.thumbnails.borrow_mut().values_mut() {
+                thumb.taken = SystemTime::UNIX_EPOCH;
+            }
+            self.home_skip.borrow_mut().clear();
+            self.sync_streams();
+        }
         self.rt.spawn(async move {
             let result = client.list_cameras().await;
             let hubs = match &result {
@@ -1592,6 +1841,7 @@ impl App {
             on_ui(move |app| {
                 *app.homes.borrow_mut() = homes;
                 *app.hub_info.borrow_mut() = info;
+                app.hub_info_tried.set(true);
                 app.refresh_home_cards();
                 app.refresh_hub_lists();
             });
@@ -1788,6 +2038,11 @@ impl App {
     /// the hub.
     fn open_playback(&self) {
         let Some((id, _)) = *self.single.borrow() else { return };
+        self.open_camera_playback(id);
+    }
+
+    /// A camera's recordings on the hub, from today.
+    fn open_camera_playback(&self, id: u32) {
         let wanted = self.cfg.borrow().camera(id).map(|c| {
             (c.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default(), c.name.clone())
         });
@@ -2129,6 +2384,13 @@ impl App {
     /// Watches the day's recordings from `at_ms`.
     fn watch_from(&self, at_ms: i64) {
         let Some(camera) = self.selected_rec_camera() else { return };
+        // Past the day's last recording: its last moments, as the Tapo app
+        // goes to the nearest recording. (Before or between recordings,
+        // playback goes on to the next one by itself.)
+        let at_ms = match self.hub.borrow().clips.iter().map(|c| (c.start, c.end)).max_by_key(|c| c.1) {
+            Some((start, end)) if at_ms >= end * 1000 => (start * 1000).max(end * 1000 - 10_000),
+            _ => at_ms,
+        };
         let date = *self.rec_date.borrow();
         if let Some(w) = self.watching.borrow().as_ref()
             && w.camera_id == camera.device_id
@@ -2335,6 +2597,17 @@ impl App {
         let task = self.rt.spawn(async move {
             let mut misses = 0;
             for (start, kind) in wanted {
+                // Pictures already fetched once come from disk.
+                let device_id = camera.device_id.clone();
+                let saved = tokio::task::spawn_blocking(move || crate::pictures::load_event(&device_id, start)).await;
+                if let Ok(Some(frame)) = saved {
+                    let key = (camera.device_id.clone(), start);
+                    on_ui(move |app| {
+                        app.event_pictures.borrow_mut().insert(key, frame);
+                        app.refresh_rec_rows();
+                    });
+                    continue;
+                }
                 let request = ClipRequest {
                     hub: hub.clone(),
                     camera: camera.clone(),
@@ -2348,6 +2621,8 @@ impl App {
                 match picture {
                     Ok(frame) => {
                         misses = 0;
+                        let (device_id, keep) = (camera.device_id.clone(), frame.clone());
+                        tokio::task::spawn_blocking(move || crate::pictures::save_event(&device_id, start, &keep));
                         let key = (camera.device_id.clone(), start);
                         on_ui(move |app| {
                             app.event_pictures.borrow_mut().insert(key, frame);
@@ -2526,6 +2801,16 @@ impl App {
         let mut view = self.timeline.borrow_mut();
         let latest = (day_end + 1) * 1000 - view.span;
         view.start = view.start.clamp(day_start * 1000, latest.max(day_start * 1000));
+    }
+
+    /// The time at `at` (a part of the timeline's width), for the playhead's
+    /// label.
+    fn tl_time_at(&self, at: f32) -> SharedString {
+        let ms = {
+            let view = self.timeline.borrow();
+            view.start + (at.clamp(0.0, 1.0) as f64 * view.span as f64) as i64
+        };
+        local_time(ms / 1000).format("%H:%M:%S").to_string().into()
     }
 
     /// A click on the timeline: watch from there.
@@ -2791,6 +3076,19 @@ fn string_model<S: Into<SharedString>>(items: impl IntoIterator<Item = S>) -> Mo
     ModelRc::new(VecModel::from(items.into_iter().map(Into::into).collect::<Vec<SharedString>>()))
 }
 
+/// `frame` at most `width` wide, keeping its shape.
+fn shrink(frame: &Frame, width: u32) -> Frame {
+    if frame.width() <= width {
+        return frame.clone();
+    }
+    let height = (frame.height() as u64 * width as u64 / frame.width() as u64).max(1) as u32;
+    let Some(full) = image::RgbImage::from_raw(frame.width(), frame.height(), frame.as_bytes().to_vec()) else {
+        return frame.clone();
+    };
+    let small = image::imageops::resize(&full, width, height, image::imageops::FilterType::Triangle);
+    slint::SharedPixelBuffer::clone_from_slice(small.as_raw(), width, height)
+}
+
 fn file_safe(name: &str) -> String {
     let s: String = name
         .chars()
@@ -2800,6 +3098,20 @@ fn file_safe(name: &str) -> String {
 }
 
 /// "H500" for the Home card and the list.
+/// "Hard disk" for "HDD", and so on.
+fn disk_name(label: &str) -> String {
+    match label {
+        "HDD" => "Hard disk".into(),
+        "Internal" => "Built-in storage".into(),
+        other => other.to_string(),
+    }
+}
+
+/// When the hub has been asked but gave nothing about its disks.
+fn known_none_after_try(loaded: bool, main: Option<&cloud::Disk>) -> bool {
+    loaded && main.is_none()
+}
+
 fn hub_detail(hub: &CloudCamera) -> String {
     match hub.model.trim() {
         "" => "Hub".into(),

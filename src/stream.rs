@@ -91,14 +91,30 @@ pub struct FrameSink {
     pub frames: u64,
     window_start: Instant,
     window_frames: u32,
+    /// For logging how long the first picture took: the stream's name, when
+    /// it was asked for and how long the relay request took.
+    first_frame: Option<(String, Instant, Duration)>,
 }
 
 impl FrameSink {
     pub(crate) fn new(slot: Arc<Mutex<Slot>>) -> Self {
-        Self { slot, frames: 0, window_start: Instant::now(), window_frames: 0 }
+        Self { slot, frames: 0, window_start: Instant::now(), window_frames: 0, first_frame: None }
+    }
+
+    /// Logs how long the next frame takes to come, from `started`.
+    pub fn time_first_frame(&mut self, name: String, started: Instant, asked: Duration) {
+        log::info!("live: {name}: relay ready after {} ms", started.elapsed().as_millis());
+        self.first_frame = Some((name, started, asked));
     }
 
     pub fn push(&mut self, frame: Frame) {
+        if let Some((name, started, asked)) = self.first_frame.take() {
+            log::info!(
+                "live: {name}: first picture after {} ms (the cloud answered in {} ms)",
+                started.elapsed().as_millis(),
+                asked.as_millis()
+            );
+        }
         self.frames += 1;
         self.window_frames += 1;
         let now = Instant::now();

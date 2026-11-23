@@ -118,6 +118,7 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     }
 
     let client = &spec.client;
+    let started = std::time::Instant::now();
     let info = match client.request_relay(&spec.camera, resolution).await {
         Err(e) if resolution == Resolution::Vga && e.is_refused() => {
             log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
@@ -126,7 +127,9 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
         }
         result => result?,
     };
+    let asked = started.elapsed();
     let mut relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
+    sink.time_first_frame(format!("{} ({:?})", spec.camera.name, spec.quality), started, asked);
     decode_relay(&mut relay, ffmpeg, w, h, sink).await
 }
 
@@ -275,6 +278,11 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> to
     }
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-nostats", "-loglevel", if timed { "info" } else { "error" }])
+        // One thread each: by default ffmpeg starts a decoding and a scaling
+        // thread per CPU core, each with its own frame buffers, which costs
+        // 2-5x the memory (over 150 MB for HD on a 16-thread CPU) for no
+        // gain at these sizes and rates.
+        .args(["-filter_threads", "1", "-threads", "1"])
         .args(input)
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
