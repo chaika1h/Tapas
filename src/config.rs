@@ -80,32 +80,27 @@ impl Theme {
 /// Graphics backend, picked at start-up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Renderer {
-    /// FemtoVG on wgpu, forced onto Direct3D 12. Avoids the OpenGL
-    /// exclusive-fullscreen flicker some Windows drivers produce.
-    #[default]
-    Direct3D,
-    Vulkan,
     /// CPU rendering; slowest, but works everywhere (VMs, RDP, old GPUs).
     Software,
+    /// FemtoVG on OpenGL: GPU-accelerated, lighter than wgpu/DX12 and broadly
+    /// compatible with older PCs. Legacy "Direct3D"/"Vulkan" configs map here.
+    #[default]
+    #[serde(other)]
     OpenGL,
 }
 
 impl Renderer {
     pub fn index(self) -> i32 {
         match self {
-            Renderer::Direct3D => 0,
-            Renderer::Vulkan => 1,
-            Renderer::Software => 2,
-            Renderer::OpenGL => 3,
+            Renderer::OpenGL => 0,
+            Renderer::Software => 1,
         }
     }
 
     pub fn from_index(i: i32) -> Self {
         match i {
-            1 => Renderer::Vulkan,
-            2 => Renderer::Software,
-            3 => Renderer::OpenGL,
-            _ => Renderer::Direct3D,
+            1 => Renderer::Software,
+            _ => Renderer::OpenGL,
         }
     }
 }
@@ -258,5 +253,15 @@ mod tests {
         assert_eq!(cfg.hubs.len(), 1);
         assert_eq!(cfg.hubs[0].device_id, "HUB1");
         assert_eq!(cfg.hubs[0].name, "Tapo H500");
+    }
+
+    #[test]
+    fn legacy_renderers_default_to_opengl() {
+        let d3d: AppConfig = serde_json::from_str(r#"{"renderer": "Direct3D"}"#).unwrap();
+        let vk: AppConfig = serde_json::from_str(r#"{"renderer": "Vulkan"}"#).unwrap();
+        let sw: AppConfig = serde_json::from_str(r#"{"renderer": "Software"}"#).unwrap();
+        assert_eq!(d3d.renderer, Renderer::OpenGL);
+        assert_eq!(vk.renderer, Renderer::OpenGL);
+        assert_eq!(sw.renderer, Renderer::Software);
     }
 }

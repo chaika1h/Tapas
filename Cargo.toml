@@ -1,6 +1,6 @@
 [package]
 name = "tapas"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Tapas: TP-Link Tapo cameras and the H500 HomeBase on Windows, through the Tapo cloud"
 license = "MIT"
@@ -22,9 +22,10 @@ rustls-platform-verifier = "0.7.1"
 sha1 = "0.11.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-# Pinned exactly: app.rs keeps the accent colour through its unstable internal API,
-# and main.rs tunes WGPU memory hints via unstable-wgpu-30.
-slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "renderer-femtovg-wgpu", "renderer-femtovg", "renderer-software", "unstable-wgpu-30", "accessibility", "compat-1-2"] }
+# Pinned exactly: app.rs keeps the accent colour through its unstable internal API.
+slint = { version = "=1.19.0", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "renderer-software", "accessibility", "compat-1-2"] }
+symphonia-codec-aac = "0.5"
+symphonia-core = "0.5"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 url = "2.5.8"
@@ -32,7 +33,7 @@ uuid = { version = "1.29.3", features = ["v4"] }
 sha2 = "0.11"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Security_Cryptography", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [build-dependencies]
 embed-resource = "3.0.12"

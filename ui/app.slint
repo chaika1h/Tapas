@@ -11,6 +11,7 @@ export struct Tile {
     live: bool,
     // The frame is the camera's last picture, shown until live video comes.
     stale: bool,
+    audio-on: bool,
 }
 
 // A camera on Home: `detail` is its model, `room` its room in the Tapo
@@ -18,14 +19,33 @@ export struct Tile {
 export struct HomeCard { id: int, name: string, detail: string, room: string, thumb: image, has-thumb: bool, state: string, playback: bool }
 export struct CameraRow { id: int, name: string, detail: string }
 // A hub: `detail` is its model and firmware; `disk` names its main disk,
-// `space` how full that is (`used` 0-1, or -1 when unknown) and `note` the
-// other disks or a problem; `loaded` once the hub has answered.
-export struct HubRow { id: int, name: string, detail: string, storage: string, room: string, disk: string, space: string, used: float, warn: bool, note: string, loaded: bool }
+// `space` how full that is (`used` 0-1, or -1 when unknown), `health` its
+// SMART temperature/uptime, and `note` the other disks or a problem; `loaded`
+// once the hub has answered.
+export struct HubRow {
+    id: int,
+    name: string,
+    detail: string,
+    storage: string,
+    room: string,
+    disk: string,
+    space: string,
+    health: string,
+    used: float,
+    warn: bool,
+    note: string,
+    loaded: bool,
+    loop-known: bool,
+    loop-on: bool,
+    alarm-on: bool,
+    busy: bool,
+}
 export struct PresetRow { id: string, name: string }
 export struct RecRow {
     // A heading for the hour (`time`) rather than a recording or event.
     header: bool,
     time: string,
+    camera: string,
     kind: string,
     // 1 person, 2 vehicle, 3 animal, 4 motion, 0 none
     icon: int,
@@ -57,11 +77,14 @@ export global Bridge {
     in property <string> home-title: "Home";
     in property <string> home-subtitle;
     callback open-hub(int);
+    callback hub-toggle-loop(int);
+    callback hub-toggle-alarm(int);
 
     // live grid
     in property <[Tile]> tiles;
     in property <int> columns: 1;
     callback open-camera(int);
+    callback toggle-tile-audio(int);
     // A camera's recordings on the hub, from its Home card.
     callback open-camera-playback(int);
 
@@ -76,6 +99,8 @@ export global Bridge {
     in property <[string]> quality-labels: ["SD", "HD"];
     callback quality-changed(int);
     callback snapshot();
+    in property <bool> single-audio-on;
+    callback single-toggle-audio();
     in property <bool> single-ptz;
     in property <bool> ptz-busy;
     in property <string> ptz-message;
@@ -84,11 +109,29 @@ export global Bridge {
     callback ptz-move(int, int);
     callback ptz-goto(string);
     callback ptz-save(string);
+    callback ptz-delete(string);
     callback ptz-refresh();
     in-out property <bool> ptz-open;
     in property <bool> single-privacy;
     in property <bool> single-privacy-known;
     callback privacy-toggle();
+    in property <bool> single-spotlight;
+    in property <bool> single-spotlight-known;
+    callback spotlight-toggle();
+    in property <bool> single-nv-known;
+    in-out property <int> single-nv-index;
+    in property <[string]> nv-labels: ["Auto", "Day", "Infrared", "Color", "Smart"];
+    callback night-vision-changed(int);
+    in property <bool> single-track;
+    in property <bool> single-track-known;
+    callback auto-track-toggle();
+    in property <bool> single-patrolling;
+    callback patrol-start(int); // 0 horizontal, 1 vertical
+    callback patrol-stop();
+    in property <bool> single-siren;
+    callback siren-toggle();
+    in-out property <bool> reboot-confirm;
+    callback camera-reboot();
     callback open-playback();
     callback single-back();
 
@@ -157,6 +200,8 @@ export global Bridge {
     in property <string> hub-message;
     in property <[string]> paired-names;
     in-out property <int> rec-camera;
+    in-out property <int> rec-filter;
+    in property <[string]> rec-filter-labels: ["All", "Person", "Vehicle", "Pet", "Motion", "Alerts"];
     in property <string> rec-date;
     in property <string> rec-month;
     in property <bool> rec-month-is-current;
@@ -169,6 +214,7 @@ export global Bridge {
     callback connect-hub();
     callback rec-hub-changed();
     callback rec-camera-changed();
+    callback rec-filter-changed(int);
     callback change-month(int);
     callback go-today();
     callback pick-day(int);
@@ -184,10 +230,12 @@ export global Bridge {
     in property <bool> player-busy;
     in property <bool> player-paused;
     in property <bool> player-ended;
+    in property <bool> player-audio-on;
     in property <[string]> speed-labels: ["1×"];
     in-out property <int> player-speed-index;
     callback player-stop();
     callback player-toggle-pause();
+    callback player-toggle-audio();
     callback player-speed(int);
     callback player-snapshot();
     callback player-record();
@@ -692,6 +740,14 @@ global Icons {
     out property <string> close: "M 6 6 L 18 18 M 18 6 L 6 18";
     out property <string> zoom-in: "M 10.5 4 A 6.5 6.5 0 1 0 10.51 4 Z M 15.5 15.5 L 20.5 20.5 M 8 10.5 H 13 M 10.5 8 V 13";
     out property <string> zoom-out: "M 10.5 4 A 6.5 6.5 0 1 0 10.51 4 Z M 15.5 15.5 L 20.5 20.5 M 8 10.5 H 13";
+    out property <string> volume-on: "M 4 9.5 H 8 L 13 5 V 19 L 8 14.5 H 4 Z M 16.5 9 A 4.2 4.2 0 0 1 16.5 15 M 19 6.5 A 7.5 7.5 0 0 1 19 17.5";
+    out property <string> volume-off: "M 4 9.5 H 8 L 13 5 V 19 L 8 14.5 H 4 Z M 16.5 9.5 L 21 14 M 21 9.5 L 16.5 14";
+    out property <string> spotlight: "M 12 7 A 5 5 0 1 0 12.01 7 Z M 12 2 V 4.2 M 12 19.8 V 22 M 2 12 H 4.2 M 19.8 12 H 22 M 4.9 4.9 L 6.5 6.5 M 17.5 17.5 L 19.1 19.1 M 19.1 4.9 L 17.5 6.5 M 6.5 17.5 L 4.9 19.1";
+    out property <string> moon: "M 19.5 14.5 A 7.5 7.5 0 1 1 9.5 4.5 A 6 6 0 0 0 19.5 14.5 Z";
+    out property <string> track: "M 12 4 A 8 8 0 1 0 12.01 4 Z M 12 9 A 3 3 0 1 0 12.01 9 Z M 12 2 V 5 M 12 19 V 22 M 2 12 H 5 M 19 12 H 22";
+    out property <string> siren: "M 6 17 H 18 M 7.5 17 V 12 A 4.5 4.5 0 0 1 16.5 12 V 17 M 12 3 V 5 M 5 6 L 6.5 7.5 M 19 6 L 17.5 7.5 M 3 12 H 5 M 19 12 H 21";
+    out property <string> power: "M 12 3.5 V 11.5 M 7.5 6.2 A 7 7 0 1 0 16.5 6.2";
+    out property <string> trash: "M 4.5 7 H 19.5 M 9.5 7 V 4.5 H 14.5 V 7 M 6.5 7 L 7.5 19.5 H 16.5 L 17.5 7";
 }
 
 component Icon inherits Path {
@@ -916,6 +972,7 @@ component ConnectingVeil inherits Rectangle {
 component VideoTile inherits Rectangle {
     in property <Tile> tile;
     callback clicked();
+    callback toggle-audio();
     background: #0d0d0d;
     border-radius: 8px;
     clip: true;
@@ -937,13 +994,19 @@ component VideoTile inherits Rectangle {
         wrap: word-wrap;
     }
     Rectangle {
+        border-radius: 8px;
+        border-width: ta.has-hover ? 2px : 0px;
+        border-color: Palette.accent-background;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Rectangle {
         y: parent.height - self.height;
         width: parent.width;
-        height: 30px;
+        height: 32px;
         background: #000000b0;
         HorizontalLayout {
             padding-left: 10px;
-            padding-right: 10px;
+            padding-right: 6px;
             spacing: 8px;
             VerticalLayout {
                 alignment: center;
@@ -964,14 +1027,27 @@ component VideoTile inherits Rectangle {
                 vertical-alignment: center;
                 overflow: elide;
             }
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 26px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: root.tile.audio-on ? Palette.accent-background : ata.has-hover ? #ffffff30 : transparent;
+                    Icon {
+                        width: 15px;
+                        height: 15px;
+                        commands: root.tile.audio-on ? Icons.volume-on : Icons.volume-off;
+                        color: root.tile.audio-on ? Palette.accent-foreground : #d8d8d8;
+                    }
+                    ata := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toggle-audio(); }
+                    }
+                }
+            }
         }
     }
-    Rectangle {
-        border-radius: 8px;
-        border-width: ta.has-hover ? 2px : 0px;
-        border-color: Palette.accent-background;
-    }
-    ta := TouchArea { clicked => { root.clicked(); } }
 }
 
 component CameraCard inherits Rectangle {
@@ -1081,13 +1157,15 @@ component CameraCard inherits Rectangle {
 component HubCard inherits Rectangle {
     in property <HubRow> hub;
     callback open();
+    callback toggle-loop();
+    callback toggle-alarm();
     border-radius: 16px;
     background: Palette.control-background;
     border-width: 1px;
     border-color: Palette.border;
     VerticalLayout {
         padding: 18px;
-        spacing: 14px;
+        spacing: 12px;
         HorizontalLayout {
             spacing: 14px;
             Rectangle {
@@ -1132,7 +1210,14 @@ component HubCard inherits Rectangle {
         if root.hub.loaded && root.hub.disk != "": VerticalLayout {
             spacing: 6px;
             HorizontalLayout {
+                spacing: 8px;
                 Text { text: root.hub.disk; font-size: 13px; font-weight: 600; }
+                if root.hub.health != "": Text {
+                    text: "·  " + root.hub.health;
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(0.45);
+                    vertical-alignment: center;
+                }
                 Rectangle { horizontal-stretch: 1; }
                 Text {
                     text: root.hub.space;
@@ -1158,6 +1243,64 @@ component HubCard inherits Rectangle {
             font-size: 12px;
             color: Palette.foreground.transparentize(0.45);
             wrap: word-wrap;
+        }
+        if root.hub.loaded: HorizontalLayout {
+            spacing: 12px;
+            if root.hub.loop-known: HorizontalLayout {
+                spacing: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Loop recording";
+                        font-size: 12px;
+                        color: Palette.foreground.transparentize(0.25);
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Switch {
+                        checked: root.hub.loop-on;
+                        enabled: !root.hub.busy;
+                        toggled => { root.toggle-loop(); }
+                    }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            if root.hub.busy: VerticalLayout {
+                alignment: center;
+                Spinner { width: 16px; height: 16px; indeterminate: true; }
+            }
+            Rectangle {
+                height: 30px;
+                width: hub-alarm-row.preferred-width + 20px;
+                border-radius: 15px;
+                background: root.hub.alarm-on ? #e5484d : hat.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
+                hub-alarm-row := HorizontalLayout {
+                    alignment: center;
+                    spacing: 6px;
+                    VerticalLayout {
+                        alignment: center;
+                        Icon {
+                            width: 15px;
+                            height: 15px;
+                            commands: Icons.siren;
+                            color: root.hub.alarm-on ? white : Palette.foreground;
+                        }
+                    }
+                    Text {
+                        text: root.hub.alarm-on ? "Stop alarm" : "Ring hub";
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: root.hub.alarm-on ? white : Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                }
+                hat := TouchArea {
+                    enabled: !root.hub.busy;
+                    mouse-cursor: pointer;
+                    clicked => { root.toggle-alarm(); }
+                }
+            }
         }
         if !root.hub.loaded: HorizontalLayout {
             spacing: 8px;
@@ -1271,6 +1414,8 @@ component HomePage inherits Rectangle {
                         width: min(560px, root.avail);
                         hub: h;
                         open => { Bridge.open-hub(i); }
+                        toggle-loop => { Bridge.hub-toggle-loop(i); }
+                        toggle-alarm => { Bridge.hub-toggle-alarm(i); }
                     }
                 }
                 if Bridge.hubs.length > 0: Rectangle { height: 6px; }
@@ -1344,6 +1489,7 @@ component LivePage inherits Rectangle {
                     height: cell-h;
                     tile: t;
                     clicked => { Bridge.open-camera(t.id); }
+                    toggle-audio => { Bridge.toggle-tile-audio(t.id); }
                 }
             }
         }
@@ -1471,6 +1617,27 @@ component PtzSection inherits VerticalLayout {
         changed(v) => { Bridge.ptz-step = Math.round(v); }
     }
     HorizontalLayout {
+        spacing: 6px;
+        Button {
+            text: "Pan patrol";
+            horizontal-stretch: 1;
+            enabled: !Bridge.ptz-busy;
+            clicked => { Bridge.patrol-start(0); }
+        }
+        Button {
+            text: "Tilt patrol";
+            horizontal-stretch: 1;
+            enabled: !Bridge.ptz-busy;
+            clicked => { Bridge.patrol-start(1); }
+        }
+        if Bridge.single-patrolling: Button {
+            text: "Stop";
+            primary: true;
+            enabled: !Bridge.ptz-busy;
+            clicked => { Bridge.patrol-stop(); }
+        }
+    }
+    HorizontalLayout {
         Text { text: "Presets"; font-size: 15px; font-weight: 600; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
         LinkText { text: "Refresh"; clicked => { Bridge.ptz-refresh(); } }
@@ -1488,18 +1655,34 @@ component PtzSection inherits VerticalLayout {
         accessible-role: button;
         accessible-label: "Go to " + p.name;
         accessible-action-default => { Bridge.ptz-goto(p.id); }
-        HorizontalLayout {
-            padding-left: 14px;
-            padding-right: 10px;
-            Text { text: p.name; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-            VerticalLayout {
-                alignment: center;
-                Icon { commands: Icons.chevron-right; width: 16px; height: 16px; color: Palette.foreground.transparentize(0.5); }
-            }
-        }
         pt := TouchArea {
             mouse-cursor: pointer;
             clicked => { Bridge.ptz-goto(p.id); }
+        }
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 6px;
+            spacing: 6px;
+            Text { text: p.name; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    border-radius: 7px;
+                    background: del.has-hover ? #e5484d30 : transparent;
+                    Icon {
+                        commands: Icons.trash;
+                        width: 15px;
+                        height: 15px;
+                        color: del.has-hover ? #e5484d : Palette.foreground.transparentize(0.45);
+                    }
+                    del := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { Bridge.ptz-delete(p.id); }
+                    }
+                }
+            }
         }
     }
     HorizontalLayout {
@@ -1593,6 +1776,16 @@ component SinglePage inherits Rectangle {
                         Text { text: Bridge.single-name; color: white; font-size: 18px; font-weight: 600; overflow: elide; }
                         Text { text: Bridge.single-status; color: #c0c0c0; font-size: 12px; overflow: elide; }
                     }
+                    VerticalLayout {
+                        alignment: center;
+                        RoundIconButton {
+                            icon: Bridge.single-audio-on ? Icons.volume-on : Icons.volume-off;
+                            label: Bridge.single-audio-on ? "Mute audio (M)" : "Listen in (M)";
+                            icon-color: Bridge.single-audio-on ? Palette.accent-foreground : white;
+                            base: Bridge.single-audio-on ? Palette.accent-background : #ffffff1a;
+                            clicked => { Bridge.single-toggle-audio(); }
+                        }
+                    }
                     // SD/HD switch.
                     VerticalLayout {
                         alignment: center;
@@ -1653,18 +1846,19 @@ component SinglePage inherits Rectangle {
                     spacing: 12px;
                     alignment: start;
                     GridLayout {
-                        spacing: 12px;
+                        spacing: 10px;
                         Row {
+                            ActionTile {
+                                icon: Bridge.single-audio-on ? Icons.volume-on : Icons.volume-off;
+                                text: Bridge.single-audio-on ? "Sound On" : "Sound Off";
+                                active: Bridge.single-audio-on;
+                                clicked => { Bridge.single-toggle-audio(); }
+                            }
                             ActionTile {
                                 icon: Icons.photo;
                                 text: "Take Photo";
                                 enabled: Bridge.single-has-frame && !Bridge.single-stale;
                                 clicked => { Bridge.snapshot(); }
-                            }
-                            ActionTile {
-                                icon: Icons.fullscreen;
-                                text: "Fullscreen";
-                                clicked => { Bridge.toggle-fullscreen(); }
                             }
                         }
                         Row {
@@ -1683,8 +1877,69 @@ component SinglePage inherits Rectangle {
                                 clicked => { Bridge.privacy-toggle(); }
                             }
                         }
+                        Row {
+                            ActionTile {
+                                icon: Icons.spotlight;
+                                text: Bridge.single-spotlight ? "Spotlight On" : "Spotlight";
+                                active: Bridge.single-spotlight;
+                                enabled: !Bridge.single-privacy && !Bridge.ptz-busy;
+                                clicked => { Bridge.spotlight-toggle(); }
+                            }
+                            ActionTile {
+                                icon: Icons.track;
+                                text: Bridge.single-track ? "Tracking On" : "Auto-Track";
+                                active: Bridge.single-track;
+                                enabled: Bridge.single-ptz && !Bridge.single-privacy && !Bridge.ptz-busy;
+                                clicked => { Bridge.auto-track-toggle(); }
+                            }
+                        }
+                        Row {
+                            ActionTile {
+                                icon: Icons.siren;
+                                text: Bridge.single-siren ? "Stop Siren" : "Siren";
+                                active: Bridge.single-siren;
+                                enabled: !Bridge.ptz-busy;
+                                clicked => { Bridge.siren-toggle(); }
+                            }
+                            ActionTile {
+                                icon: Icons.fullscreen;
+                                text: "Fullscreen";
+                                clicked => { Bridge.toggle-fullscreen(); }
+                            }
+                        }
                     }
                     if Bridge.ptz-open && Bridge.single-ptz && !Bridge.single-privacy: PtzSection { }
+                    // Night vision selector.
+                    Rectangle {
+                        height: 52px;
+                        border-radius: 12px;
+                        background: Palette.foreground.transparentize(0.93);
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 10px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon { commands: Icons.moon; width: 20px; height: 20px; }
+                            }
+                            Text {
+                                text: "Night Vision";
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                ComboBox {
+                                    width: 128px;
+                                    model: Bridge.nv-labels;
+                                    current-index <=> Bridge.single-nv-index;
+                                    enabled: !Bridge.single-privacy && !Bridge.ptz-busy;
+                                    selected => { Bridge.night-vision-changed(Bridge.single-nv-index); }
+                                }
+                            }
+                        }
+                    }
                     // Playback & Download: the camera's recordings on the hub.
                     Rectangle {
                         height: 58px;
@@ -1710,6 +1965,47 @@ component SinglePage inherits Rectangle {
                         pb := TouchArea {
                             mouse-cursor: pointer;
                             clicked => { Bridge.open-playback(); }
+                        }
+                    }
+                    // Reboot camera with 2-step confirmation.
+                    if !Bridge.reboot-confirm: HorizontalLayout {
+                        Button {
+                            text: "Reboot camera";
+                            horizontal-stretch: 1;
+                            enabled: !Bridge.ptz-busy;
+                            clicked => { Bridge.reboot-confirm = true; }
+                        }
+                    }
+                    if Bridge.reboot-confirm: Rectangle {
+                        border-radius: 12px;
+                        background: #e5484d1a;
+                        border-width: 1px;
+                        border-color: #e5484d60;
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text {
+                                text: "Reboot " + Bridge.single-name + "? Video will pause for ~30 seconds.";
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Button {
+                                    text: "Cancel";
+                                    horizontal-stretch: 1;
+                                    clicked => { Bridge.reboot-confirm = false; }
+                                }
+                                Button {
+                                    text: "Confirm Reboot";
+                                    primary: true;
+                                    horizontal-stretch: 1;
+                                    clicked => {
+                                        Bridge.reboot-confirm = false;
+                                        Bridge.camera-reboot();
+                                    }
+                                }
+                            }
                         }
                     }
                     if Bridge.ptz-message != "": Text {
@@ -1828,7 +2124,11 @@ component ClipRow inherits Rectangle {
             alignment: center;
             horizontal-stretch: 1;
             spacing: 3px;
-            Text { text: root.rec.time; font-weight: 600; overflow: elide; }
+            Text {
+                text: root.rec.camera != "" ? root.rec.time + "  ·  " + root.rec.camera : root.rec.time;
+                font-weight: 600;
+                overflow: elide;
+            }
             HorizontalLayout {
                 spacing: 6px;
                 if root.rec.icon > 0: Icon {
@@ -2208,6 +2508,18 @@ component PlaybackPage inherits Rectangle {
                                 RoundIconButton {
                                     width: 36px;
                                     height: 36px;
+                                    icon: Bridge.player-audio-on ? Icons.volume-on : Icons.volume-off;
+                                    label: Bridge.player-audio-on ? "Mute audio (M)" : "Listen in (M)";
+                                    icon-color: Bridge.player-audio-on ? Palette.accent-foreground : white;
+                                    base: Bridge.player-audio-on ? Palette.accent-background : #ffffff26;
+                                    clicked => { Bridge.player-toggle-audio(); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                RoundIconButton {
+                                    width: 36px;
+                                    height: 36px;
                                     icon: Icons.record;
                                     label: Bridge.player-recording ? "Stop and save the recording" : "Record";
                                     icon-color: Bridge.player-recording ? #ff6b6b : white;
@@ -2374,6 +2686,34 @@ component PlaybackPage inherits Rectangle {
                         Text { text: Bridge.rec-date; font-weight: 600; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
                         Muted { text: Bridge.rec-list-title; vertical-alignment: center; }
+                    }
+                    if Bridge.hub-connected: HorizontalLayout {
+                        spacing: 4px;
+                        for f[i] in Bridge.rec-filter-labels: Rectangle {
+                            height: 26px;
+                            horizontal-stretch: 1;
+                            border-radius: 13px;
+                            background: Bridge.rec-filter == i
+                                ? Palette.accent-background
+                                : fta.has-hover ? Palette.foreground.transparentize(0.88) : Palette.foreground.transparentize(0.93);
+                            Text {
+                                text: f;
+                                font-size: 11px;
+                                font-weight: 600;
+                                color: Bridge.rec-filter == i ? Palette.accent-foreground : Palette.foreground.transparentize(0.2);
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    if (Bridge.rec-filter != i) {
+                                        Bridge.rec-filter = i;
+                                        Bridge.rec-filter-changed(i);
+                                    }
+                                }
+                            }
+                        }
                     }
                     if Bridge.hub-connected: Rectangle {
                         vertical-stretch: 1;
@@ -2661,7 +3001,7 @@ component SettingsPage inherits Rectangle {
                             alignment: center;
                             ComboBox {
                                 width: 220px;
-                                model: ["Direct3D 12 (recommended)", "Vulkan", "Software (CPU)", "OpenGL"];
+                                model: ["OpenGL (recommended)", "Software (CPU)"];
                                 current-index <=> Bridge.renderer-index;
                                 selected => { Bridge.save-settings(); }
                             }
@@ -2788,6 +3128,16 @@ export component MainWindow inherits Window {
             if (event.text == Key.Escape) {
                 Bridge.escape();
                 return accept;
+            }
+            if (event.text == "m" || event.text == "M") {
+                if (Bridge.page == Page.single) {
+                    Bridge.single-toggle-audio();
+                    return accept;
+                }
+                if (Bridge.page == Page.recordings && Bridge.player-open) {
+                    Bridge.player-toggle-audio();
+                    return accept;
+                }
             }
             if (Bridge.page == Page.single && Bridge.single-ptz) {
                 if (event.text == Key.LeftArrow) {
