@@ -38,6 +38,10 @@ const AHEAD: i64 = 45;
 /// How much fetched video is kept in memory, across recordings: several
 /// minutes of a camera's HD video.
 const CACHE_BYTES: usize = 128 << 20;
+/// Paused this long, playback lets go of its ffmpeg (whose queues fill
+/// while nothing is read: ~100 MB) and the hub's session; the picture stays,
+/// and playing on starts again from it, mostly from the cache.
+const PARK_AFTER: Duration = Duration::from_secs(10);
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 
@@ -128,6 +132,8 @@ enum Outcome {
     Seek(i64),
     /// Start again from the position (the decoding mode changed).
     Restart,
+    /// Paused for a while: decoding and fetching stopped until it plays on.
+    Parked,
     Failed(String),
 }
 
@@ -160,6 +166,13 @@ async fn run(source: Source, mut sink: FrameSink, state: Arc<Mutex<PlayState>>, 
             Outcome::Ended => at = segment.end * 1000,
             Outcome::Seek(t) => at = t,
             Outcome::Restart => at = state.lock().unwrap().position_ms,
+            Outcome::Parked => {
+                log::info!("playback: paused a while; stopped decoding and fetching until it plays on");
+                match wait_for_play(&mut cmds, &state).await {
+                    Some(t) => at = t,
+                    None => return,
+                }
+            }
             Outcome::Failed(message) => {
                 log::warn!("playback: {message}");
                 if message.contains("expired") {
@@ -175,6 +188,23 @@ async fn run(source: Source, mut sink: FrameSink, state: Arc<Mutex<PlayState>>, 
                     None => return,
                 }
             }
+        }
+    }
+}
+
+/// While parked: handles commands until playing on (from where it stopped)
+/// or a seek.
+async fn wait_for_play(cmds: &mut mpsc::UnboundedReceiver<Cmd>, state: &Mutex<PlayState>) -> Option<i64> {
+    loop {
+        match cmds.recv().await? {
+            Cmd::Seek(t) => return Some(t),
+            Cmd::Pause(true) => state.lock().unwrap().paused = true,
+            Cmd::Pause(false) => {
+                let mut s = state.lock().unwrap();
+                s.paused = false;
+                return Some(s.position_ms);
+            }
+            Cmd::Speed(speed) => state.lock().unwrap().speed = speed,
         }
     }
 }
@@ -237,6 +267,8 @@ async fn play_segment(
     let mut first_time: Option<f64> = None;
     // (when, recorded ms) of the frame the pacing is measured from.
     let mut pace: Option<(Instant, i64)> = None;
+    // Since when it's been paused, if it is.
+    let mut paused_since: Option<Instant> = None;
     let mut last_shown = from_ms;
     let mut last_display = Instant::now();
     let (mut got, mut shown, mut report) = (0u32, 0u32, Instant::now());
@@ -294,8 +326,11 @@ async fn play_segment(
                 (s.paused, s.speed.max(1))
             };
             let wait = if paused {
-                None
+                // Paused long enough: let go of ffmpeg and the hub.
+                let since = *paused_since.get_or_insert_with(Instant::now);
+                Some(since + PARK_AFTER)
             } else {
+                paused_since = None;
                 let (since, at) = *pace.get_or_insert((Instant::now(), last_shown));
                 let due = since + Duration::from_millis(((recorded - at).max(0) as f64 / speed as f64) as u64);
                 if Instant::now() >= due {
@@ -309,7 +344,12 @@ async fn play_segment(
                         Some(due) => tokio::time::sleep_until(due).await,
                         None => std::future::pending().await,
                     }
-                } => break,
+                } => {
+                    if paused {
+                        return Outcome::Parked;
+                    }
+                    break;
+                }
                 cmd = cmds.recv() => match cmd {
                     None => return Outcome::Failed(String::new()),
                     Some(Cmd::Seek(t)) => return Outcome::Seek(t),
@@ -414,6 +454,11 @@ struct Cache {
 }
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+
+/// How much recorded video is held in memory now, in bytes.
+pub fn cached_bytes() -> usize {
+    CACHE.lock().unwrap().bytes
+}
 
 impl Cache {
     /// The pieces to show from `at_ms` (from the keyframe at or before it),

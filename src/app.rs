@@ -195,6 +195,8 @@ pub struct App {
     home_skip: RefCell<HashSet<u32>>,
     /// When unused streams were last looked at.
     last_sweep: Cell<Option<Instant>>,
+    /// When the memory in use was last logged.
+    last_memory_log: Cell<Option<Instant>>,
     /// Home card badges, e.g. "Offline".
     home_states: RefCell<HashMap<u32, String>>,
     home_cards: Rc<VecModel<HomeCard>>,
@@ -279,6 +281,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         thumbnails: RefCell::default(),
         home_skip: RefCell::default(),
         last_sweep: Cell::default(),
+        last_memory_log: Cell::default(),
         home_states: RefCell::default(),
         home_cards: Rc::new(VecModel::default()),
         return_page: Cell::new(Page::Home),
@@ -464,6 +467,10 @@ impl App {
             Page::Recordings => self.pump_player(&b),
             _ => {}
         }
+        if self.last_memory_log.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(120)) {
+            self.last_memory_log.set(Some(Instant::now()));
+            self.log_memory(b.get_page());
+        }
         if self.last_sweep.get().is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
             self.last_sweep.set(Some(Instant::now()));
             self.streams.borrow_mut().retain(|_, l| l.unused_since.is_none_or(|t| t.elapsed() < STREAM_LINGER));
@@ -473,6 +480,20 @@ impl App {
             *self.status_until.borrow_mut() = None;
             b.set_status_text(SharedString::new());
         }
+    }
+
+    /// Logs the memory in use and what's running, to tell what costs what
+    /// (e.g. comparing renderers).
+    fn log_memory(&self, page: Page) {
+        let Some((private, working)) = process_memory_mb() else { return };
+        let streams = self.streams.borrow().len();
+        let watching = self.watching.borrow().is_some();
+        log::info!(
+            "memory: {private} MB in use (working set {working} MB) · {:?} renderer · {page:?} page · {streams} video stream(s) · playback {} · {} MB of recordings cached",
+            self.cfg.borrow().renderer,
+            if watching { "open" } else { "closed" },
+            crate::playback::cached_bytes() >> 20,
+        );
     }
 
     fn pump_tiles(&self) {
@@ -813,7 +834,7 @@ impl App {
             .iter()
             .map(|c| {
                 let thumb = thumbs.get(&c.id).map(|t| t.frame.clone());
-                let room = c.cloud.as_ref().and_then(|l| homes.rooms.get(&l.device_id)).cloned().unwrap_or_default();
+                let room = c.cloud.as_ref().and_then(|l| homes.room_of(&l.device_id)).cloned().unwrap_or_default();
                 HomeCard {
                     id: c.id as i32,
                     name: c.name.as_str().into(),
@@ -1399,7 +1420,7 @@ impl App {
                 if !info.storage_status.is_empty() {
                     storage += &format!("\n{}", info.storage_status);
                 }
-                let room = self.homes.borrow().rooms.get(&h.device_id).cloned().unwrap_or_default();
+                let room = self.homes.borrow().room_of(&h.device_id).cloned().unwrap_or_default();
                 // The main (largest) disk gets the bar; the rest, and any
                 // problem, a line under it.
                 let main = info.disks.first();
@@ -1918,6 +1939,15 @@ impl App {
                 self.save_cloud_session(user, &session);
                 self.refresh_cloud_ui();
                 self.status("Signed in to the Tapo cloud again.");
+                // What failed with the old session: the hubs, homes and rooms.
+                if !self.hub_info_tried.get()
+                    && let Some(client) = self.cloud_client()
+                {
+                    self.rt.spawn(async move {
+                        let hubs = client.list_hubs().await;
+                        on_ui(move |app| app.cloud_hubs_loaded(hubs));
+                    });
+                }
             }
             Ok(Login::NeedsMfa(_)) => self.cloud_session_lost(),
             Err(e) if e.is_auth() || e.is_refused() => self.cloud_session_lost(),
@@ -2396,6 +2426,7 @@ impl App {
             && w.camera_id == camera.device_id
             && w.date == date
         {
+            self.pictures_after_video();
             w.playback.seek(at_ms);
             w.playback.set_paused(false);
             return;
@@ -2427,7 +2458,7 @@ impl App {
             ffmpeg,
         };
         // The hub serves one session at a time: the picture first.
-        self.stop_event_pictures();
+        self.pictures_after_video();
         let playback = Playback::start(&self.rt, source, at_ms, self.speed.get());
         *self.watching.borrow_mut() = Some(Watching {
             playback,
@@ -2570,11 +2601,10 @@ impl App {
     /// Fetches the pictures of the day's newest events (the hub keeps one per
     /// event), one at a time and only while nothing plays: the hub serves
     /// one session at a time, and watching comes first.
+    /// Fetches the day's event pictures, newest first. They take the hub
+    /// only while playback doesn't need it.
     fn fetch_event_pictures(&self) {
         self.stop_event_pictures();
-        if self.watching.borrow().is_some() {
-            return;
-        }
         let (Some(client), Some(ffmpeg), Some(hub), Some(camera)) = (
             self.cloud_client().filter(|c| c.session().is_some()),
             self.ffmpeg.borrow().clone(),
@@ -2588,7 +2618,7 @@ impl App {
             let pictures = self.event_pictures.borrow();
             let mut events: Vec<(i64, i64)> = session.events.iter().map(|e| (e.start, e.kind)).collect();
             events.reverse(); // newest first
-            events.into_iter().filter(|(start, _)| !pictures.contains_key(&(camera.device_id.clone(), *start))).take(60).collect()
+            events.into_iter().filter(|(start, _)| !pictures.contains_key(&(camera.device_id.clone(), *start))).take(100).collect()
         };
         if wanted.is_empty() {
             return;
@@ -2641,6 +2671,16 @@ impl App {
             }
         });
         *self.picture_task.borrow_mut() = Some(task);
+    }
+
+    /// Video is wanted now: an event picture on its way stops, so the hub is
+    /// free at once, and the rest come once playback has the hub.
+    fn pictures_after_video(&self) {
+        self.stop_event_pictures();
+        self.rt.spawn(async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            on_ui(|app| app.fetch_event_pictures());
+        });
     }
 
     fn stop_event_pictures(&self) {
@@ -3074,6 +3114,31 @@ fn link_cloud_cameras(cameras: &mut Vec<CameraConfig>, account: &[CloudCamera]) 
 
 fn string_model<S: Into<SharedString>>(items: impl IntoIterator<Item = S>) -> ModelRc<SharedString> {
     ModelRc::new(VecModel::from(items.into_iter().map(Into::into).collect::<Vec<SharedString>>()))
+}
+
+/// This process's memory in MB: (private bytes, working set).
+#[cfg(windows)]
+fn process_memory_mb() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the counters are sized as `cb` says; the pseudo-handle needs no closing.
+    let ok = unsafe {
+        GetProcessMemoryInfo(GetCurrentProcess(), &mut counters as *mut _ as *mut PROCESS_MEMORY_COUNTERS, counters.cb)
+    };
+    (ok != 0).then(|| ((counters.PrivateUsage >> 20) as u64, (counters.WorkingSetSize >> 20) as u64))
+}
+
+#[cfg(not(windows))]
+fn process_memory_mb() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = |key: &str| -> Option<u64> {
+        status.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse().ok()
+    };
+    Some((kb("RssAnon:").unwrap_or(0) >> 10, kb("VmRSS:")? >> 10))
 }
 
 /// `frame` at most `width` wide, keeping its shape.

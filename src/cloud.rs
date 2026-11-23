@@ -248,6 +248,14 @@ pub struct Homes {
     pub names: Vec<String>,
     /// Room name by device id, for devices placed in a room.
     pub rooms: HashMap<String, String>,
+    /// The account's only room, when it has just one: where every device is.
+    pub only_room: Option<String>,
+}
+
+impl Homes {
+    pub fn room_of(&self, device_id: &str) -> Option<&String> {
+        self.rooms.get(device_id).or(self.only_room.as_ref())
+    }
 }
 
 /// Something a camera detected, from the hub's event list.
@@ -810,10 +818,10 @@ impl CloudClient {
             json!({ "method": "getLensMaskConfig", "params": { "lens_mask": { "name": ["lens_mask_info"] } } }),
         ];
         let responses = self.camera_requests(camera, requests).await?;
-        let components = first_result(&responses, "getAppComponentList")?;
+        let components = result_for(&responses, "getAppComponentList", 0)?;
         let list = components.pointer("/app_component/app_component_list").and_then(Value::as_array);
         let ptz = list.is_some_and(|l| l.iter().any(|c| c.get("name").and_then(Value::as_str) == Some("ptz")));
-        let privacy = first_result(&responses[1..], "getLensMaskConfig").ok().and_then(|r| parse_lens_mask(&r));
+        let privacy = result_for(&responses, "getLensMaskConfig", 1).ok().and_then(|r| parse_lens_mask(&r));
         Ok((ptz, privacy))
     }
 
@@ -965,10 +973,16 @@ impl CloudClient {
             json!({ "method": "getSdCardStatus", "params": { "harddisk_manage": { "table": ["hd_info"] } } }),
         ];
         let responses = self.camera_requests(hub, requests).await?;
-        let info = first_result(&responses, "getDeviceInfo").unwrap_or_default();
-        let disks = first_result(responses.get(1..).unwrap_or_default(), "getSdCardStatus").unwrap_or_default();
+        // An H500 doesn't answer in the order asked: match by method.
+        let info = result_for(&responses, "getDeviceInfo", 0);
+        let disks = result_for(&responses, "getSdCardStatus", 1);
+        let (info, disks) = (info.clone().unwrap_or_default(), disks.clone().unwrap_or_default());
         let parsed = parse_hub_info(&info, &disks);
-        log::info!("hub {}: {parsed:?}; its storage said {disks}", hub.name);
+        log::info!("hub {}: {parsed:?}", hub.name);
+        if parsed.disks.is_empty() {
+            let answer = Value::Array(responses).to_string();
+            log::info!("hub {}: no disks in its answer: {}", hub.name, answer.chars().take(3000).collect::<String>());
+        }
         Ok(parsed)
     }
 
@@ -987,15 +1001,36 @@ impl CloudClient {
                 ids.push(id);
             }
         }
-        for id in ids {
-            let id: String = url::form_urlencoded::byte_serialize(id.as_bytes()).collect();
-            match self.iot_get(&format!("/v1/families/{id}/rooms")).await {
-                Ok(rooms) => {
-                    log::info!("rooms: {rooms}");
-                    homes.rooms.extend(parse_rooms(&rooms));
+        let escape = |id: &str| -> String { url::form_urlencoded::byte_serialize(id.as_bytes()).collect() };
+        // Room ids and names; the rooms don't list their devices, but each
+        // room's "thing order" does (the order the Tapo app shows them in).
+        let mut all_rooms: Vec<String> = Vec::new();
+        for family in &ids {
+            let rooms = match self.iot_get(&format!("/v1/families/{}/rooms", escape(family))).await {
+                Ok(rooms) => rooms,
+                Err(e) => {
+                    log::info!("no rooms for a home: {e}");
+                    continue;
                 }
-                Err(e) => log::info!("no rooms for a home: {e}"),
+            };
+            log::info!("rooms: {rooms}");
+            homes.rooms.extend(parse_rooms(&rooms));
+            for (room, name) in room_list(&rooms) {
+                all_rooms.push(name.clone());
+                let path = format!("/v1/families/{}/rooms/{}/thing-order", escape(family), escape(&room));
+                match self.iot_get(&path).await {
+                    Ok(things) => {
+                        log::info!("devices in {name}: {things}");
+                        for device in device_ids(&things) {
+                            homes.rooms.insert(device, name.clone());
+                        }
+                    }
+                    Err(e) => log::info!("no device list for {name}: {e}"),
+                }
             }
+        }
+        if let [only] = all_rooms.as_slice() {
+            homes.only_room = Some(only.clone());
         }
         Ok(homes)
     }
@@ -1109,6 +1144,13 @@ fn parse_camera_answer(status: u16, bytes: &[u8]) -> Result<Vec<Value>> {
 }
 
 /// The result of the first response, or the camera's error.
+/// The result of `method` in a multiple request's answers: the answer that
+/// names it, else the one at `index`.
+fn result_for(responses: &[Value], method: &str, index: usize) -> Result<Value> {
+    let named = responses.iter().position(|r| r.get("method").and_then(Value::as_str) == Some(method));
+    first_result(responses.get(named.unwrap_or(index)..).unwrap_or_default(), method)
+}
+
 fn first_result(responses: &[Value], method: &str) -> Result<Value> {
     let response = responses.first().ok_or_else(|| CloudError::new(format!("No answer to {method}")))?;
     match error_code(response) {
@@ -1330,34 +1372,52 @@ fn name_of(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().map(|k| decode_name(str_field(v, k).trim())).find(|n| !n.is_empty())
 }
 
-/// Rooms and the devices in them: each room object with an id and a name,
-/// and any device ids (strings, or objects with a device or thing id) under
-/// it.
+/// Rooms and the devices in them, where the answer lists them: each room
+/// object with an id and a name, and any device ids under it.
 fn parse_rooms(value: &Value) -> HashMap<String, String> {
     let mut rooms = HashMap::new();
     for room in objects_with(value, &["roomId"]) {
         let Some(name) = name_of(room, &["roomName", "name"]) else { continue };
-        let mut stack: Vec<&Value> = room.as_object().into_iter().flat_map(|o| o.values()).collect();
-        while let Some(v) = stack.pop() {
-            match v {
-                Value::Array(a) => stack.extend(a),
-                Value::Object(o) => {
-                    let id = ["deviceId", "thingName", "thingId"].iter().map(|k| str_field(v, k)).find(|x| !x.is_empty());
-                    match id {
-                        Some(id) => {
-                            rooms.insert(id, name.clone());
-                        }
-                        None => stack.extend(o.values()),
-                    }
-                }
-                Value::String(s) if s.len() >= 20 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                    rooms.insert(s.clone(), name.clone());
-                }
-                _ => {}
-            }
+        for device in device_ids(room) {
+            rooms.insert(device, name.clone());
         }
     }
     rooms
+}
+
+/// (id, name) of each room in a rooms answer: `{"data": [{"id", "name"}]}`.
+fn room_list(value: &Value) -> Vec<(String, String)> {
+    objects_with(value, &["roomId", "id"])
+        .into_iter()
+        .filter_map(|room| {
+            let id = ["roomId", "id"].iter().map(|k| str_field(room, k)).find(|v| !v.is_empty())?;
+            Some((id, name_of(room, &["roomName", "name"])?))
+        })
+        .collect()
+}
+
+/// Device ids anywhere in `value`: objects with a device or thing id, and
+/// strings that look like one (40 hex digits).
+fn device_ids(value: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack: Vec<&Value> = match value {
+        Value::Object(o) => o.values().collect(),
+        other => vec![other],
+    };
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(a) => stack.extend(a),
+            Value::Object(o) => {
+                match ["deviceId", "thingName", "thingId"].iter().map(|k| str_field(v, k)).find(|x| !x.is_empty()) {
+                    Some(id) => found.push(id),
+                    None => stack.extend(o.values()),
+                }
+            }
+            Value::String(s) if s.len() >= 20 && s.bytes().all(|b| b.is_ascii_hexdigit()) => found.push(s.clone()),
+            _ => {}
+        }
+    }
+    found
 }
 
 /// The clip relay request for the log, without the player id.
@@ -1718,6 +1778,15 @@ mod tests {
         let rooms = parse_rooms(&rooms);
         assert_eq!(rooms.get("CAM1").map(String::as_str), Some("Office"));
         assert_eq!(rooms.get("802DDDB125A9F2705123B328A3947A4B2526D47C").map(String::as_str), Some("Lobby"));
+        // As the cloud answers: rooms without their devices, then a room's
+        // thing order.
+        let listed = json!({"data": [{"id": "w03QLRwg", "name": "Ofis"}], "page": 0, "pageSize": 20, "total": 1});
+        assert_eq!(room_list(&listed), vec![("w03QLRwg".to_string(), "Ofis".to_string())]);
+        assert!(parse_rooms(&listed).is_empty());
+        let order = json!({"data": ["802DDDB125A9F2705123B328A3947A4B2526D47C", {"thingName": "8021F89910F333382370C451E9E4B624249780DE"}]});
+        assert_eq!(device_ids(&order).len(), 2);
+        let homes = Homes { only_room: Some("Ofis".into()), ..Default::default() };
+        assert_eq!(homes.room_of("anything").map(String::as_str), Some("Ofis"));
         let families = json!({"data": [{"familyId": "f1", "familyName": "T2ZmaWNl"}]});
         let names: Vec<_> = objects_with(&families, &["familyId", "id"]).iter().filter_map(|f| name_of(f, &["familyName", "name"])).collect();
         assert_eq!(names, vec!["Office"]);
