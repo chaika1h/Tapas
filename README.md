@@ -13,8 +13,9 @@ app login, like the Tapo app.
   Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
 - **Fullscreen** (F11 / double-click, Esc to leave) for a single camera or the whole grid.
 - **Playback from anywhere**: the H500's recordings of each camera along a day timeline, like the
-  Tapo app: click or drag to any moment, 1× to 16×, pause, detected events, a month calendar.
-  Recordings stream through the cloud; ↓ saves one to `Videos\TapoViewer`.
+  Tapo app: click or drag to any moment, 1× to 16×, pause, full screen, detected events with
+  their pictures, a month calendar, Record and Take photo. Recordings stream through the cloud;
+  ↓ saves one to `Videos\TapoViewer`.
 - **Snapshots** to `Pictures\TapoViewer`.
 - **Light or dark**, or the same as Windows (*Settings › Video & display*), always in the app's
   own blue rather than the Windows accent colour.
@@ -77,8 +78,17 @@ a dot). The timeline under the video shows the day: recordings in blue, detected
   five minutes. While playing, it follows the picture.
 - **1× 2× 4× 8× 16×** change the speed; from 8× only keyframes are shown, about one every
   second or two of recording. Click the picture (or ❚❚) to pause.
+- **Full screen** (its button, F11 or double-click the picture; Esc leaves it) puts the timeline
+  and controls over the picture. The list button by ⟳ hides the list for a bigger picture.
+- **Record** marks where the picture is; press it again to save from there to where the picture
+  is then (watching on, or jumping ahead) to `Videos\TapoViewer`, from memory where it can.
 - **Take photo** saves the picture shown to `Pictures\TapoViewer`; **↓** on an event or recording
   saves it to `Videos\TapoViewer`.
+
+The list shows the day's **detected events** (person, vehicle, animal, motion…) under each hour,
+with the picture the hub keeps for each, as in the Tapo app; days without any list the
+recordings. Pictures are fetched one at a time while nothing plays, as the hub serves one
+session at a time.
 
 Watching keeps nothing on disk: the recording comes from the hub through the cloud a couple of
 minutes at a time, shortly before it's needed, and what has arrived stays in memory for a while
@@ -95,7 +105,9 @@ stops working after a Tapo app update, the protocol has probably changed (see *T
 Cameras that send encrypted video through the cloud aren't supported yet; their tile says so.
 
 The day's recordings, events and calendar come from the hub's own searches (`searchVideoWithUTC`,
-`searchDetectionList`, `searchDateWithVideo` a month at a time). Playback asks the cloud for a relay
+`searchDetectionList` naming the camera by id and MAC, `searchDateWithVideo` a month at a time).
+An event's picture is a single H.264/H.265 keyframe (`image/avc`, `image/hevc`) from a "cover"
+download of media type 3, as the app's event list fetches them. Playback asks the cloud for a relay
 to the hub naming the camera, as the Tapo app does, and then
 has the conversation the hub has on its local media port (request, acknowledgements every 25
 parts, heartbeats, stop), ported from the MIT-licensed

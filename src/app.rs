@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 
 use crate::clip::{self, ClipRequest};
@@ -69,13 +69,31 @@ struct HubSession {
     /// What the camera detected that day, oldest first (empty if the hub
     /// doesn't list detections).
     events: Vec<Detection>,
-    /// The list's rows, newest first: (start, end, kind), from `events` if
-    /// there are any, else from `clips`.
-    rows: Vec<(i64, i64, i64)>,
+    /// The list's rows, newest first, from `events` if there are any, else
+    /// from `clips`, under a heading for each hour.
+    rows: Vec<ListRow>,
     /// Days with recordings, for the months in `months`.
     days: HashSet<NaiveDate>,
     months: HashSet<NaiveDate>,
     rec_request: u64,
+}
+
+/// A row of the Playback page's list.
+#[derive(Clone, Copy, PartialEq)]
+enum ListRow {
+    /// The hour (Unix seconds of its start) the rows below it fall in.
+    Hour(i64),
+    /// (start, end, kind)
+    Entry(i64, i64, i64),
+}
+
+impl ListRow {
+    fn entry(&self) -> Option<(i64, i64, i64)> {
+        match *self {
+            ListRow::Entry(a, b, k) => Some((a, b, k)),
+            ListRow::Hour(_) => None,
+        }
+    }
 }
 
 /// The part of the day the timeline shows (Unix ms).
@@ -151,6 +169,14 @@ pub struct App {
     home_cards: Rc<VecModel<HomeCard>>,
     /// Where the camera view's back button goes.
     return_page: Cell<Page>,
+    /// The list's rows as shown, updated in place so it keeps its scroll.
+    rec_rows: Rc<VecModel<RecRow>>,
+    /// Event pictures by (camera id, event start).
+    event_pictures: RefCell<HashMap<(String, i64), Frame>>,
+    /// Fetching event pictures, while nothing plays.
+    picture_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
+    /// Recording what's watched: from when (ms), in the day being watched.
+    recording_from: Cell<Option<i64>>,
     /// The Tapo app's homes and rooms, from the account.
     homes: RefCell<Homes>,
     /// What each hub (by device id) says about itself.
@@ -222,6 +248,10 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         pending_rec_camera: RefCell::default(),
         homes: RefCell::default(),
         hub_info: RefCell::default(),
+        rec_rows: Rc::new(VecModel::default()),
+        event_pictures: RefCell::default(),
+        picture_task: RefCell::default(),
+        recording_from: Cell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     if new_terminal {
@@ -279,6 +309,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_player_toggle_pause(cb!(&app, |a| a.player_toggle_pause()));
     b.on_player_speed(cb!(&app, |a, i| a.player_speed(i)));
     b.on_player_snapshot(cb!(&app, |a| a.player_snapshot()));
+    b.on_player_record(cb!(&app, |a| a.player_record()));
+    b.set_recordings(app.rec_rows.clone().into());
     b.on_tl_click(cb!(&app, |a, f| a.tl_click(f)));
     b.on_tl_drag(cb!(&app, |a, f| a.tl_drag(f)));
     b.on_tl_drag_end(cb!(&app, |a| a.timeline.borrow_mut().drag_from = None));
@@ -561,7 +593,8 @@ impl App {
     fn toggle_fullscreen(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        if matches!(b.get_page(), Page::Live | Page::Single) || b.get_fullscreen() {
+        let watching = b.get_page() == Page::Recordings && b.get_player_open();
+        if matches!(b.get_page(), Page::Live | Page::Single) || watching || b.get_fullscreen() {
             self.set_fullscreen(!b.get_fullscreen());
         }
     }
@@ -1549,7 +1582,7 @@ impl App {
         b.set_hub_connected(false);
         b.set_hub_busy(false);
         b.set_rec_loading(false);
-        b.set_recordings(ModelRc::default());
+        self.rec_rows.set_vec(Vec::new());
         b.set_paired_names(ModelRc::default());
         self.update_calendar();
         self.refresh_timeline();
@@ -1813,7 +1846,8 @@ impl App {
             session.rows.clear();
             session.rec_request
         };
-        b.set_recordings(ModelRc::default());
+        self.rec_rows.set_vec(Vec::new());
+        self.stop_event_pictures();
         b.set_rec_message(SharedString::new());
         self.reset_timeline();
         let (Some(client), Some(hub), Some(camera)) = (
@@ -1831,7 +1865,7 @@ impl App {
             let clips = client.hub_clips(&hub, &camera.device_id, start, end, &player_id).await;
             // The events are extra: without them the list shows the recordings.
             let events = match &clips {
-                Ok(_) => client.hub_detections(&hub, &camera.device_id, start, end).await.unwrap_or_else(|e| {
+                Ok(_) => client.hub_detections(&hub, &camera, start, end).await.unwrap_or_else(|e| {
                     log::info!("no detected events from the hub: {e}");
                     Vec::new()
                 }),
@@ -1851,12 +1885,13 @@ impl App {
         match result {
             Ok(clips) => {
                 let total: i64 = clips.iter().map(Clip::seconds).sum();
-                let mut rows: Vec<(i64, i64, i64)> = if events.is_empty() {
+                let mut entries: Vec<(i64, i64, i64)> = if events.is_empty() {
                     clips.iter().map(|c| (c.start, c.end, c.kind)).collect()
                 } else {
                     events.iter().map(|e| (e.start, e.end, e.kind)).collect()
                 };
-                rows.reverse(); // newest first
+                entries.reverse(); // newest first
+                let rows = with_hours(&entries);
                 b.set_rec_list_title(match (events.len(), clips.len()) {
                     (0, 0) => SharedString::new(),
                     (0, n) => format!("Recordings · {n}").into(),
@@ -1888,6 +1923,7 @@ impl App {
         self.update_calendar();
         self.refresh_rec_rows();
         self.refresh_timeline();
+        self.fetch_event_pictures();
     }
 
     /// The row that holds the picture being watched, if any.
@@ -1896,7 +1932,7 @@ impl App {
         let w = watching.as_ref()?;
         let position = w.playback.state.lock().unwrap().position_ms / 1000;
         let session = self.hub.borrow();
-        session.rows.iter().position(|&(start, end, _)| start <= position && position <= end)
+        session.rows.iter().position(|r| r.entry().is_some_and(|(start, end, _)| start <= position && position <= end))
     }
 
     fn refresh_rec_rows(&self) {
@@ -1904,28 +1940,61 @@ impl App {
         let watched = self.watched_row();
         let session = self.hub.borrow();
         let detected = !session.events.is_empty();
+        let pictures = self.event_pictures.borrow();
         let rows: Vec<RecRow> = session
             .rows
             .iter()
             .enumerate()
-            .map(|(i, &(start, end, kind))| RecRow {
-                time: if detected {
-                    local_time(start).format("%H:%M:%S").to_string().into()
-                } else {
-                    format!("{} – {}", local_time(start).format("%H:%M:%S"), local_time(end).format("%H:%M:%S")).into()
+            .map(|(i, row)| match *row {
+                ListRow::Hour(hour) => RecRow {
+                    header: true,
+                    time: local_time(hour).format("%H:00").to_string().into(),
+                    ..Default::default()
                 },
-                kind: cloud::clip_kind(kind).into(),
-                duration: fmt_duration((end - start).max(0) as u64).into(),
-                playing: watched == Some(i),
-                saved: is_saved(&clip_path(&camera, start)),
+                ListRow::Entry(start, end, kind) => {
+                    let picture = pictures.get(&(camera.device_id.clone(), start));
+                    RecRow {
+                        header: false,
+                        time: if detected {
+                            local_time(start).format("%H:%M:%S").to_string().into()
+                        } else {
+                            format!("{} – {}", local_time(start).format("%H:%M:%S"), local_time(end).format("%H:%M:%S"))
+                                .into()
+                        },
+                        kind: cloud::clip_kind(kind).into(),
+                        icon: kind_icon(kind),
+                        duration: fmt_duration((end - start).max(0) as u64).into(),
+                        playing: watched == Some(i),
+                        saved: is_saved(&clip_path(&camera, start)),
+                        has_thumb: picture.is_some(),
+                        thumb: picture.cloned().map(Image::from_rgb8).unwrap_or_default(),
+                    }
+                }
             })
             .collect();
-        self.ui().global::<Bridge>().set_recordings(ModelRc::new(VecModel::from(rows)));
+        // In place where the rows are the same, so the list keeps its scroll.
+        if rows.len() == self.rec_rows.row_count() {
+            for (i, row) in rows.into_iter().enumerate() {
+                let old = self.rec_rows.row_data(i);
+                let same = old.as_ref().is_some_and(|o| {
+                    o.time == row.time
+                        && o.playing == row.playing
+                        && o.saved == row.saved
+                        && o.has_thumb == row.has_thumb
+                        && o.header == row.header
+                });
+                if !same {
+                    self.rec_rows.set_row_data(i, row);
+                }
+            }
+        } else {
+            self.rec_rows.set_vec(rows);
+        }
     }
 
     /// A row of the list: watch from its start.
     fn play_row(&self, index: usize) {
-        let Some(&(start, _, _)) = self.hub.borrow().rows.get(index) else { return };
+        let Some((start, _, _)) = self.hub.borrow().rows.get(index).and_then(ListRow::entry) else { return };
         self.watch_from(start * 1000);
     }
 
@@ -1969,6 +2038,8 @@ impl App {
             segments: clips,
             ffmpeg,
         };
+        // The hub serves one session at a time: the picture first.
+        self.stop_event_pictures();
         let playback = Playback::start(&self.rt, source, at_ms, self.speed.get());
         *self.watching.borrow_mut() = Some(Watching {
             playback,
@@ -2018,6 +2089,13 @@ impl App {
             (Some((st.position_ms, paused)), true)
         };
         let Some((position, paused)) = position else { return };
+        if let Some(from) = self.recording_from.get() {
+            let secs = ((position - from).max(0) / 1000) as u64;
+            let text = format!("{}:{:02}", secs / 60, secs % 60);
+            if b.get_player_rec_time() != text.as_str() {
+                b.set_player_rec_time(text.into());
+            }
+        }
         self.follow_playhead(position, paused);
         if row_changed {
             let row = self.watched_row();
@@ -2046,7 +2124,15 @@ impl App {
         b.set_player_frame(Image::default());
         b.set_player_has_frame(false);
         b.set_tl_playhead(-1.0);
+        if self.recording_from.take().is_some() {
+            b.set_player_recording(false);
+            self.status("Recording stopped without saving: the player was closed.");
+        }
+        if b.get_fullscreen() {
+            self.set_fullscreen(false);
+        }
         self.refresh_rec_rows();
+        self.fetch_event_pictures();
     }
 
     /// Play/pause; after the day's last recording, play from its first.
@@ -2089,6 +2175,149 @@ impl App {
         };
         let name = self.selected_rec_camera().map(|c| c.name).unwrap_or_default();
         self.save_snapshot(frame, &name, local_time(at / 1000));
+    }
+
+    // ------------------------------------------------------- event pictures
+
+    /// Fetches the pictures of the day's newest events (the hub keeps one per
+    /// event), one at a time and only while nothing plays: the hub serves
+    /// one session at a time, and watching comes first.
+    fn fetch_event_pictures(&self) {
+        self.stop_event_pictures();
+        if self.watching.borrow().is_some() {
+            return;
+        }
+        let (Some(client), Some(ffmpeg), Some(hub), Some(camera)) = (
+            self.cloud_client().filter(|c| c.session().is_some()),
+            self.ffmpeg.borrow().clone(),
+            self.hub.borrow().hub.clone(),
+            self.selected_rec_camera(),
+        ) else {
+            return;
+        };
+        let wanted: Vec<(i64, i64)> = {
+            let session = self.hub.borrow();
+            let pictures = self.event_pictures.borrow();
+            let mut events: Vec<(i64, i64)> = session.events.iter().map(|e| (e.start, e.kind)).collect();
+            events.reverse(); // newest first
+            events.into_iter().filter(|(start, _)| !pictures.contains_key(&(camera.device_id.clone(), *start))).take(60).collect()
+        };
+        if wanted.is_empty() {
+            return;
+        }
+        let player_id = self.player_id.clone();
+        let task = self.rt.spawn(async move {
+            let mut misses = 0;
+            for (start, kind) in wanted {
+                let request = ClipRequest {
+                    hub: hub.clone(),
+                    camera: camera.clone(),
+                    clip: Clip { start, end: start, kind },
+                    player_id: player_id.clone(),
+                };
+                let picture = match clip::event_picture(&client, &request).await {
+                    Ok((data, kind)) => crate::ffmpeg::decode_picture(&ffmpeg, &data, &kind, 256, 144).await,
+                    Err(e) => Err(e),
+                };
+                match picture {
+                    Ok(frame) => {
+                        misses = 0;
+                        let key = (camera.device_id.clone(), start);
+                        on_ui(move |app| {
+                            app.event_pictures.borrow_mut().insert(key, frame);
+                            app.refresh_rec_rows();
+                        });
+                    }
+                    Err(e) => {
+                        log::info!("no picture for the event at {start}: {e:#}");
+                        misses += 1;
+                        if misses >= 3 {
+                            log::info!("event pictures: giving up after three misses in a row");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        *self.picture_task.borrow_mut() = Some(task);
+    }
+
+    fn stop_event_pictures(&self) {
+        if let Some(task) = self.picture_task.borrow_mut().take() {
+            task.abort(); // its session guard ends the hub session
+        }
+    }
+
+    // -------------------------------------------------------------- record
+
+    /// Record: the first press marks where the picture is; the second saves
+    /// the recording from there to where the picture is then (watching on,
+    /// or jumping there), from memory where it can, else from the hub.
+    fn player_record(&self) {
+        let position = {
+            let watching = self.watching.borrow();
+            let Some(w) = watching.as_ref() else { return };
+            w.playback.state.lock().unwrap().position_ms
+        };
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        let Some(from) = self.recording_from.take() else {
+            self.recording_from.set(Some(position));
+            b.set_player_recording(true);
+            b.set_player_rec_time("0:00".into());
+            return;
+        };
+        b.set_player_recording(false);
+        let (start, end) = (from.min(position), from.max(position));
+        if end - start < 1000 {
+            self.status("Nothing recorded: play on, or jump ahead, before pressing Record again.");
+            return;
+        }
+        self.save_range(start, end);
+    }
+
+    /// Saves `start_ms..end_ms` of the day being watched to one file.
+    fn save_range(&self, start_ms: i64, end_ms: i64) {
+        let (Some(client), Some(hub), Some(camera)) = (
+            self.cloud_client().filter(|c| c.session().is_some()),
+            self.hub.borrow().hub.clone(),
+            self.selected_rec_camera(),
+        ) else {
+            return;
+        };
+        let clips: Vec<Clip> = {
+            let session = self.hub.borrow();
+            let mut c: Vec<Clip> =
+                session.clips.iter().filter(|c| c.end * 1000 > start_ms && c.start * 1000 < end_ms).copied().collect();
+            c.sort_by_key(|c| c.start);
+            c
+        };
+        if clips.is_empty() {
+            self.status("There's no recording in that stretch.");
+            return;
+        }
+        let first = local_time(start_ms / 1000);
+        let path = config::recordings_dir().join(format!(
+            "{}_{}_to_{}.ts",
+            file_safe(&camera.name),
+            first.format("%Y-%m-%d_%H-%M-%S"),
+            local_time(end_ms / 1000).format("%H-%M-%S")
+        ));
+        let label = format!("{} · {} – {}", camera.name, first.format("%d %b %H:%M:%S"), local_time(end_ms / 1000).format("%H:%M:%S"));
+        let row = self.push_download(label, "Saving…".into(), &path, false);
+        let player_id = self.player_id.clone();
+        self.rt.spawn(async move {
+            let result = save_stretch(&client, &hub, &camera, &player_id, &clips, start_ms, end_ms, &path).await;
+            let (text, done) = match &result {
+                Ok(from_memory) => {
+                    let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+                    let how = if *from_memory { " (from what was watched)" } else { "" };
+                    (format!("Saved · {mb:.1} MB{how}"), true)
+                }
+                Err(e) => (format!("Failed: {e:#}"), false),
+            };
+            on_ui(move |app| app.set_download_status(row, text, done));
+        });
     }
 
     // --------------------------------------------------------- the timeline
@@ -2217,7 +2446,7 @@ impl App {
 
     /// Saves a row's recording to `Videos\TapoViewer` without playing it.
     fn download(&self, index: usize) {
-        let Some(&(start, end, kind)) = self.hub.borrow().rows.get(index) else { return };
+        let Some((start, end, kind)) = self.hub.borrow().rows.get(index).and_then(ListRow::entry) else { return };
         let (Some(hub), Some(camera)) = (self.hub.borrow().hub.clone(), self.selected_rec_camera()) else { return };
         let request = ClipRequest { hub, camera, clip: Clip { start, end, kind }, player_id: self.player_id.clone() };
         let path = clip_path(&request.camera, start);
@@ -2293,6 +2522,94 @@ fn keep_app_accent(ui: &MainWindow) {
     let context = WindowInner::from_pub(ui.window()).context();
     if context.accent_color() != slint::Color::default() {
         context.set_accent_color(slint::Color::default());
+    }
+}
+
+/// Rows newest first, with a heading at each new hour.
+fn with_hours(entries: &[(i64, i64, i64)]) -> Vec<ListRow> {
+    let mut rows = Vec::new();
+    let mut hour = None;
+    for &(start, end, kind) in entries {
+        let t = local_time(start);
+        let this = t.timestamp() - (t.minute() as i64 * 60 + t.second() as i64);
+        if hour != Some(this) {
+            rows.push(ListRow::Hour(this));
+            hour = Some(this);
+        }
+        rows.push(ListRow::Entry(start, end, kind));
+    }
+    rows
+}
+
+/// The list's icon for an event's kind: 1 person, 2 vehicle, 3 animal,
+/// 4 motion, 0 none (continuous recording).
+fn kind_icon(kind: i64) -> i32 {
+    match kind {
+        6 | 20..=22 | 27 => 1,
+        8 => 2,
+        9 | 11 | 12 | 33 => 3,
+        1 => 0,
+        _ => 4,
+    }
+}
+
+/// Writes `start_ms..end_ms` across `clips` to `path`: from memory where all
+/// of a recording's part is there, else fetched from the hub. Returns
+/// whether it all came from memory.
+#[allow(clippy::too_many_arguments)]
+async fn save_stretch(
+    client: &CloudClient,
+    hub: &CloudCamera,
+    camera: &HubCamera,
+    player_id: &str,
+    clips: &[Clip],
+    start_ms: i64,
+    end_ms: i64,
+    path: &Path,
+) -> anyhow::Result<bool> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let partial = clip::partial_path(path);
+    let mut file = std::io::BufWriter::new(std::fs::File::create(&partial)?);
+    let mut all_from_memory = true;
+    let result = async {
+        for c in clips {
+            let (a, b) = (start_ms.max(c.start * 1000), end_ms.min(c.end * 1000));
+            if let Some(pieces) = crate::playback::cached_video(&camera.device_id, c.start, a, b) {
+                for piece in pieces {
+                    file.write_all(&piece)?;
+                }
+                continue;
+            }
+            all_from_memory = false;
+            let request = ClipRequest {
+                hub: hub.clone(),
+                camera: camera.clone(),
+                clip: Clip { start: a / 1000, end: (b + 999) / 1000, kind: c.kind },
+                player_id: player_id.to_string(),
+            };
+            let mut media = |m: clip::Media<'_>| -> anyhow::Result<()> {
+                file.write_all(m.data)?;
+                Ok(())
+            };
+            clip::download(client, &request, &mut media, &mut |_| {}).await?;
+        }
+        file.flush()?;
+        anyhow::Ok(())
+    }
+    .await;
+    drop(file);
+    match result {
+        Ok(()) => {
+            std::fs::rename(&partial, path)?;
+            Ok(all_from_memory)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            Err(e)
+        }
     }
 }
 

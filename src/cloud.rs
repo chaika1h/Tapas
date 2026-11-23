@@ -888,10 +888,10 @@ impl CloudClient {
     }
 
     /// What the camera detected between `start` and `end` (Unix seconds, at
-    /// most a day), oldest first. This is the camera's own event search with
-    /// the hub's `child_device_id`; hubs that answer otherwise give an error
-    /// (logged with their answer).
-    pub async fn hub_detections(&self, hub: &CloudCamera, camera_id: &str, start: i64, end: i64) -> Result<Vec<Detection>> {
+    /// most a day), oldest first: the hub's event search, naming the camera
+    /// by id and MAC address as the Tapo app does (an H500 finds nothing
+    /// without the MAC).
+    pub async fn hub_detections(&self, hub: &CloudCamera, camera: &HubCamera, start: i64, end: i64) -> Result<Vec<Detection>> {
         const PAGE: i64 = 100;
         let mut found = Vec::new();
         let mut index = 0;
@@ -904,7 +904,8 @@ impl CloudClient {
                     "end_time": end,
                     "start_index": index,
                     "end_index": index + PAGE - 1,
-                    "child_device_id": camera_id,
+                    "child_device_id": camera.device_id,
+                    "child_device_mac": camera.mac,
                 } } },
             });
             let responses = self.camera_requests(hub, vec![request]).await?;
