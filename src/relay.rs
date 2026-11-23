@@ -174,11 +174,27 @@ pub async fn read_response_head<R: AsyncBufRead + Unpin>(reader: &mut R) -> Resu
     let status = read_line(reader).await?;
     while !read_line(reader).await?.is_empty() {}
     let code = status.split_whitespace().nth(1).unwrap_or("");
+    if status.starts_with("HTTP/1.") && matches!(code, "500" | "503") {
+        return Err(anyhow!(RelayBusy(status.trim().to_string())));
+    }
     if !status.starts_with("HTTP/1.") || code != "200" {
         bail!("The video relay refused the connection ({})", status.trim());
     }
     Ok(())
 }
+
+/// The relay turned the connection away with a server error, as it does
+/// while the device is still busy with another session.
+#[derive(Debug)]
+pub struct RelayBusy(pub String);
+
+impl std::fmt::Display for RelayBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "The video relay refused the connection ({}); the device may still be busy", self.0)
+    }
+}
+
+impl std::error::Error for RelayBusy {}
 
 /// Copies the MPEG-TS carried in the multipart body to `out` until the relay
 /// stops, which is always an error for a live stream.

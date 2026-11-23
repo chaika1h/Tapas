@@ -14,7 +14,8 @@ use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel};
 
 use crate::clip::{self, ClipRequest};
 use crate::cloud::{
-    self, Clip, CloudCamera, CloudClient, Detection, HubCamera, Login, MfaChallenge, MfaMethod, Session,
+    self, Clip, CloudCamera, CloudClient, Detection, Homes, HubCamera, HubInfo, Login, MfaChallenge, MfaMethod,
+    Session,
 };
 use crate::config::{self, AppConfig, CameraConfig, Quality, Renderer, Theme};
 use crate::playback::{Playback, SPEEDS, Source};
@@ -150,6 +151,10 @@ pub struct App {
     home_cards: Rc<VecModel<HomeCard>>,
     /// Where the camera view's back button goes.
     return_page: Cell<Page>,
+    /// The Tapo app's homes and rooms, from the account.
+    homes: RefCell<Homes>,
+    /// What each hub (by device id) says about itself.
+    hub_info: RefCell<HashMap<String, HubInfo>>,
     /// A camera (cloud device id or name) to select once the hub's cameras
     /// are listed.
     pending_rec_camera: RefCell<Option<(String, String)>>,
@@ -215,6 +220,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         home_cards: Rc::new(VecModel::default()),
         return_page: Cell::new(Page::Home),
         pending_rec_camera: RefCell::default(),
+        homes: RefCell::default(),
+        hub_info: RefCell::default(),
     });
     APP.with(|a| *a.borrow_mut() = Some(app.clone()));
     if new_terminal {
@@ -287,6 +294,10 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     app.refresh_hub_lists();
     app.update_rec_date_label();
     app.update_calendar();
+    if app.signed_in_now() {
+        let hubs = app.cfg.borrow().hubs.clone();
+        app.load_account_details(&hubs);
+    }
     app.reset_timeline();
     app.sync_streams();
 
@@ -346,6 +357,7 @@ impl App {
     /// Runs every ~30 ms: moves new frames and status into the UI.
     fn pump(&self) {
         let Some(ui) = self.ui.upgrade() else { return };
+        keep_app_accent(&ui);
         let b = ui.global::<Bridge>();
         match b.get_page() {
             Page::Home => self.pump_home(),
@@ -653,18 +665,27 @@ impl App {
         let cfg = self.cfg.borrow();
         let thumbs = self.thumbnails.borrow();
         let states = self.home_states.borrow();
+        let homes = self.homes.borrow();
+        let title = match homes.names.as_slice() {
+            [name, ..] => name.clone(),
+            [] => "Home".to_string(),
+        };
+        self.ui().global::<Bridge>().set_home_title(title.into());
         let cards: Vec<HomeCard> = cfg
             .cameras
             .iter()
             .map(|c| {
                 let thumb = thumbs.get(&c.id).cloned();
+                let room = c.cloud.as_ref().and_then(|l| homes.rooms.get(&l.device_id));
                 HomeCard {
                     id: c.id as i32,
                     name: c.name.as_str().into(),
-                    detail: match &c.cloud {
-                        Some(link) if !link.model.is_empty() => link.model.as_str().into(),
-                        Some(_) => "Tapo camera".into(),
-                        None => "Not linked to your Tapo account".into(),
+                    detail: match (&c.cloud, room) {
+                        (Some(link), Some(room)) if !link.model.is_empty() => format!("{} · {room}", link.model).into(),
+                        (Some(link), None) if !link.model.is_empty() => link.model.as_str().into(),
+                        (Some(_), Some(room)) => room.as_str().into(),
+                        (Some(_), None) => "Tapo camera".into(),
+                        (None, _) => "Not linked to your Tapo account".into(),
                     },
                     has_thumb: thumb.is_some(),
                     thumb: thumb.map(Image::from_rgb8).unwrap_or_default(),
@@ -1002,7 +1023,24 @@ impl App {
             .hubs
             .iter()
             .enumerate()
-            .map(|(i, h)| HubRow { id: i as i32, name: h.name.as_str().into(), detail: hub_detail(h).into() })
+            .map(|(i, h)| {
+                let info = self.hub_info.borrow().get(&h.device_id).cloned().unwrap_or_default();
+                let mut detail = hub_detail(h);
+                if let Some(room) = self.homes.borrow().rooms.get(&h.device_id) {
+                    detail += &format!(" · {room}");
+                }
+                if !info.firmware.is_empty() {
+                    detail += &format!(" · firmware {}", info.firmware.split_whitespace().next().unwrap_or(""));
+                }
+                let mut storage = match info.storage.as_str() {
+                    "" => String::new(),
+                    s => format!("Storage: {s}"),
+                };
+                if !info.storage_status.is_empty() && !info.storage_status.eq_ignore_ascii_case("normal") {
+                    storage += &format!(" ({})", info.storage_status);
+                }
+                HubRow { id: i as i32, name: h.name.as_str().into(), detail: detail.into(), storage: storage.into() }
+            })
             .collect();
         b.set_hubs(ModelRc::new(VecModel::from(rows)));
         b.set_hub_names(string_model(cfg.hubs.iter().map(|h| h.name.clone())));
@@ -1358,6 +1396,7 @@ impl App {
                 return;
             }
         };
+        self.load_account_details(&hubs);
         if hubs == self.cfg.borrow().hubs {
             return;
         }
@@ -1370,6 +1409,34 @@ impl App {
         if current.is_some() && self.selected_hub() != current {
             self.connect_hub();
         }
+    }
+
+    /// The account's homes and rooms, and each hub's firmware and storage:
+    /// extras, so failures are only logged.
+    fn load_account_details(&self, hubs: &[CloudCamera]) {
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        let hubs = hubs.to_vec();
+        self.rt.spawn(async move {
+            let homes = client.homes().await.unwrap_or_else(|e| {
+                log::info!("no homes from the account: {e}");
+                Homes::default()
+            });
+            let mut info = HashMap::new();
+            for hub in &hubs {
+                match client.hub_info(hub).await {
+                    Ok(i) => {
+                        info.insert(hub.device_id.clone(), i);
+                    }
+                    Err(e) => log::info!("no details from {}: {e}", hub.name),
+                }
+            }
+            on_ui(move |app| {
+                *app.homes.borrow_mut() = homes;
+                *app.hub_info.borrow_mut() = info;
+                app.refresh_home_cards();
+                app.refresh_hub_lists();
+            });
+        });
     }
 
     fn cloud_cameras_loaded(&self, result: cloud::Result<Vec<CloudCamera>>) {
@@ -1937,13 +2004,7 @@ impl App {
             }
             let st = w.playback.state.lock().unwrap().clone();
             let time = local_time(st.position_ms / 1000).format("%H:%M:%S").to_string();
-            let status = if !st.message.is_empty() {
-                st.message.clone()
-            } else if st.buffering {
-                "Loading…".to_string()
-            } else {
-                String::new()
-            };
+            let status = st.message.clone();
             let busy = st.buffering && st.message.is_empty();
             if (&time, &status, busy, st.paused, st.ended) != (&w.shown.0, &w.shown.1, w.shown.2, w.shown.3, w.shown.4) {
                 b.set_player_time(time.as_str().into());
@@ -2069,7 +2130,8 @@ impl App {
         let ticks: Vec<TlTick> = (0..)
             .map(|k| first + k * step)
             .take_while(|&t| t <= end)
-            .filter(|&t| t >= start)
+            // Not right at the ends, where the label wouldn't fit.
+            .filter(|&t| (0.04..=0.96).contains(&fraction(t)))
             .map(|t| TlTick { x: fraction(t), label: local_time(t / 1000).format("%H:%M").to_string().into() })
             .collect();
         drop(session);
@@ -2217,6 +2279,20 @@ impl App {
         d.status = status.into();
         d.done = done;
         self.downloads.set_row_data(row, d);
+    }
+}
+
+/// The app's own blue, not the Windows accent colour: Slint's Fluent style
+/// tints its blues towards the system accent when it has one (set when the
+/// window opens and again whenever the Windows theme changes), and uses its
+/// standard blues without. This takes the system accent away; it's checked on
+/// every UI tick, as a theme change brings it back. Slint has no public way to
+/// do this, hence its unstable internal API (pinned with the slint version).
+fn keep_app_accent(ui: &MainWindow) {
+    use slint::private_unstable_api::re_exports::WindowInner;
+    let context = WindowInner::from_pub(ui.window()).context();
+    if context.accent_color() != slint::Color::default() {
+        context.set_accent_color(slint::Color::default());
     }
 }
 

@@ -3,14 +3,16 @@
 //! 16×, with pause.
 //!
 //! The video comes through the cloud in windows of two minutes (see
-//! [`crate::clip`]), each fetched shortly before the picture needs it and
-//! kept only in memory. Each recording is decoded by its own ffmpeg, whose
-//! `showinfo` timestamps say when each frame was recorded; frames are shown
-//! at that time divided by the speed. Nothing is written to disk.
+//! [`crate::clip`]), each fetched shortly before the picture needs it. What
+//! has been fetched stays in memory for a while (see [`Cache`]), so going
+//! back, or forward into what has already arrived, starts at once. Each
+//! recording is decoded by its own ffmpeg, whose `showinfo` timestamps say
+//! when each frame was recorded; frames are shown at that time divided by
+//! the speed. Nothing is written to disk.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -33,6 +35,8 @@ const WINDOW: i64 = 120;
 /// The next window is fetched when less than this many seconds (times the
 /// speed) are left to show.
 const AHEAD: i64 = 45;
+/// How much fetched video is kept in memory, across recordings.
+const CACHE_BYTES: usize = 200 << 20;
 const WIDTH: usize = 1280;
 const HEIGHT: usize = 720;
 
@@ -196,7 +200,9 @@ async fn play_segment(
     cmds: &mut mpsc::UnboundedReceiver<Cmd>,
 ) -> Outcome {
     let keyframes = state.lock().unwrap().speed >= KEYFRAMES_FROM;
-    let mut input = vec!["-f", "mpegts", "-i", "pipe:0"];
+    // Start from the first picture: no waiting to size up the stream (its
+    // audio can't be decoded here anyway).
+    let mut input = vec!["-analyzeduration", "0", "-probesize", "131072", "-f", "mpegts", "-i", "pipe:0"];
     if keyframes {
         input.splice(0..0, ["-skip_frame", "nokey"]);
     }
@@ -266,7 +272,7 @@ async fn play_segment(
                         pace = None;
                     }
                 },
-                _ = tokio::time::sleep(Duration::from_millis(700)) => {
+                _ = tokio::time::sleep(Duration::from_millis(1200)) => {
                     state.lock().unwrap().buffering = true;
                 }
             }
@@ -376,8 +382,96 @@ async fn read_frames(
     }
 }
 
-/// Fetches the recording from `from_ms` to its end, window by window, a
-/// little ahead of the picture, and feeds it to ffmpeg.
+/// A piece of a recording as the hub sent it: about a frame.
+#[derive(Clone)]
+struct Piece {
+    pts: i64,
+    key: bool,
+    data: Arc<[u8]>,
+}
+
+/// One stretch of a recording fetched in one go, its pieces in order.
+struct Run {
+    id: u64,
+    /// (camera, recording start)
+    recording: (String, i64),
+    pieces: Vec<Piece>,
+    bytes: usize,
+    /// Everything up to here (ms) has been fetched.
+    until: i64,
+    used: std::time::Instant,
+}
+
+/// Video fetched lately, so seeking back, or forward into what has already
+/// arrived, needs no new download. The least recently used stretches go
+/// once it holds [`CACHE_BYTES`].
+#[derive(Default)]
+struct Cache {
+    runs: Vec<Run>,
+    bytes: usize,
+    next_id: u64,
+}
+
+static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
+
+impl Cache {
+    /// The pieces to show from `at_ms` (from the keyframe at or before it),
+    /// the stretch they belong to and how far it goes.
+    fn find(&mut self, recording: &(String, i64), at_ms: i64) -> Option<(Vec<Piece>, u64, i64)> {
+        let run = self.runs.iter_mut().find(|r| {
+            &r.recording == recording && r.pieces.first().is_some_and(|p| p.pts <= at_ms) && at_ms < r.until
+        })?;
+        let from = run.pieces.iter().rposition(|p| p.key && p.pts <= at_ms)?;
+        run.used = std::time::Instant::now();
+        Some((run.pieces[from..].to_vec(), run.id, run.until))
+    }
+
+    fn start(&mut self, recording: (String, i64)) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let now = std::time::Instant::now();
+        self.runs.push(Run { id, recording, pieces: Vec::new(), bytes: 0, until: i64::MIN, used: now });
+        id
+    }
+
+    fn add(&mut self, id: u64, piece: Piece) {
+        let Some(run) = self.runs.iter_mut().find(|r| r.id == id) else { return };
+        run.bytes += piece.data.len();
+        self.bytes += piece.data.len();
+        run.until = run.until.max(piece.pts);
+        run.used = std::time::Instant::now();
+        run.pieces.push(piece);
+        self.evict(id);
+    }
+
+    /// Everything up to `until` (ms) is in the stretch.
+    fn complete_to(&mut self, id: u64, until: i64) {
+        if let Some(run) = self.runs.iter_mut().find(|r| r.id == id && !r.pieces.is_empty()) {
+            run.until = run.until.max(until);
+        }
+    }
+
+    fn evict(&mut self, keep: u64) {
+        while self.bytes > CACHE_BYTES {
+            let Some(oldest) = self
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.id != keep)
+                .min_by_key(|(_, r)| r.used)
+                .map(|(i, _)| i)
+            else {
+                return;
+            };
+            let run = self.runs.remove(oldest);
+            self.bytes -= run.bytes;
+        }
+    }
+}
+
+/// Feeds ffmpeg the recording from `from_ms` to its end: what's in memory
+/// first, then the rest fetched window by window, a little ahead of the
+/// picture.
 async fn fetch_and_feed(
     source: Source,
     segment: Clip,
@@ -388,7 +482,7 @@ async fn fetch_and_feed(
     error: Arc<Mutex<Option<String>>>,
 ) {
     let Some(mut stdin) = stdin else { return };
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
     let feeding = async move {
         while let Some(piece) = rx.recv().await {
             if stdin.write_all(&piece).await.is_err() {
@@ -398,12 +492,27 @@ async fn fetch_and_feed(
         // Closing stdin lets ffmpeg finish the recording.
     };
     let fetching = async move {
+        let recording = (source.camera.device_id.clone(), segment.start);
         let mut start = from_ms / 1000;
         // The newest piece passed on (i64::MIN: none yet). A window starts at
         // a keyframe before the moment asked for, so at its start, pieces
         // already passed on are skipped.
         let newest = AtomicI64::new(i64::MIN);
         let overlap = AtomicBool::new(false);
+        let cached = CACHE.lock().unwrap().find(&recording, from_ms);
+        let run = match cached {
+            Some((pieces, id, until)) => {
+                log::debug!("playback: {:.0}s from memory", (until - pieces[0].pts) as f64 / 1000.0);
+                *anchor.lock().unwrap() = Some(pieces[0].pts);
+                for piece in &pieces {
+                    newest.fetch_max(piece.pts, Ordering::Relaxed);
+                    let _ = tx.send(piece.data.clone());
+                }
+                start = start.max(until / 1000);
+                id
+            }
+            None => CACHE.lock().unwrap().start(recording),
+        };
         while start < segment.end {
             let end = (start + WINDOW).min(segment.end);
             let request = ClipRequest {
@@ -413,6 +522,7 @@ async fn fetch_and_feed(
                 player_id: source.player_id.clone(),
             };
             let mut media = |m: Media<'_>| -> Result<()> {
+                let data: Arc<[u8]> = Arc::from(m.data);
                 if let Some(pts) = m.pts_ms {
                     let seen = newest.load(Ordering::Relaxed);
                     if overlap.load(Ordering::Relaxed) && pts <= seen {
@@ -426,8 +536,9 @@ async fn fetch_and_feed(
                             *a = Some(pts);
                         }
                     }
+                    CACHE.lock().unwrap().add(run, Piece { pts, key: m.key, data: data.clone() });
                 }
-                let _ = tx.send(m.data.to_vec());
+                let _ = tx.send(data);
                 Ok(())
             };
             let mut progress = |_| {};
@@ -437,6 +548,7 @@ async fn fetch_and_feed(
                 && !e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth)
             {
                 log::warn!("playback: fetching {start}..{end} failed ({e:#}); trying again");
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 overlap.store(newest.load(Ordering::Relaxed) != i64::MIN, Ordering::Relaxed);
                 result = clip::download(&source.client, &request, &mut media, &mut progress).await;
             }
@@ -444,6 +556,7 @@ async fn fetch_and_feed(
                 *error.lock().unwrap() = Some(format!("{e:#}"));
                 return;
             }
+            CACHE.lock().unwrap().complete_to(run, end * 1000);
             start = end;
             // Wait until the picture gets close to the end of what's fetched.
             loop {
@@ -474,5 +587,33 @@ mod tests {
         // In a gap: the next one.
         assert_eq!(segment_at(&segments, 250_000).unwrap().start, 300);
         assert!(segment_at(&segments, 400_000).is_none());
+    }
+
+    fn piece(pts: i64, key: bool, size: usize) -> Piece {
+        Piece { pts, key, data: Arc::from(vec![0u8; size]) }
+    }
+
+    #[test]
+    fn cache_starts_at_the_keyframe_and_forgets_the_oldest() {
+        let mut cache = Cache::default();
+        let recording = ("cam".to_string(), 100);
+        let run = cache.start(recording.clone());
+        for (i, key) in [true, false, false, true, false].into_iter().enumerate() {
+            cache.add(run, piece(1_000 + i as i64 * 500, key, 10));
+        }
+        cache.complete_to(run, 4_000);
+        // From the keyframe at or before the moment, up to what's fetched.
+        let (pieces, id, until) = cache.find(&recording, 2_700).unwrap();
+        assert_eq!((pieces.len(), pieces[0].pts, id, until), (2, 2_500, run, 4_000));
+        assert!(cache.find(&recording, 900).is_none());
+        assert!(cache.find(&recording, 4_000).is_none());
+        assert!(cache.find(&("other".into(), 100), 2_700).is_none());
+
+        // Over the limit, the least recently used stretch goes, not the one
+        // being filled.
+        let big = cache.start(("cam".into(), 200));
+        cache.add(big, piece(9_000, true, CACHE_BYTES));
+        assert!(cache.find(&recording, 2_700).is_none());
+        assert_eq!(cache.runs.len(), 1);
     }
 }

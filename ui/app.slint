@@ -13,7 +13,7 @@ export struct Tile {
 
 export struct HomeCard { id: int, name: string, detail: string, thumb: image, has-thumb: bool, state: string }
 export struct CameraRow { id: int, name: string, detail: string }
-export struct HubRow { id: int, name: string, detail: string }
+export struct HubRow { id: int, name: string, detail: string, storage: string }
 export struct PresetRow { id: string, name: string }
 export struct RecRow { time: string, kind: string, duration: string, playing: bool, saved: bool }
 export struct DayChip { day: string, has-video: bool, selected: bool, future: bool, in-month: bool }
@@ -34,6 +34,8 @@ export global Bridge {
     // home
     in property <[HomeCard]> home-cameras;
     in property <string> account-name;
+    // The Tapo app's home name, or "Home".
+    in property <string> home-title: "Home";
     callback open-hub(int);
 
     // live grid
@@ -958,7 +960,7 @@ component CameraCard inherits Rectangle {
 component HubCard inherits Rectangle {
     in property <HubRow> hub;
     callback open();
-    height: 148px;
+    min-height: 148px;
     border-radius: 16px;
     background: Palette.control-background;
     border-width: 1px;
@@ -980,7 +982,13 @@ component HubCard inherits Rectangle {
                 spacing: 2px;
                 Text { text: root.hub.name; font-size: 16px; font-weight: 600; overflow: elide; }
                 Text {
-                    text: root.hub.detail + " · recordings through the cloud";
+                    text: root.hub.detail;
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.4);
+                    overflow: elide;
+                }
+                if root.hub.storage != "": Text {
+                    text: root.hub.storage;
                     font-size: 13px;
                     color: Palette.foreground.transparentize(0.4);
                     overflow: elide;
@@ -1011,7 +1019,7 @@ component HomePage inherits Rectangle {
     property <int> rows: Math.ceil(Bridge.home-cameras.length / self.cols);
     VerticalLayout {
         PageHeader {
-            title: "Home";
+            title: Bridge.home-title;
             if Bridge.cloud-busy: VerticalLayout {
                 alignment: center;
                 Spinner { width: 22px; height: 22px; indeterminate: true; }
@@ -1616,8 +1624,7 @@ component Timeline inherits Rectangle {
         background: #ffffff50;
     }
     for t in Bridge.tl-ticks: Text {
-        // Kept inside at the ends.
-        x: max(0px, min(root.width - 48px, t.x * root.width - 24px));
+        x: t.x * root.width - 24px;
         y: 8px;
         width: 48px;
         text: t.label;
@@ -1778,14 +1785,28 @@ component PlaybackPage inherits Rectangle {
                             wrap: word-wrap;
                         }
                     }
-                    if Bridge.player-open && (!Bridge.player-has-frame || Bridge.player-status != ""): VerticalLayout {
+                    // Before the first picture: a spinner in the middle.
+                    if Bridge.player-open && !Bridge.player-has-frame && Bridge.player-busy: VerticalLayout {
                         alignment: center;
-                        spacing: 14px;
-                        if Bridge.player-busy: HorizontalLayout {
+                        HorizontalLayout {
                             alignment: center;
                             Spinner { width: 36px; height: 36px; indeterminate: true; }
                         }
-                        if Bridge.player-status != "": HorizontalLayout {
+                    }
+                    // With a picture: it stays, with a small spinner in the corner.
+                    if Bridge.player-open && Bridge.player-has-frame && Bridge.player-busy: Rectangle {
+                        x: parent.width - self.width - 12px;
+                        y: 12px;
+                        width: 34px;
+                        height: 34px;
+                        border-radius: 17px;
+                        background: #00000090;
+                        Spinner { width: 22px; height: 22px; indeterminate: true; }
+                    }
+                    // Why it stopped, or the end of the day.
+                    if Bridge.player-open && !Bridge.player-busy && Bridge.player-status != "": VerticalLayout {
+                        alignment: center;
+                        HorizontalLayout {
                             alignment: center;
                             Rectangle {
                                 width: min(status-text.preferred-width + 28px, video.width - 40px);
@@ -2180,6 +2201,7 @@ component SettingsPage inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "Tapo Viewer";
+    icon: @image-url("../assets/app-icon.png");
 
     // Gives the keyboard back to the shortcuts (F11, Esc, arrow keys): a
     // focused text box that disappears with its page would otherwise leave

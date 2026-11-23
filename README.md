@@ -6,7 +6,8 @@ app login, like the Tapo app.
 
 - **Live view from anywhere** through the Tapo cloud, like the Tapo app: no VPN, port forwarding
   or camera accounts.
-- **Home**: a card per camera with a recent picture, and the H500 with its recordings.
+- **Home**: a card per camera with a recent picture and its room, and the H500 with its
+  firmware, storage and recordings; the page is titled with your home's name from the Tapo app.
 - **Live view**: all cameras in a grid sized to fit the window, one click from anywhere.
 - **Camera view**: the video with Take Photo, Pan & Tilt (pad and presets; arrow keys work too),
   Privacy Mode, SD/HD, Fullscreen, and Playback & Download for that camera's recordings on the hub.
@@ -15,7 +16,8 @@ app login, like the Tapo app.
   Tapo app: click or drag to any moment, 1× to 16×, pause, detected events, a month calendar.
   Recordings stream through the cloud; ↓ saves one to `Videos\TapoViewer`.
 - **Snapshots** to `Pictures\TapoViewer`.
-- **Light or dark**, or the same as Windows (*Settings › Video & display*).
+- **Light or dark**, or the same as Windows (*Settings › Video & display*), always in the app's
+  own blue rather than the Windows accent colour.
 - **Sign-in like the Tapo app**: welcome screen, log in, and two-step verification with the code
   sent to your phone.
 - The password (with *Remember me*) and the cloud session are encrypted with Windows DPAPI, so
@@ -79,7 +81,10 @@ a dot). The timeline under the video shows the day: recordings in blue, detected
   saves it to `Videos\TapoViewer`.
 
 Watching keeps nothing on disk: the recording comes from the hub through the cloud a couple of
-minutes at a time, shortly before it's needed. Days follow this PC's time zone.
+minutes at a time, shortly before it's needed, and what has arrived stays in memory for a while
+(up to about 200 MB), so going back, or forward into what has already arrived, starts at once.
+The hub serves one download at a time, so jumps are queued behind the one finishing. Days follow
+this PC's time zone.
 
 ### About the cloud
 
@@ -115,6 +120,16 @@ switch makes some Windows drivers blank the screen for a moment. You can change 
 
 If the app won't start, run `TapoViewer.exe --software`, or set `SLINT_BACKEND=winit-software`.
 
+### What else comes from the account
+
+- **Names**: hubs' names come base64-encoded from the cloud (an H500 is "VGFwbyBINTAw", "Tapo
+  H500") and are decoded.
+- **Homes and rooms** (as set up in the Tapo app): the home's name titles Home, and each camera's
+  room is on its card. They come from the cloud's IoT service (`/v1/families`, then each home's
+  `/rooms`); the log has its answers.
+- **The hub's firmware, address and storage**, asked of the hub itself through the cloud
+  (`getDeviceInfo`, `getSdCardStatus`).
+
 ## Files
 
 | What | Where |
@@ -128,6 +143,8 @@ If the app won't start, run `TapoViewer.exe --software`, or set `SLINT_BACKEND=w
 ## Building
 
 The minimal ffmpeg that gets embedded lives in `vendor/ffmpeg.exe` (see `vendor/README.md`).
+The icon (`assets/app.ico`, and `assets/app-icon.png` for the window) is the in-app logo, drawn by
+`tools/make-icon.py`; `build.rs` embeds it in the exe through `assets/app.rc`.
 `build.rs` embeds it automatically; without it, the app looks for ffmpeg next to the exe and on
 PATH instead.
 
@@ -185,7 +202,8 @@ detected events) and "Garage" (today); the recorded time is written on the pictu
 at a time, and `--slow-clips` sends recordings in real time, which makes a download that's left
 open (and blocks the hub's playback, the Tapo app's too) easy to spot in its output. Like an H500
 it sends nothing for the "cover" download; `--clip-path video|playback|none` picks which other way
-works.
+works. Like an H500 it serves one download at a time (the relay answers HTTP 500 to a second), and
+the account has a home ("Office") with rooms, and the hub reports its firmware and storage.
 
 ## Troubleshooting
 
