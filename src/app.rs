@@ -338,13 +338,18 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     let b = ui.global::<Bridge>();
     b.set_tiles(app.tiles.clone().into());
     b.set_home_cameras(app.home_cards.clone().into());
-    ui.invoke_set_theme(app.cfg.borrow().theme.index());
+    let theme_index = app.cfg.borrow().theme.index();
+    ui.invoke_set_theme(theme_index);
+    crate::chrome::install(ui, theme_index);
     b.set_downloads(app.downloads.clone().into());
     b.set_quality_labels(string_model(Quality::LABELS.iter().copied()));
 
     b.on_navigate(cb!(&app, |a, page| a.navigate(page)));
     b.on_toggle_fullscreen(cb!(&app, |a| a.toggle_fullscreen()));
     b.on_escape(cb!(&app, |a| a.escape()));
+    b.on_window_minimize(|| crate::chrome::minimize());
+    b.on_window_toggle_maximize(|| crate::chrome::toggle_maximize());
+    b.on_window_close(|| crate::chrome::close());
     b.on_open_camera(cb!(&app, |a, id| a.open_camera(id as u32)));
     b.on_toggle_tile_audio(cb!(&app, |a, id| a.toggle_tile_audio(id as u32)));
     b.on_open_hub(cb!(&app, |a, i| a.open_hub(i)));
@@ -881,8 +886,12 @@ impl App {
 
     fn set_fullscreen(&self, on: bool) {
         let ui = self.ui();
+        crate::chrome::set_fullscreen(on);
         ui.window().set_fullscreen(on);
         ui.global::<Bridge>().set_fullscreen(on);
+        if !on {
+            crate::chrome::refresh_frame();
+        }
     }
 
     fn toggle_fullscreen(&self) {
@@ -1455,7 +1464,9 @@ impl App {
             changed
         };
         self.persist();
-        ui.invoke_set_theme(self.cfg.borrow().theme.index());
+        let theme_index = self.cfg.borrow().theme.index();
+        ui.invoke_set_theme(theme_index);
+        crate::chrome::set_theme(theme_index);
         if ffmpeg_changed {
             *self.ffmpeg.borrow_mut() = crate::ffmpeg::find(&self.cfg.borrow().ffmpeg_path);
             // A different ffmpeg: reconnect the streams.
