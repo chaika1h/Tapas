@@ -4,21 +4,26 @@ Tapas is a Windows app for TP-Link **Tapo** cameras and the **H500 HomeBase** hu
 with your Tapo account and works through the Tapo cloud, like the Tapo app on your phone, so it
 works from anywhere with internet: no VPN, port forwarding or camera passwords.
 
-- **Live view** of every camera in a grid, or one camera at a time.
-- **Pan & tilt**, presets, privacy mode, SD/HD, snapshots.
-- **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16×,
-  detected events with their pictures, a calendar, recording clips and saving them.
+- **Live view** of every camera in a grid, or one camera at a time, with **live audio** (G.711 and AAC).
+- **Camera controls**: pan & tilt, pan/tilt patrol, saved presets (go to, save, delete), privacy mode,
+  spotlight, night vision mode, auto-tracking, siren/alarm, reboot, SD/HD, and snapshots.
+- **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16× with 1× audio,
+  AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`), an **All cameras** cross-camera
+  events feed with pictures, a calendar, recording clips, and saving them.
 - **Full screen** for live view and playback.
-- Your **homes and rooms** from the Tapo app, and the hub's firmware and storage.
-- **Light or dark**, an **installer** and **automatic updates**.
+- Your **homes and rooms** from the Tapo app, and the H500 hub's firmware, storage, HDD health
+  (temperature & power-on hours), loop recording, and hub alarm/ring.
+- **Integrated Windows 11 Fluent window** (light or dark, OpenGL default with software fallback),
+  an **installer**, and **automatic updates**.
 
 Tapas is written in Rust with [Slint](https://slint.dev). It isn't made or supported by TP-Link.
 
 ## Installing
 
-Run **`Tapas-Setup-<version>.exe`**. It installs Tapas for your Windows user, without
-administrator rights, into `%LOCALAPPDATA%\Programs\Tapas`, with a Start menu shortcut, an
-optional desktop shortcut and an uninstaller under *Settings › Apps*.
+Download **`Tapas-Setup-<version>.exe`** from the
+[latest GitHub Release](https://github.com/chaika1h/Tapas/releases/latest) and run it. It installs
+Tapas for your Windows user, without administrator rights, into `%LOCALAPPDATA%\Programs\Tapas`,
+with a Start menu shortcut, an optional desktop shortcut, and an uninstaller under *Settings › Apps*.
 
 The installer isn't code-signed, so Windows may say *Windows protected your PC*; choose
 *More info › Run anyway*.
@@ -47,9 +52,10 @@ cameras added in the Tapo app later.
 
 ### Home
 
-Home is titled with your home's name from the Tapo app. The hub's card has its room, model and
-firmware, and how full its storage is (a bar for the hard disk, and a line for its own storage);
-**Playback** opens its recordings. Each camera's card has a recent picture, its room and model,
+Home is titled with your home's name from the Tapo app. The hub's card shows its room, model,
+firmware, storage usage (a bar for the hard disk and a line for built-in storage), HDD health
+(temperature and power-on hours), a **Loop recording** switch, a **Ring hub / Stop alarm** button,
+and **Playback** to open its recordings. Each camera's card has a recent picture, its room and model,
 a button for its recordings and one to watch it. **Live view** shows every camera.
 
 The pictures are kept from one run to the next, so Home has them at once. A camera's picture is
@@ -58,15 +64,19 @@ watching it; ⟳ takes new ones of every camera.
 
 ### Live view and the camera view
 
-**Live view** shows all cameras in a grid that fits the window. Until a camera's video comes, its
-tile shows its last picture, dimmed. Click a camera for its own view, which starts with the grid's
-picture while the HD video connects:
+**Live view** shows all cameras in a grid that fits the window, each with a quick speaker button to
+listen in (only one camera plays audio at a time). Until a camera's video comes, its tile shows its
+last picture, dimmed. Click a camera for its own view, which starts with the grid's picture while
+the HD video connects:
 
+- **Sound** (`M` or speaker button): listen to the camera's live audio stream.
 - **Take Photo** saves the picture to `Pictures\Tapas`.
-- **Pan & Tilt** (cameras that have it): the pad or the arrow keys, and presets to go to or save.
-  Each move goes through the cloud, so it takes a moment; presses made meanwhile add up to one
-  move.
-- **Privacy Mode** covers the lens, as in the Tapo app; the picture comes back when it's off.
+- **Pan & Tilt** (cameras that have it): the pad or the arrow keys, **Pan Patrol / Tilt Patrol / Stop**,
+  and presets to go to, save, or delete. Each move goes through the cloud, so it takes a moment;
+  presses made meanwhile add up to one move.
+- **Camera controls** (supported models): **Spotlight**, **Night Vision** (`Auto`, `Day`, `Infrared`,
+  `Color`, `Smart`), **Auto-Track**, **Siren**, **Privacy Mode** (covers the lens), and a two-step
+  **Reboot Camera** button.
 - **SD / HD** picks the camera's stream. The grid uses SD and the camera view HD unless you
   change it.
 - **Playback & Download** opens the camera's recordings on the hub.
@@ -77,16 +87,19 @@ grid, is instant.
 
 ### Playback
 
-**Playback** shows what the hub recorded. Pick the camera and a day; the calendar marks days with
-recordings. The timeline under the picture shows the day: recordings in blue, detected events in
-amber.
+**Playback** shows what the hub recorded. Pick a camera — or **All cameras (events)** for a unified
+cross-camera feed — and a day; the calendar marks days with recordings. The timeline under the
+picture shows the day: recordings in blue, detected events in amber.
 
-- **Click the timeline**, or an event in the list, to watch from there. Playback carries on through
-  the day's recordings, skipping the gaps.
+- **Click the timeline**, or an event in the list, to watch from there (clicking an event in
+  **All cameras** jumps straight to that camera's recording at that moment). Playback carries on
+  through the day's recordings, skipping the gaps.
+- **Filter events** with the chips above the list (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`).
 - **Drag the white playhead** to a moment: its label shows the time it will play from.
 - **Drag** anywhere else on the timeline to move along it, and **scroll** (or the zoom buttons) to
   zoom between the whole day and five minutes. It follows the picture while playing.
-- **1× 2× 4× 8× 16×** set the speed. From 8×, only keyframes are shown, like fast-forward.
+- **1× 2× 4× 8× 16×** set the speed, with **audio (`M`)** available at 1×. From 8×, only keyframes
+  are shown, like fast-forward.
 - **Click the picture** (or ❚❚) to pause. **Full screen** puts the timeline and controls over the
   picture; the list button at the top hides the list instead.
 - **Record**: press it, watch on (or jump ahead), press it again, and that stretch is saved to
@@ -169,10 +182,13 @@ TP-Link can change it.
   by a small built-in ffmpeg. Live view asks a camera; playback asks the hub, naming the camera,
   and then talks to the hub as it would on its local media port (request, acknowledgements,
   heartbeats, stop). Event pictures come the same way, as single keyframes.
+- **Audio**: embedded MPEG-TS audio tracks (G.711 A-law/µ-law and ADTS AAC) are demuxed and decoded
+  in pure Rust and played through Windows `winmm` (`waveOut`) when unmuted.
 - Each frame's recorded time comes from ffmpeg, so playback runs at the chosen speed, and the hub
   stamps every piece of video with its time, which lines up the timeline.
 
-**Limitations**: no sound yet; cameras that send encrypted video through the cloud can't be shown.
+**Limitations**: two-way talk isn't supported yet; cameras that send encrypted video through the
+cloud can't be shown.
 
 **Privacy**: Tapas talks to TP-Link's cloud (sign-in, devices, video) and to GitHub (the update
 check, which sends only the app's version). The password, when remembered, and the cloud session
@@ -184,15 +200,17 @@ are encrypted with Windows DPAPI, so only your Windows user can read them.
 
 | Path | What |
 |---|---|
-| `src/main.rs` | Start-up, renderer choice, logging |
+| `src/main.rs` | Start-up, renderer choice (OpenGL default, software fallback), logging |
 | `src/app.rs` | The app's state and everything between the UI and the work below |
+| `src/chrome.rs` | Integrated Windows 11 borderless frame (`WM_NCCALCSIZE`, DWM rounded corners/shadow, Snap Layouts) |
 | `ui/app.slint` | The whole UI |
-| `src/cloud.rs` | The Tapo cloud: sign-in, devices, homes, pass-through requests, relays |
+| `src/cloud.rs` | The Tapo cloud: sign-in, devices, homes, camera & hub pass-through RPCs, relays |
 | `src/relay.rs` | The relay connection (a long HTTP request carrying multipart parts) |
-| `src/stream.rs`, `src/ffmpeg.rs` | Live video: relay → ffmpeg → frames |
-| `src/ptz.rs` | Pan/tilt, presets and privacy mode |
+| `src/audio.rs` | Pure-Rust MPEG-TS audio demuxer (G.711 & AAC) and Windows `waveOut` output |
+| `src/stream.rs`, `src/ffmpeg.rs` | Live video: relay → ffmpeg → RGBA frames |
+| `src/ptz.rs` | Pan/tilt, patrol, presets, privacy, spotlight, night vision, auto-tracking, siren, reboot |
 | `src/clip.rs` | Hub recordings and event pictures over the relay |
-| `src/playback.rs` | Timeline playback: fetching ahead, the in-memory cache, pacing, speeds |
+| `src/playback.rs` | Timeline playback: fetching ahead, the in-memory cache, pacing, speeds, 1× audio |
 | `src/update.rs` | Updates from GitHub releases |
 | `src/pictures.rs` | Cameras' last pictures and event pictures, kept on disk |
 | `src/config.rs`, `src/secret.rs` | Settings, and DPAPI encryption of secrets |
