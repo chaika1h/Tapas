@@ -469,6 +469,19 @@ impl Cache {
     }
 }
 
+/// The video of one recording from `from_ms` to `to_ms`, if it's all in
+/// memory: from the keyframe at or before `from_ms`.
+pub fn cached_video(camera_id: &str, recording_start: i64, from_ms: i64, to_ms: i64) -> Option<Vec<Arc<[u8]>>> {
+    let mut cache = CACHE.lock().unwrap();
+    let recording = (camera_id.to_string(), recording_start);
+    let run = cache.runs.iter_mut().find(|r| {
+        r.recording == recording && r.pieces.first().is_some_and(|p| p.pts <= from_ms) && r.until >= to_ms
+    })?;
+    let first = run.pieces.iter().rposition(|p| p.key && p.pts <= from_ms)?;
+    run.used = std::time::Instant::now();
+    Some(run.pieces[first..].iter().take_while(|p| p.pts <= to_ms).map(|p| p.data.clone()).collect())
+}
+
 /// Feeds ffmpeg the recording from `from_ms` to its end: what's in memory
 /// first, then the rest fetched window by window, a little ahead of the
 /// picture.

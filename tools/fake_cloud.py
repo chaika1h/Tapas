@@ -364,8 +364,12 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "searchDetectionList":
             query = params.get("playback", {}).get("search_detection_list", {})
             camera = query.get("child_device_id")
+            mac = next((c["mac"] for c in HUB_CAMERAS if c["device_id"] == camera), None)
             if camera not in DETECTIONS:
                 code = -40106
+            elif query.get("child_device_mac") != mac:
+                # Like an H500: without the camera's MAC it finds nothing.
+                result = {"playback": {"search_detection_list": [], "snapshot_enable": True, "total_num": 0}}
             else:
                 found = detections_for(camera, int(query["start_time"]), int(query["end_time"]))
                 page = found[int(query["start_index"]):int(query["end_index"]) + 1]
@@ -514,6 +518,24 @@ class Handler(BaseHTTPRequestHandler):
             print(f"  relay: {device} closed", flush=True)
 
 
+    def event_picture(self, camera, start, request):
+        """An event's picture, as an H500 sends it: one H.264 keyframe."""
+        when = datetime.datetime.fromtimestamp(start).strftime("%H\\:%M\\:%S")
+        label = f",drawtext=fontfile={FONT}:text='{when}':x=20:y=20:fontsize=64:fontcolor=white:box=1:boxcolor=black@0.6" if FONT else ""
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+               "-i", f"{PATTERNS.get(camera, 'testsrc')}=size=640x360:rate=15{label}",
+               "-frames:v", "1", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "h264", "pipe:1"]
+        frame = subprocess.run(cmd, capture_output=True, check=True).stdout
+        print(f"  picture: {camera} event at {datetime.datetime.fromtimestamp(start)} ({len(frame)} bytes)", flush=True)
+        reply = {"type": "response", "seq": request.get("seq"), "params": {"error_code": 0, "session_id": "42"}}
+        self.send_part("application/json", json.dumps(reply).encode())
+        self.send_part("image/avc", frame, "X-If-Encrypt: 0\r\nX-Data-Sequence: 1\r\n")
+        done = {"type": "notification", "params": {"event_type": "stream_status", "status": "finished"}}
+        self.send_part("application/json", json.dumps(done).encode())
+        while (part := self.read_client_part()) is not None:
+            if part[1].get("params", {}).get("method") == "do":
+                break
+
     def read_client_part(self):
         """The next part the client sends in its (endless) request body."""
         while True:
@@ -554,7 +576,8 @@ class Handler(BaseHTTPRequestHandler):
             problems.append(f"request {request}")
         if headers.get("x-data-window-size") != ("40" if playback else "50"):
             problems.append(f"X-Data-Window-Size {headers.get('x-data-window-size')}")
-        if download.get("player_id") != player_id or player_id not in self.state.search_players:
+        picture = not playback and download.get("media_type", 0) != 0
+        if not picture and (download.get("player_id") != player_id or player_id not in self.state.search_players):
             problems.append("the player id isn't the one the clips were searched with")
         self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed;boundary=--device-stream-boundary--\r\n\r\n")
         if problems:
@@ -581,6 +604,8 @@ class Handler(BaseHTTPRequestHandler):
             print(f"  clip: session closed ({left} open)", flush=True)
 
     def clip_session(self, camera, download, request, stream):
+        if stream == (3, "cover") and download.get("media_type") == 3:
+            return self.event_picture(camera, int(download["start_time"]), request)
         start, end = int(download["start_time"]), int(download["end_time"])
         works = {"video": (3, "video"), "playback": (1, None)}.get(self.state.args.clip_path)
         print(f"  clip: {camera} {end - start}s from {datetime.datetime.fromtimestamp(start)} by {stream}"

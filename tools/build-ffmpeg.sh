@@ -49,7 +49,7 @@ flags=(
   --enable-static --disable-shared --enable-small
   --enable-ffmpeg --enable-avcodec --enable-avformat --enable-avfilter --enable-swscale
   --disable-network --enable-protocol=pipe
-  --enable-demuxer=mpegts
+  --enable-demuxer=mpegts,h264,hevc
   --enable-decoder=h264,hevc
   --enable-parser=h264,hevc
   --enable-filter=scale,pad,format,null,showinfo

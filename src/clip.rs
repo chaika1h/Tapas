@@ -51,6 +51,9 @@ const END_QUIET: Duration = Duration::from_secs(3);
 /// A piece of the recording as the hub sent it.
 pub struct Media<'a> {
     pub data: &'a [u8],
+    /// `video/mp2t` for recordings; `image/avc` or `image/hevc` for an
+    /// event's picture.
+    pub content_type: &'a str,
     /// The hub's wall-clock time for this piece (`X-Data-Pts`), in ms.
     pub pts_ms: Option<i64>,
     /// The piece starts a keyframe (`X-If-Iframe`).
@@ -168,6 +171,20 @@ async fn attempt(
             (playback_request(1, request, client_id), PLAYBACK_WINDOW_SIZE)
         }
     };
+    session(client, request, method, first_request, window, media, progress).await
+}
+
+/// One session with the hub through the relay: `first_request`, then what it
+/// sends until it says it's done.
+async fn session(
+    client: &CloudClient,
+    request: &ClipRequest,
+    method: ClipStream,
+    first_request: Value,
+    window: &str,
+    media: &mut MediaSink<'_>,
+    progress: &mut (dyn FnMut(Progress) + Send),
+) -> Result<Progress> {
     let slot = HUB_SLOT.clone().acquire_owned().await.expect("the hub slot is never closed");
     let info = client.request_clip_relay(&request.hub, &request.camera, &request.player_id, method).await?;
     let mut stream = relay::connect(client.tls(), &info).await?;
@@ -316,6 +333,83 @@ pub fn partial_path(path: &Path) -> PathBuf {
     path.with_extension(format!("ts.{tag}.part"))
 }
 
+/// The picture media types the Tapo app asks for (`DownloadMediaType`):
+/// THUMBNAIL, then PUSH_IMAGE.
+const PICTURE_TYPES: [i64; 2] = [3, 1];
+/// The index in [`PICTURE_TYPES`] that last brought a picture.
+static PICTURE_TYPE: AtomicUsize = AtomicUsize::new(0);
+
+/// The picture the hub keeps for an event (the thumbnails of the Tapo app's
+/// event list), for the event starting at `request.clip.start`: one encoded
+/// keyframe and its content type, `image/avc` (H.264) or `image/hevc`. It
+/// comes through a "cover" download, the app's.
+pub async fn event_picture(client: &CloudClient, request: &ClipRequest) -> Result<(Vec<u8>, String)> {
+    let first = PICTURE_TYPE.load(Ordering::Relaxed);
+    let order = [first, 1 - first];
+    for i in order {
+        let mut outcome: Result<(Vec<u8>, String)> = Err(anyhow::anyhow!("not tried"));
+        for _ in 0..4 {
+            let (mut data, mut kind) = (Vec::new(), String::new());
+            let ask = picture_request(1, request, PICTURE_TYPES[i]);
+            let result = {
+                let mut sink = |m: Media<'_>| -> Result<()> {
+                    if kind.is_empty() {
+                        kind = m.content_type.to_string();
+                    }
+                    data.extend_from_slice(m.data);
+                    Ok(())
+                };
+                session(client, request, ClipStream::Download("cover"), ask, DATA_WINDOW_SIZE, &mut sink, &mut |_| {})
+                    .await
+            };
+            match result {
+                Err(e) if e.is::<relay::RelayBusy>() => {
+                    outcome = Err(e);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                Err(e) => {
+                    outcome = Err(e);
+                    break;
+                }
+                Ok(_) => {
+                    outcome = Ok((data, kind));
+                    break;
+                }
+            }
+        }
+        match outcome {
+            Ok((data, kind)) if !data.is_empty() => {
+                PICTURE_TYPE.store(i, Ordering::Relaxed);
+                return Ok((data, kind));
+            }
+            Ok(_) => {}
+            Err(e) if e.is::<NoVideo>() => log::info!("clip: no event picture as media type {}", PICTURE_TYPES[i]),
+            Err(e) => return Err(e),
+        }
+    }
+    bail!("The hub has no picture for this event")
+}
+
+/// The Tapo app's request for an event picture (`GetDownloadParams` without
+/// an end).
+fn picture_request(seq: u32, request: &ClipRequest, media_type: i64) -> Value {
+    json!({
+        "type": "request",
+        "seq": seq,
+        "params": {
+            "method": "get",
+            "download": {
+                "channels": [0],
+                "client_id": 1,
+                "media_type": media_type,
+                "start_time": request.clip.start.to_string(),
+                "dev_id": request.camera.device_id,
+                "streams": [],
+            }
+        }
+    })
+}
+
 /// The first client part: which clip, from which camera.
 fn download_request(seq: u32, request: &ClipRequest) -> Value {
     json!({
@@ -416,7 +510,8 @@ impl Download {
         }
         let pts_ms = part.header("x-data-pts").and_then(|v| v.trim().parse::<i64>().ok());
         let key = part.header("x-if-iframe") == Some("1");
-        media(Media { data: &part.body, pts_ms, key }).context("Could not use the recording")?;
+        let content_type = part.header("content-type").unwrap_or("");
+        media(Media { data: &part.body, content_type, pts_ms, key }).context("Could not use the recording")?;
         self.got.bytes += part.body.len() as u64;
         self.clock.feed(&part.body);
         self.got.seconds = self.clock.seconds();
@@ -583,6 +678,17 @@ mod tests {
     }
 
     #[test]
+    fn picture_request_matches_the_app() {
+        assert_eq!(
+            picture_request(1, &request(), 3),
+            json!({"type": "request", "seq": 1, "params": {"method": "get", "download": {
+                "channels": [0], "client_id": 1, "media_type": 3, "start_time": "1700000000",
+                "dev_id": "CAM", "streams": []
+            }}})
+        );
+    }
+
+    #[test]
     fn control_parts_carry_the_session() {
         let session = Mutex::new(None);
         let p = String::from_utf8(control_part(&session, &[], &json!({"a": 1}))).unwrap();
@@ -616,6 +722,7 @@ mod tests {
         let saved = Arc::new(Mutex::new(Vec::new()));
         let sink = saved.clone();
         let mut media = move |m: Media<'_>| -> Result<()> {
+            assert_eq!(m.content_type, "video/mp2t");
             sink.lock().unwrap().extend_from_slice(m.data);
             Ok(())
         };

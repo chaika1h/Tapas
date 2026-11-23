@@ -236,6 +236,26 @@ impl Decoder {
     }
 }
 
+/// Decodes a single encoded picture (an event's keyframe from a hub,
+/// `image/avc` or `image/hevc`) into a `width`×`height` frame.
+pub async fn decode_picture(ffmpeg: &Path, data: &[u8], content_type: &str, width: usize, height: usize) -> Result<SharedPixelBuffer<slint::Rgb8Pixel>> {
+    use tokio::io::AsyncWriteExt;
+    let format = if content_type.contains("hevc") || content_type.contains("265") { "hevc" } else { "h264" };
+    let mut decoder = Decoder::spawn(ffmpeg, &["-f", format, "-i", "pipe:0"], width, height)?;
+    let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
+    stdin.write_all(data).await.context("Could not pass the picture to ffmpeg")?;
+    drop(stdin);
+    let mut buf = vec![0u8; width * height * 3];
+    match timeout(Duration::from_secs(10), decoder.stdout.read_exact(&mut buf)).await {
+        Ok(Ok(_)) => Ok(SharedPixelBuffer::clone_from_slice(&buf, width as u32, height as u32)),
+        _ => {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let error = decoder.last_error.lock().unwrap().clone();
+            bail!("Could not decode the picture{}", if error.is_empty() { String::new() } else { format!(": {error}") })
+        }
+    }
+}
+
 /// The frame time in a `showinfo` line: `... n:  12 pts: 108000 pts_time:1.2 ...`.
 fn showinfo_time(line: &str) -> Option<f64> {
     if !line.contains("Parsed_showinfo") {
