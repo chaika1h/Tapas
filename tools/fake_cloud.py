@@ -85,11 +85,12 @@ HUB_CAMERAS = [
 # Days ago with recordings, per camera, and the clips of such a day:
 # (hour, minute, seconds long, video_type).
 # The Tapo app's homes ("families") and their rooms.
-FAMILIES = [{"familyId": "fam1", "familyName": "Office", "avatarUrl": ""}]
-ROOMS = {"fam1": [
-    {"roomId": "room1", "roomName": "Entrance", "things": [{"thingName": "FAKE0001"}, {"thingName": "FAKEHUB1"}]},
-    {"roomId": "room2", "roomName": "Warehouse", "things": [{"thingName": "FAKE0002"}]},
-]}
+# As the real IoT service answers: homes with their rooms, rooms without
+# their devices, and each room's "thing order" listing them.
+FAMILIES = [{"default": True, "id": "default", "name": "Office", "shared": False,
+             "rooms": [{"id": "room1", "name": "Entrance"}, {"id": "room2", "name": "Warehouse"}]}]
+ROOMS = {"default": [{"id": "room1", "name": "Entrance"}, {"id": "room2", "name": "Warehouse"}]}
+ROOM_DEVICES = {"room1": ["FAKE0001", "FAKEHUB1"], "room2": ["FAKE0002"]}
 RECORDED_DAYS = {"FAKE0001": [0, 1, 3], "FAKE0002": [0]}
 DAY_CLIPS = [(0, 5, 12, 2), (8, 2, 25, 6), (9, 41, 18, 2), (10, 0, 360, 1), (12, 15, 40, 8), (15, 33, 20, 6),
              (18, 7, 30, 9), (21, 48, 15, 2)]
@@ -262,7 +263,9 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 3:
             return self.reply({"data": FAMILIES})
         if len(parts) == 5 and parts[4] == "rooms" and parts[3] in ROOMS:
-            return self.reply({"data": ROOMS[parts[3]]})
+            return self.reply({"data": ROOMS[parts[3]], "page": 0, "pageSize": 20, "total": len(ROOMS[parts[3]])})
+        if len(parts) == 7 and parts[4] == "rooms" and parts[6] == "thing-order" and parts[5] in ROOM_DEVICES:
+            return self.reply({"data": [{"thingName": d} for d in ROOM_DEVICES[parts[5]]]})
         return self.reply({"message": "not found"}, 404)
 
     def do_POST(self):
@@ -441,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply({"outputParams": {"responseData": {"error_code": -40401}}})
         if device == "FAKEHUB1":
             responses = [self.hub_method(r.get("method"), r.get("params", {})) for r in requests]
+            # Like an H500: the answers don't come in the order asked.
+            responses.reverse()
         else:
             responses = [self.camera_method(device, r.get("method"), r.get("params", {})) for r in requests]
         return self.reply({"outputParams": {"responseData": {"error_code": 0, "result": {"responses": responses}}}})

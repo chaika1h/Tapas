@@ -2519,8 +2519,7 @@ component SettingsPage inherits Rectangle {
                     SettingRow {
                         icon: Icons.refresh;
                         title: "Cameras and hubs";
-                        description: Bridge.cloud-message != "" ? Bridge.cloud-message
-                            : "The cameras and hubs on your account are added by themselves. Update the list after adding one in the Tapo app.";
+                        description: Bridge.cloud-message != "" ? Bridge.cloud-message : "Added by themselves; update after adding one in the Tapo app.";
                         if Bridge.cloud-busy: VerticalLayout {
                             alignment: center;
                             Spinner { width: 20px; height: 20px; indeterminate: true; }
@@ -2656,7 +2655,7 @@ component SettingsPage inherits Rectangle {
                     SettingRow {
                         icon: Icons.grid;
                         title: "Graphics renderer";
-                        description: "How the window is drawn; applies after restarting Tapas. Software works everywhere, e.g. over remote desktop.";
+                        description: "How the window is drawn, from the next start.";
                         VerticalLayout {
                             alignment: center;
                             ComboBox {
@@ -2737,10 +2736,12 @@ component SettingsPage inherits Rectangle {
                             }
                         }
                     }
-                    SettingRow {
-                        title: "Credits";
-                        description: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
-                    }
+                }
+                // Long text wraps well only outside the cards' rows.
+                Muted {
+                    text: "Tapas's cloud client is ported from the MIT-licensed Topo and Topo TV projects, and the hub's recording protocol from the tapo crate by Mihai Dinculescu. Video is decoded by FFmpeg (LGPL).";
+                    font-size: 12px;
+                    wrap: word-wrap;
                 }
                 HorizontalLayout {
                     alignment: start;

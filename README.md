@@ -95,10 +95,14 @@ amber.
   picture.
 
 The list has the day's **detected events** (person, vehicle, animal, motion…) by hour, with the
-picture the hub keeps for each. On a day without events it lists the recordings.
+picture the hub keeps for each. The pictures come while you watch, whenever playback isn't using
+the hub, and are kept on this PC so they come at once next time. On a day without events the list
+has the recordings.
 
 Recordings come from the hub through the cloud a couple of minutes at a time, just before they're
-needed, and nothing is saved unless you ask. Leaving the page pauses what's playing. What has arrived stays in memory for a while, so going
+needed, and nothing is saved unless you ask. Leaving the page pauses what's playing; after ten
+seconds paused, Tapas lets go of the hub (so the Tapo app can play) and picks up where it was when
+you play on. What has arrived stays in memory for a while, so going
 back, or forward into it, starts at once. A jump elsewhere takes a few seconds while the hub
 answers. Days are in this PC's time zone. Saved recordings are `.ts` files, which VLC and Windows'
 media players play.

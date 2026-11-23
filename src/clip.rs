@@ -89,6 +89,44 @@ const METHODS: [ClipStream; 3] = [ClipStream::Download("video"), ClipStream::Pla
 /// holds this until its connection has closed.
 static HUB_SLOT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
+/// Video sessions (playback, saving) waiting for the hub. Event pictures
+/// give way to them, and take the hub only while it's free, e.g. between
+/// the stretches playback fetches.
+static VIDEO_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts a video session as waiting until it has the hub (or gives up).
+struct Waiting;
+
+impl Waiting {
+    fn new() -> Self {
+        VIDEO_WAITING.fetch_add(1, Ordering::SeqCst);
+        Waiting
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        VIDEO_WAITING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The hub, for one session: video waits its turn; a picture waits until no
+/// video wants the hub.
+async fn take_hub(picture: bool) -> tokio::sync::OwnedSemaphorePermit {
+    if !picture {
+        let _waiting = Waiting::new();
+        return HUB_SLOT.clone().acquire_owned().await.expect("the hub slot is never closed");
+    }
+    loop {
+        if VIDEO_WAITING.load(Ordering::SeqCst) == 0
+            && let Ok(slot) = HUB_SLOT.clone().try_acquire_owned()
+        {
+            return slot;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// The index in [`METHODS`] that last brought video, tried first next time.
 static WORKING: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -185,7 +223,8 @@ async fn session(
     media: &mut MediaSink<'_>,
     progress: &mut (dyn FnMut(Progress) + Send),
 ) -> Result<Progress> {
-    let slot = HUB_SLOT.clone().acquire_owned().await.expect("the hub slot is never closed");
+    let picture = first_request.pointer("/params/download/end_time").is_none();
+    let slot = take_hub(picture).await;
     let info = client.request_clip_relay(&request.hub, &request.camera, &request.player_id, method).await?;
     let mut stream = relay::connect(client.tls(), &info).await?;
     let mut first = relay::recording_head(&info).into_bytes();
