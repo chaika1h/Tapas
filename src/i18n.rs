@@ -423,6 +423,35 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "Pencere çizim motoru (sonraki açılışta geçerli olur).",
     ));
     tr.set_settings_file(t("Settings file", "Ayar dosyası"));
+    tr.set_sec_shortcuts(t("Keyboard shortcuts", "Klavye kısayolları"));
+    tr.set_sc_nav(t(
+        "Switch pages (Home, Live view, Playback, People, Settings)",
+        "Sayfalar arası geçiş (Ana sayfa, Canlı izleme, Kayıtlar, Yüzler, Ayarlar)",
+    ));
+    tr.set_sc_cam(t(
+        "Open camera 1–9 from Home or Live view",
+        "Ana sayfa veya Canlı izlemeden 1–9 numaralı kamerayı aç",
+    ));
+    tr.set_sc_space(t("Play or pause in Playback", "Kayıtlarda oynat veya duraklat"));
+    tr.set_sc_arrows(t(
+        "Skip ±10s in Playback (Shift: ±30s), or pan PTZ camera",
+        "Kayıtlarda ±10 sn atla (Shift: ±30 sn) veya PTZ kamerayı yönlendir",
+    ));
+    tr.set_sc_speed(t("Decrease or increase Playback speed", "Kayıt oynatma hızını azalt veya artır"));
+    tr.set_sc_mute(t("Mute or unmute audio", "Sesi aç veya kapat"));
+    tr.set_sc_snap(t("Take snapshot (Pictures\\Tapas)", "Fotoğraf çek (Resimler\\Tapas)"));
+    tr.set_sc_rec(t(
+        "Start or stop MP4 recording (Videos\\Tapas)",
+        "MP4 kaydını başlat veya durdur (Videolar\\Tapas)",
+    ));
+    tr.set_sc_zoom(t(
+        "Scroll to zoom (1×–8×), drag to pan; press 0 to reset",
+        "Yakınlaştırmak için kaydır (1×–8×), sürükleyerek gez; sıfırlamak için 0",
+    ));
+    tr.set_sc_full(t(
+        "Toggle or leave fullscreen, or go back from Single view",
+        "Tam ekranı aç/kapat veya tek kamera görünümünden geri dön",
+    ));
     tr.set_sec_about(t("About and updates", "Hakkında ve güncellemeler"));
     tr.set_about_default(t(
         "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.",

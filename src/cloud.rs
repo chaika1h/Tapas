@@ -472,14 +472,17 @@ impl FaceFilter {
     }
 }
 
-/// One cross-camera face tracking trajectory returned by `doSearchFaceTrackingList`.
+/// One cross-camera face tracking trajectory (`doSearchFaceTrackingList`) or
+/// face-filtered recording clip (`doSearchFaceDetectionVideo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaceTrackingEntry {
     pub face_id: i64,
     pub start_time: i64,
     pub end_time: i64,
-    /// Normalized uppercase hex MAC (no separators) of the camera that captured the snapshot.
+    /// Normalized uppercase hex MAC (no separators) of the camera that captured the snapshot/clip.
     pub snapshot_mac: String,
+    /// Optional hub child camera `device_id` (populated by `doSearchFaceDetectionVideo`).
+    pub dev_id: String,
     pub channel_id: i32,
     pub clip_count: i32,
     pub device_count: i32,
@@ -954,9 +957,13 @@ impl CloudClient {
     }
 
     /// Asks the cloud for a relay session to download face profile JPEGs from
-    /// an H500 hub (`STREAM_TYPE_IMAGE = 6` in the Tapo app).
+    /// an H500 hub (`STREAM_TYPE_IMAGE = 6`, `subType = "get_face"` in the Tapo app).
     pub async fn request_face_image_relay(&self, hub: &CloudCamera, player_id: &str) -> Result<RelayInfo> {
         let device_type = if hub.device_type.is_empty() { HUB_TYPE } else { &hub.device_type };
+        let custom = json!({
+            "image_type": "get_face",
+            "image_format": "jpeg",
+        });
         let payload = json!({
             "deviceId": hub.device_id,
             "dataTimeoutCount": 0,
@@ -966,6 +973,8 @@ impl CloudClient {
             "rootCaVer": "1",
             "preConnection": 0,
             "streamType": STREAM_IMAGE,
+            "subType": "get_face",
+            "customParams": custom.to_string(),
         });
         log::info!("face image relay request: {}", redact_relay_request(&payload));
         self.relay_request(&payload, player_id.to_string(), "Hub").await
@@ -1625,6 +1634,46 @@ impl CloudClient {
         Ok(entries)
     }
 
+    /// Face-filtered recordings (`doSearchFaceDetectionVideo` / `SearchVideoWithFilterRequest`)
+    /// across `camera_macs` for each face in `face_ids`, newest first. Works on H500 hubs even
+    /// when multi-camera Face Tracking is turned off.
+    pub async fn hub_face_videos(
+        &self,
+        hub: &CloudCamera,
+        start: i64,
+        end: i64,
+        face_ids: &[i64],
+        camera_macs: &[String],
+    ) -> Result<Vec<FaceTrackingEntry>> {
+        if face_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        for chunk in face_ids.chunks(8) {
+            let requests: Vec<Value> = chunk
+                .iter()
+                .map(|&fid| search_face_videos_request(fid, camera_macs, start, end, 0, 49))
+                .collect();
+            let responses = self.camera_requests(hub, requests).await?;
+            for (i, (&fid, resp)) in chunk.iter().zip(responses.iter()).enumerate() {
+                if let Ok(res) = first_result(std::slice::from_ref(resp), "doSearchFaceDetectionVideo") {
+                    if entries.is_empty() && i == 0 {
+                        let raw = serde_json::to_string(&res).unwrap_or_default();
+                        log::info!(
+                            "hub {} face videos (face {fid}): {}",
+                            hub.name,
+                            raw.chars().take(1200).collect::<String>()
+                        );
+                    }
+                    entries.extend(parse_face_videos(&res, fid));
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.start_time.cmp(&a.start_time).then_with(|| b.end_time.cmp(&a.end_time)));
+        entries.dedup();
+        Ok(entries)
+    }
+
     /// Detailed per-camera clips inside a single cross-camera face trajectory.
     #[allow(dead_code)]
     pub async fn hub_face_tracking_clips(
@@ -1853,15 +1902,48 @@ fn search_face_tracking_request(
     body.insert("version".into(), json!(2));
     if let Some(id) = face_id {
         body.insert("face_id".into(), json!([id]));
+    } else {
+        body.insert("face_id".into(), json!([]));
     }
     if let Some(t) = tag.filter(|t| !t.is_empty()) {
         body.insert("tag".into(), json!([t]));
+    } else if face_id.is_none() {
+        body.insert("tag".into(), json!(["familiar", "stranger"]));
     }
     json!({
         "method": "doSearchFaceTrackingList",
         "params": {
             "face_detection": {
                 "action_search_face_tracking_list": Value::Object(body),
+            }
+        }
+    })
+}
+
+/// Builds `doSearchFaceDetectionVideo` (`SearchVideoWithFilterRequest` in the Tapo app).
+fn search_face_videos_request(
+    face_id: i64,
+    camera_macs: &[String],
+    start: i64,
+    end: i64,
+    start_index: i32,
+    end_index: i32,
+) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("id".into(), json!(1));
+    body.insert("face_id".into(), json!(face_id));
+    body.insert("start_time".into(), json!(start));
+    body.insert("end_time".into(), json!(end));
+    body.insert("start_index".into(), json!(start_index));
+    body.insert("end_index".into(), json!(end_index));
+    if !camera_macs.is_empty() {
+        body.insert("mac".into(), json!(camera_macs));
+    }
+    json!({
+        "method": "doSearchFaceDetectionVideo",
+        "params": {
+            "playback": {
+                "action_search_face_detection_video": Value::Object(body),
             }
         }
     })
@@ -1984,6 +2066,7 @@ fn parse_face_tracking_list(result: &Value) -> Vec<FaceTrackingEntry> {
                 .max(start_time);
             let face_id = e.get("face_id").and_then(int_value).unwrap_or(0);
             let snapshot_mac = normalize_mac(&str_field(e, "snapshot_mac"));
+            let dev_id = str_field(e, "dev_id");
             let channel_id = e.get("chn_id").and_then(int_value).unwrap_or(0) as i32;
             let clip_count = e.get("clip_cnt").and_then(int_value).unwrap_or(1) as i32;
             let device_count = e.get("dev_cnt").and_then(int_value).unwrap_or(1) as i32;
@@ -1992,9 +2075,55 @@ fn parse_face_tracking_list(result: &Value) -> Vec<FaceTrackingEntry> {
                 start_time,
                 end_time,
                 snapshot_mac,
+                dev_id,
                 channel_id,
                 clip_count,
                 device_count,
+            })
+        })
+        .collect()
+}
+
+/// Parses `VideoResultList` of `doSearchFaceDetectionVideo`:
+/// `playback.action_search_face_detection_video.search_face_detection_video_result`
+/// (or `playback.search_face_detection_video_result`).
+fn parse_face_videos(result: &Value, face_id: i64) -> Vec<FaceTrackingEntry> {
+    let list = result
+        .pointer("/playback/action_search_face_detection_video/search_face_detection_video_result")
+        .or_else(|| result.pointer("/playback/search_face_detection_video_result"))
+        .or_else(|| result.get("search_face_detection_video_result"))
+        .or_else(|| result.pointer("/playback/action_search_face_detection_video"));
+    let plain = list
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.get("startTime").is_some() || e.get("start_time").is_some());
+    let wrapped = section_entries(list)
+        .filter(|e| e.get("startTime").is_some() || e.get("start_time").is_some());
+    plain
+        .chain(wrapped)
+        .filter_map(|e| {
+            let start_time = e
+                .get("startTime")
+                .or_else(|| e.get("start_time"))
+                .and_then(int_value)?;
+            let end_time = e
+                .get("endTime")
+                .or_else(|| e.get("end_time"))
+                .and_then(int_value)
+                .unwrap_or(start_time)
+                .max(start_time);
+            let snapshot_mac = normalize_mac(&str_field(e, "mac"));
+            let dev_id = str_field(e, "dev_id");
+            Some(FaceTrackingEntry {
+                face_id,
+                start_time,
+                end_time,
+                snapshot_mac,
+                dev_id,
+                channel_id: 0,
+                clip_count: 1,
+                device_count: 1,
             })
         })
         .collect()
@@ -2836,6 +2965,28 @@ mod tests {
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].mac, "A842A1001133");
         assert_eq!(clips[0].codec, "h264");
+
+        // Exact H500 `doSearchFaceDetectionVideo` request & `VideoResultList` response shape
+        let vid_req = search_face_videos_request(42, &["A8-42-A1-00-11-22".into()], 100, 200, 0, 49);
+        assert_eq!(vid_req["method"], "doSearchFaceDetectionVideo");
+        let vid_body = &vid_req["params"]["playback"]["action_search_face_detection_video"];
+        assert_eq!(vid_body["face_id"], 42);
+        assert_eq!(vid_body["id"], 1);
+        assert_eq!(vid_body["mac"], json!(["A8-42-A1-00-11-22"]));
+        let vid_json = json!({
+            "playback": {
+                "action_search_face_detection_video": {
+                    "search_face_detection_video_result": [
+                        {"startTime": 1700002000, "endTime": 1700002030, "mac": "a8-42-a1-00-11-22", "dev_id": "CAM1"}
+                    ]
+                }
+            }
+        });
+        let vids = parse_face_videos(&vid_json, 42);
+        assert_eq!(vids.len(), 1);
+        assert_eq!(vids[0].face_id, 42);
+        assert_eq!(vids[0].snapshot_mac, "A842A1001122");
+        assert_eq!(vids[0].dev_id, "CAM1");
     }
 
     #[test]

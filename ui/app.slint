@@ -511,6 +511,17 @@ export global Tr {
     in-out property <string> renderer-title: "Graphics renderer";
     in-out property <string> renderer-desc: "How the window is drawn, from the next start.";
     in-out property <string> settings-file: "Settings file";
+    in-out property <string> sec-shortcuts: "Keyboard shortcuts";
+    in-out property <string> sc-nav: "Switch pages (Home, Live view, Playback, People, Settings)";
+    in-out property <string> sc-cam: "Open camera 1–9 from Home or Live view";
+    in-out property <string> sc-space: "Play or pause in Playback";
+    in-out property <string> sc-arrows: "Skip ±10s in Playback (Shift: ±30s), or pan PTZ camera";
+    in-out property <string> sc-speed: "Decrease or increase Playback speed";
+    in-out property <string> sc-mute: "Mute or unmute audio";
+    in-out property <string> sc-snap: "Take snapshot (Pictures\\Tapas)";
+    in-out property <string> sc-rec: "Start or stop MP4 recording (Videos\\Tapas)";
+    in-out property <string> sc-zoom: "Scroll to zoom (1×–8×), drag to pan; press 0 to reset";
+    in-out property <string> sc-full: "Toggle or leave fullscreen, or go back from Single view";
     in-out property <string> sec-about: "About and updates";
     in-out property <string> about-default: "TP-Link Tapo cameras and the H500 HomeBase, through the Tapo cloud.";
     in-out property <string> update-to-prefix: "Update to ";
@@ -4056,6 +4067,69 @@ component SettingsPage inherits Rectangle {
                         VerticalLayout {
                             alignment: center;
                             Button { text: Tr.show-in-folder; clicked => { Bridge.show-in-folder(Bridge.config-path); } }
+                        }
+                    }
+                }
+                Rectangle { height: 8px; }
+
+                SettingsHeading { text: Tr.sec-shortcuts; }
+                SettingsCard {
+                    for s[i] in [
+                        { keys: "Ctrl + 1–5", desc: Tr.sc-nav },
+                        { keys: "1–9", desc: Tr.sc-cam },
+                        { keys: "Space", desc: Tr.sc-space },
+                        { keys: "← / →", desc: Tr.sc-arrows },
+                        { keys: "[ / ]", desc: Tr.sc-speed },
+                        { keys: "M", desc: Tr.sc-mute },
+                        { keys: "S", desc: Tr.sc-snap },
+                        { keys: "R", desc: Tr.sc-rec },
+                        { keys: "Scroll / 0", desc: Tr.sc-zoom },
+                        { keys: "F11 / Esc", desc: Tr.sc-full },
+                    ]: Rectangle {
+                        min-height: 44px;
+                        if i > 0: Rectangle {
+                            x: 16px;
+                            y: 0;
+                            width: parent.width - 32px;
+                            height: 1px;
+                            background: Palette.border;
+                        }
+                        HorizontalLayout {
+                            padding-left: 18px;
+                            padding-right: 18px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 14px;
+                            VerticalLayout {
+                                alignment: center;
+                                width: 112px;
+                                HorizontalLayout {
+                                    alignment: start;
+                                    Rectangle {
+                                        height: 26px;
+                                        width: k-lbl.preferred-width + 18px;
+                                        border-radius: 6px;
+                                        background: Palette.foreground.transparentize(0.93);
+                                        border-width: 1px;
+                                        border-color: Palette.border;
+                                        k-lbl := Text {
+                                            text: s.keys;
+                                            font-size: 12px;
+                                            font-weight: 600;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                            Text {
+                                text: s.desc;
+                                font-size: 13px;
+                                color: Palette.foreground.transparentize(0.2);
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                wrap: word-wrap;
+                            }
                         }
                     }
                 }

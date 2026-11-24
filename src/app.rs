@@ -3941,17 +3941,69 @@ impl App {
         self.face_track_request.set(req);
         let (start, end) = local_day(self.face_track_date.get());
         let face_id = self.selected_face.get();
-        let tag = if face_id.is_some() {
-            None
+        let filter = FaceFilter::from_index(b.get_face_filter());
+        let tag = if face_id.is_some() { None } else { filter.tag_param() };
+
+        // Candidate face IDs and hub camera MACs for the `doSearchFaceDetectionVideo`
+        // fallback (used when multi-camera Face Tracking returns empty or is disabled).
+        let fallback_face_ids: Vec<i64> = if let Some(id) = face_id {
+            vec![id]
         } else {
-            FaceFilter::from_index(b.get_face_filter()).tag_param()
+            let mut list: Vec<FaceInfo> = self
+                .faces
+                .borrow()
+                .iter()
+                .filter(|f| filter.matches(f))
+                .cloned()
+                .collect();
+            list.sort_by(|a, b| b.last_seen().cmp(&a.last_seen()));
+            list.into_iter().take(24).map(|f| f.face_id).collect()
         };
+        let mut camera_macs: Vec<String> = self
+            .hub
+            .borrow()
+            .cameras
+            .iter()
+            .filter(|c| !c.mac.is_empty())
+            .map(|c| c.mac.clone())
+            .collect();
+        if camera_macs.is_empty() {
+            camera_macs = self
+                .cfg
+                .borrow()
+                .cameras
+                .iter()
+                .filter_map(|c| c.cloud.as_ref().map(|l| l.mac.clone()))
+                .filter(|m| !m.is_empty())
+                .collect();
+        }
+
         b.set_face_track_loading(true);
         b.set_face_track_message(
-            i18n::pick("Loading cross-camera tracking…", "Kameralar arası takip yükleniyor…").into(),
+            i18n::pick("Loading face appearances…", "Yüz kayıtları yükleniyor…").into(),
         );
         self.rt.spawn(async move {
-            let result = client.hub_face_tracking(&hub, start, end, face_id, tag).await;
+            let tracking = client.hub_face_tracking(&hub, start, end, face_id, tag).await;
+            let result = match tracking {
+                Ok(entries) if !entries.is_empty() => Ok(entries),
+                Err(e) if e.is_auth() => {
+                    on_ui(move |app| app.face_tracks_loaded(req, Err(e)));
+                    return;
+                }
+                other => {
+                    if let Err(ref e) = other {
+                        log::info!("doSearchFaceTrackingList unavailable ({e}); trying doSearchFaceDetectionVideo");
+                    }
+                    match client.hub_face_videos(&hub, start, end, &fallback_face_ids, &camera_macs).await {
+                        Ok(vids) if !vids.is_empty() => Ok(vids),
+                        Ok(_) => other.or(Ok(Vec::new())),
+                        Err(ve) => {
+                            log::info!("doSearchFaceDetectionVideo failed: {ve}");
+                            other.or(Err(ve))
+                        }
+                    }
+                }
+            };
             on_ui(move |app| app.face_tracks_loaded(req, result));
         });
     }
@@ -3978,7 +4030,7 @@ impl App {
                     if i18n::is_tr() {
                         format!("Yüz takip geçmişi alınamadı: {e}")
                     } else {
-                        format!("Could not load face tracking timeline: {e}")
+                        format!("Could not load face timeline: {e}")
                     }
                     .into(),
                 );
@@ -3986,8 +4038,22 @@ impl App {
         }
     }
 
-    fn resolve_camera_by_mac(&self, normalized_mac: &str) -> Option<(String, String)> {
-        if normalized_mac.is_empty() {
+    fn resolve_camera_for_track(&self, entry: &FaceTrackingEntry) -> Option<(String, String)> {
+        if !entry.dev_id.is_empty() {
+            if let Some(cam) = self.hub.borrow().cameras.iter().find(|c| c.device_id == entry.dev_id) {
+                return Some((cam.device_id.clone(), cam.name.clone()));
+            }
+            if let Some(cam) = self
+                .cfg
+                .borrow()
+                .cameras
+                .iter()
+                .find(|c| c.cloud.as_ref().is_some_and(|l| l.device_id == entry.dev_id))
+            {
+                return Some((entry.dev_id.clone(), cam.name.clone()));
+            }
+        }
+        if entry.snapshot_mac.is_empty() {
             return None;
         }
         if let Some(cam) = self
@@ -3995,14 +4061,14 @@ impl App {
             .borrow()
             .cameras
             .iter()
-            .find(|c| cloud::normalize_mac(&c.mac) == normalized_mac)
+            .find(|c| cloud::normalize_mac(&c.mac) == entry.snapshot_mac)
         {
             return Some((cam.device_id.clone(), cam.name.clone()));
         }
         if let Some(cam) = self.cfg.borrow().cameras.iter().find(|c| {
             c.cloud
                 .as_ref()
-                .is_some_and(|l| cloud::normalize_mac(&l.mac) == normalized_mac)
+                .is_some_and(|l| cloud::normalize_mac(&l.mac) == entry.snapshot_mac)
         }) {
             let id = cam.cloud.as_ref().map(|l| l.device_id.clone()).unwrap_or_default();
             return Some((id, cam.name.clone()));
@@ -4029,7 +4095,7 @@ impl App {
                 } else {
                     String::new()
                 };
-                let resolved = self.resolve_camera_by_mac(&t.snapshot_mac);
+                let resolved = self.resolve_camera_for_track(t);
                 let camera = resolved
                     .as_ref()
                     .map(|(_, name)| name.clone())
@@ -4082,8 +4148,8 @@ impl App {
         b.set_face_track_message(
             if count == 0 {
                 i18n::pick(
-                    "No cross-camera face appearances on this day.",
-                    "Bu gün için kameralar arası yüz kaydı yok.",
+                    "No face appearances on this day.",
+                    "Bu gün için yüz kaydı yok.",
                 )
             } else {
                 i18n::pick(
@@ -4098,7 +4164,7 @@ impl App {
     fn face_track_play(&self, index: usize) {
         let entry = self.face_tracks.borrow().get(index).cloned();
         let Some(entry) = entry else { return };
-        let Some((device_id, name)) = self.resolve_camera_by_mac(&entry.snapshot_mac) else {
+        let Some((device_id, name)) = self.resolve_camera_for_track(&entry) else {
             self.status(i18n::pick(
                 "Could not match this appearance to a camera on the hub.",
                 "Bu kayıt hub üzerindeki bir kamerayla eşleştirilemedi.",
