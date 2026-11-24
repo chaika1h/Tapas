@@ -465,7 +465,7 @@ fn picture_request(seq: u32, request: &ClipRequest, media_type: i64) -> Value {
 }
 
 /// The Tapo app's request for H500 facial profile JPEGs (`GetImageRequest` /
-/// `GetDownloadFaceImageParams` on `STREAM_TYPE_IMAGE = 6`).
+/// `GetDownloadFaceImageParams` extending `ImageParams("get_face")` on `STREAM_TYPE_IMAGE = 6`).
 fn face_image_request(seq: u32, face_ids: &[i64]) -> Value {
     json!({
         "type": "request",
@@ -473,6 +473,7 @@ fn face_image_request(seq: u32, face_ids: &[i64]) -> Value {
         "params": {
             "method": "get",
             "image": {
+                "type": "get_face",
                 "face_id": face_ids,
             }
         }
@@ -1060,7 +1061,7 @@ mod tests {
     fn face_image_conversation_handles_jpegs_and_acks() {
         assert_eq!(
             face_image_request(1, &[101, 202]),
-            json!({"type": "request", "seq": 1, "params": {"method": "get", "image": {"face_id": [101, 202]}}})
+            json!({"type": "request", "seq": 1, "params": {"method": "get", "image": {"type": "get_face", "face_id": [101, 202]}}})
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut s = FaceImageSession::new(tx, Arc::default(), &[101, 202]);
