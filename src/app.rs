@@ -387,6 +387,19 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     let theme_index = app.cfg.borrow().theme.index();
     ui.invoke_set_theme(theme_index);
     crate::chrome::install(ui, theme_index);
+    if let Some((w, h)) = app.cfg.borrow().saved_window_size() {
+        ui.window().set_size(slint::LogicalSize::new(w as f32, h as f32));
+    }
+    if app.cfg.borrow().window_maximized {
+        ui.window().set_maximized(true);
+    }
+    let weak_close = Rc::downgrade(&app);
+    ui.window().on_close_requested(move || {
+        if let Some(a) = weak_close.upgrade() {
+            a.save_window_state();
+        }
+        slint::CloseRequestResponse::HideWindow
+    });
     let lang = i18n::set(app.cfg.borrow().language);
     i18n::apply_to_ui(ui, lang);
     b.set_downloads(app.downloads.clone().into());
@@ -395,9 +408,13 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_navigate(cb!(&app, |a, page| a.navigate(page)));
     b.on_toggle_fullscreen(cb!(&app, |a| a.toggle_fullscreen()));
     b.on_escape(cb!(&app, |a| a.escape()));
+    b.on_clear_status(cb!(&app, |a| a.clear_status()));
     b.on_window_minimize(|| crate::chrome::minimize());
     b.on_window_toggle_maximize(|| crate::chrome::toggle_maximize());
-    b.on_window_close(|| crate::chrome::close());
+    b.on_window_close(cb!(&app, |a| {
+        a.save_window_state();
+        crate::chrome::close();
+    }));
     b.on_open_camera(cb!(&app, |a, id| a.open_camera(id as u32)));
     b.on_open_camera_slot(cb!(&app, |a, slot| a.open_camera_slot(slot as usize)));
     b.on_toggle_tile_audio(cb!(&app, |a, id| a.toggle_tile_audio(id as u32)));
@@ -405,6 +422,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_hub_toggle_loop(cb!(&app, |a, i| a.hub_toggle_loop(i as usize)));
     b.on_hub_toggle_alarm(cb!(&app, |a, i| a.hub_toggle_alarm(i as usize)));
     b.on_single_back(cb!(&app, |a| a.single_back()));
+    b.on_single_step_camera(cb!(&app, |a, delta| a.single_step_camera(delta)));
     b.on_single_record(cb!(&app, |a| a.single_record()));
     b.on_single_toggle_audio(cb!(&app, |a| a.single_toggle_audio()));
     b.on_reset_zoom(cb!(&app, |a| a.reset_zoom()));
@@ -462,6 +480,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_batch_export(cb!(&app, |a| a.batch_export()));
     b.on_batch_cancel(cb!(&app, |a| a.batch_cancel()));
     b.on_faces_refresh(cb!(&app, |a| a.load_faces()));
+    b.on_face_search_changed(cb!(&app, |a, _q| a.refresh_faces_ui()));
     b.on_face_filter_changed(cb!(&app, |a, _i| a.face_filter_changed()));
     b.on_face_select(cb!(&app, |a, id| a.face_select(id.as_str())));
     b.on_face_save(cb!(&app, |a| a.face_save()));
@@ -525,7 +544,8 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         };
         b.set_login_email(user.as_str().into());
         if let Err(e) = &app.cloud {
-            app.show_sign_in(0, &format!("Tapo cloud unavailable: {e}"));
+            let msg = format!("{}: {e}", i18n::pick("Tapo cloud unavailable", "Tapo bulutuna ulaşılamıyor"));
+            app.show_sign_in(0, &msg);
         } else if !user.is_empty() && !pass.is_empty() {
             b.set_login_password(pass.as_str().into());
             b.set_onboarding_step(1);
@@ -551,8 +571,63 @@ impl App {
     fn status(&self, msg: impl Into<SharedString>) {
         let msg = msg.into();
         log::info!("{msg}");
-        self.ui().global::<Bridge>().set_status_text(msg);
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_status_action_path(SharedString::new());
+        b.set_status_text(msg);
+        *self.status_until.borrow_mut() = Some(Instant::now() + Duration::from_secs(6));
+    }
+
+    fn status_with_path(&self, msg: impl Into<SharedString>, path: &Path) {
+        let msg = msg.into();
+        log::info!("{msg} ({})", path.display());
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_status_action_path(path.display().to_string().into());
+        b.set_status_text(msg);
         *self.status_until.borrow_mut() = Some(Instant::now() + Duration::from_secs(8));
+    }
+
+    fn clear_status(&self) {
+        *self.status_until.borrow_mut() = None;
+        let ui = self.ui();
+        let b = ui.global::<Bridge>();
+        b.set_status_text(SharedString::new());
+        b.set_status_action_path(SharedString::new());
+    }
+
+    /// Saves the current window size and maximized state to `config.json`.
+    fn save_window_state(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        if ui.global::<Bridge>().get_fullscreen() {
+            return;
+        }
+        let window = ui.window();
+        let maximized = window.is_maximized();
+        let mut changed = false;
+        {
+            let mut cfg = self.cfg.borrow_mut();
+            if cfg.window_maximized != maximized {
+                cfg.window_maximized = maximized;
+                changed = true;
+            }
+            if !maximized {
+                let size = window.size().to_logical(window.scale_factor());
+                let w = size.width.round() as u32;
+                let h = size.height.round() as u32;
+                if (760..=7680).contains(&w)
+                    && (480..=4320).contains(&h)
+                    && (cfg.window_width != w || cfg.window_height != h)
+                {
+                    cfg.window_width = w;
+                    cfg.window_height = h;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.persist();
+        }
     }
 
     /// The Tapo account: the saved password, or the one typed in this run.
@@ -568,7 +643,7 @@ impl App {
 
     fn persist(&self) {
         if let Err(e) = config::save(&self.cfg.borrow()) {
-            self.status(format!("Could not save settings: {e:#}"));
+            self.status(format!("{}: {e:#}", i18n::pick("Could not save settings", "Ayarlar kaydedilemedi")));
         }
     }
 
@@ -628,6 +703,7 @@ impl App {
         if expired {
             *self.status_until.borrow_mut() = None;
             b.set_status_text(SharedString::new());
+            b.set_status_action_path(SharedString::new());
         }
     }
 
@@ -725,8 +801,8 @@ impl App {
         let window = ui.window();
         let size = window.size().to_logical(window.scale_factor());
         let fullscreen = ui.global::<Bridge>().get_fullscreen();
-        // Sidebar, page header and status bar around the grid (see app.slint).
-        let (chrome_w, chrome_h) = if fullscreen { (8.0, 8.0) } else { (236.0 + 20.0, 76.0 + 26.0 + 20.0) };
+        // Sidebar and page header around the grid (see app.slint).
+        let (chrome_w, chrome_h) = if fullscreen { (8.0, 8.0) } else { (236.0 + 20.0, 76.0 + 20.0) };
         let (w, h) = (size.width - chrome_w, size.height - chrome_h);
         let key = (n, w as i32, h as i32);
         if *self.last_grid_size.borrow() == key || n == 0 {
@@ -868,10 +944,18 @@ impl App {
     /// What a camera's tile shows before its stream reports anything.
     fn tile_status(&self, cam: &CameraConfig) -> String {
         match (&self.cloud, &cam.cloud) {
-            (Err(e), _) => format!("Tapo cloud unavailable: {e}"),
-            (Ok(client), _) if client.session().is_none() => "Not signed in: sign in with your Tapo account in Settings".into(),
-            (Ok(_), None) => "Not linked to a camera on your Tapo account: edit it in Settings".into(),
-            (Ok(_), Some(_)) => "Connecting…".into(),
+            (Err(e), _) => format!("{}: {e}", i18n::pick("Tapo cloud unavailable", "Tapo bulutuna ulaşılamıyor")),
+            (Ok(client), _) if client.session().is_none() => i18n::pick(
+                "Not signed in: sign in with your Tapo account in Settings",
+                "Giriş yapılmadı: Ayarlar'dan Tapo hesabınızla giriş yapın",
+            )
+            .into(),
+            (Ok(_), None) => i18n::pick(
+                "Not linked to a camera on your Tapo account: edit it in Settings",
+                "Tapo hesabındaki bir kameraya bağlı değil: Ayarlar'dan düzenleyin",
+            )
+            .into(),
+            (Ok(_), Some(_)) => i18n::pick("Connecting…", "Bağlanıyor…").into(),
         }
     }
 
@@ -908,6 +992,7 @@ impl App {
     fn navigate(&self, page: Page) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
+        b.set_tip_text(SharedString::new());
         let from = b.get_page();
         if b.get_fullscreen() && page != from {
             self.set_fullscreen(false);
@@ -1031,13 +1116,27 @@ impl App {
         self.navigate(self.return_page.get());
     }
 
+    /// Steps to the previous (`-1`) or next (`+1`) camera while staying in Single view.
+    fn single_step_camera(&self, delta: i32) {
+        let Some((current_id, _)) = *self.single.borrow() else { return };
+        let ids: Vec<u32> = self.cfg.borrow().cameras.iter().map(|c| c.id).collect();
+        if let Some(next_id) = step_camera_id(&ids, current_id, delta) {
+            self.open_camera(next_id);
+        }
+    }
+
     fn open_camera(&self, id: u32) {
         self.stop_live_recording(false);
         self.reset_zoom();
-        let Some(cam) = self.cfg.borrow().camera(id).cloned() else { return };
+        let (cam, can_switch) = {
+            let cfg = self.cfg.borrow();
+            let Some(cam) = cfg.camera(id).cloned() else { return };
+            (cam, cfg.cameras.len() > 1)
+        };
         let quality = Quality::Hd;
         let ui = self.ui();
         let b = ui.global::<Bridge>();
+        b.set_tip_text(SharedString::new());
         if b.get_page() != Page::Single {
             self.return_page.set(b.get_page());
             if b.get_page() == Page::Live {
@@ -1049,6 +1148,7 @@ impl App {
         *self.single_shown.borrow_mut() = (0, String::new());
 
         b.set_single_name(cam.name.as_str().into());
+        b.set_single_can_switch(can_switch);
         b.set_single_quality(quality.index());
         // Until the HD video comes: the grid's picture, or the last one.
         let placeholder = self.picture_of(id);
@@ -1217,7 +1317,11 @@ impl App {
             };
             on_ui(move |app| {
                 app.set_download_status(row, row_text, done);
-                app.status(toast);
+                if done {
+                    app.status_with_path(toast, &target);
+                } else {
+                    app.status(toast);
+                }
             });
         });
     }
@@ -1226,7 +1330,7 @@ impl App {
         let Some(key) = *self.single.borrow() else { return };
         let frame = self.streams.borrow().get(&key).and_then(|l| l.handle.latest_frame());
         let Some(frame) = frame else {
-            self.status("No picture yet.");
+            self.status(i18n::pick("No picture yet.", "Henüz görüntü yok."));
             return;
         };
         let name = self.cfg.borrow().camera(key.0).map(|c| c.name.clone()).unwrap_or_default();
@@ -1246,8 +1350,16 @@ impl App {
                 Ok(())
             })();
             on_ui(move |app| match result {
-                Ok(()) => app.status(format!("Snapshot saved to {}", path.display())),
-                Err(e) => app.status(format!("Snapshot failed: {e:#}")),
+                Ok(()) => {
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let msg = if i18n::is_tr() {
+                        format!("Fotoğraf kaydedildi · {file_name}")
+                    } else {
+                        format!("Snapshot saved · {file_name}")
+                    };
+                    app.status_with_path(msg, &path);
+                }
+                Err(e) => app.status(format!("{}: {e:#}", i18n::pick("Snapshot failed", "Fotoğraf kaydedilemedi"))),
             });
         });
     }
@@ -1296,8 +1408,12 @@ impl App {
                     name: c.name.as_str().into(),
                     detail: match &c.cloud {
                         Some(link) if !link.model.is_empty() => link.model.as_str().into(),
-                        Some(_) => "Tapo camera".into(),
-                        None => "Not linked to your Tapo account".into(),
+                        Some(_) => i18n::pick("Tapo camera", "Tapo kamerası").into(),
+                        None => i18n::pick(
+                            "Not linked to your Tapo account",
+                            "Tapo hesabınıza bağlı değil",
+                        )
+                        .into(),
                     },
                     room: room.into(),
                     has_thumb: thumb.is_some(),
@@ -1442,10 +1558,10 @@ impl App {
                 if matches!(slot.status, crate::stream::Status::Retrying(_)) && live.unused_since.is_none() {
                     gave_up.push(key.0);
                 }
-                let badge = if status.contains("offline") {
-                    "Offline"
-                } else if status.contains("Privacy mode is on") {
-                    "Privacy mode"
+                let badge = if status.contains("offline") || status.contains("çevrimdışı") {
+                    i18n::pick("Offline", "Çevrimdışı")
+                } else if status.contains("Privacy mode is on") || status.contains("Gizlilik modu") {
+                    i18n::pick("Privacy mode", "Gizlilik modu")
                 } else {
                     ""
                 };
@@ -1795,6 +1911,7 @@ impl App {
             })
             .collect();
         b.set_cameras(ModelRc::new(VecModel::from(rows)));
+        b.set_single_can_switch(cfg.cameras.len() > 1);
 
         let tile_cam = self.tile_audio_cam.get();
         let tiles: Vec<Tile> = cfg
@@ -1850,9 +1967,11 @@ impl App {
     /// Fills the camera form's "Tapo camera" list and selects `selected`.
     fn set_cloud_choices(&self, selected: Option<&str>) {
         let list = self.known_cloud_cameras();
-        let labels = std::iter::once("Not linked".to_string()).chain(list.iter().map(|c| match c.model.as_str() {
-            "" => c.name.clone(),
-            model => format!("{} ({model})", c.name),
+        let labels = std::iter::once(i18n::pick("Not linked", "Bağlı değil").to_string()).chain(list.iter().map(|c| {
+            match c.model.as_str() {
+                "" => c.name.clone(),
+                model => format!("{} ({model})", c.name),
+            }
         }));
         let index = selected.and_then(|id| list.iter().position(|c| c.device_id == id)).map_or(0, |i| i as i32 + 1);
         let ui = self.ui();
@@ -1878,7 +1997,11 @@ impl App {
         let b = ui.global::<Bridge>();
         let Some(cloud) = self.selected_cloud_camera() else {
             b.set_cam_error(
-                "Pick the camera on your Tapo account. Sign in under “Tapo account” to list your cameras.".into(),
+                i18n::pick(
+                    "Pick the camera on your Tapo account. Sign in under “Tapo account” to list your cameras.",
+                    "Tapo hesabınızdaki kamerayı seçin. Kameralarınızı listelemek için “Tapo hesabı” altından giriş yapın.",
+                )
+                .into(),
             );
             return;
         };
@@ -1907,7 +2030,7 @@ impl App {
         b.set_cam_editing(-1);
         self.refresh_camera_lists();
         self.sync_streams();
-        self.status("Camera saved.");
+        self.status(i18n::pick("Camera saved.", "Kamera kaydedildi."));
     }
 
     fn delete_camera(&self, id: u32) {
@@ -2073,13 +2196,20 @@ impl App {
                         if let Some(info) = app.hub_info.borrow_mut().get_mut(&id) {
                             info.loop_recording = Some(now);
                         }
-                        app.status(if now { "Loop recording turned on." } else { "Loop recording turned off." });
+                        app.status(if now {
+                            i18n::pick("Loop recording turned on.", "Döngüsel kayıt açıldı.")
+                        } else {
+                            i18n::pick("Loop recording turned off.", "Döngüsel kayıt kapatıldı.")
+                        });
                     }
                     Err(e) => {
                         if e.is_auth() {
                             app.cloud_auth_failed();
                         }
-                        app.status(format!("Could not change loop recording: {e}"));
+                        app.status(format!(
+                            "{}: {e}",
+                            i18n::pick("Could not change loop recording", "Döngüsel kayıt değiştirilemedi")
+                        ));
                     }
                 }
                 app.refresh_hub_lists();
@@ -2102,17 +2232,20 @@ impl App {
                     Ok(now) => {
                         if now {
                             app.hub_alarms.borrow_mut().insert(id);
-                            app.status("Hub alarm triggered.");
+                            app.status(i18n::pick("Hub alarm triggered.", "Hub alarmı başlatıldı."));
                         } else {
                             app.hub_alarms.borrow_mut().remove(&id);
-                            app.status("Hub alarm stopped.");
+                            app.status(i18n::pick("Hub alarm stopped.", "Hub alarmı durduruldu."));
                         }
                     }
                     Err(e) => {
                         if e.is_auth() {
                             app.cloud_auth_failed();
                         }
-                        app.status(format!("Could not toggle hub alarm: {e}"));
+                        app.status(format!(
+                            "{}: {e}",
+                            i18n::pick("Could not toggle hub alarm", "Hub alarmı değiştirilemedi")
+                        ));
                     }
                 }
                 app.refresh_hub_lists();
@@ -2140,16 +2273,24 @@ impl App {
         let session = self.cloud_client().and_then(|c| c.session());
         b.set_cloud_signed_in(session.is_some());
         let status = match (&self.cloud, &session) {
-            (Err(e), _) => format!("Tapo cloud unavailable: {e}"),
+            (Err(e), _) => format!("{}: {e}", i18n::pick("Tapo cloud unavailable", "Tapo bulutuna ulaşılamıyor")),
             (Ok(_), Some(s)) => {
                 let region = url::Url::parse(&s.base_url).ok().and_then(|u| u.host_str().map(str::to_string));
                 let account = self.cfg.borrow().cloud.account.clone();
                 match region {
-                    Some(region) => format!("Signed in as {account} ({region})"),
-                    None => format!("Signed in as {account}"),
+                    Some(region) => if i18n::is_tr() {
+                        format!("{account} olarak giriş yapıldı ({region})")
+                    } else {
+                        format!("Signed in as {account} ({region})")
+                    },
+                    None => if i18n::is_tr() {
+                        format!("{account} olarak giriş yapıldı")
+                    } else {
+                        format!("Signed in as {account}")
+                    },
                 }
             }
-            (Ok(_), None) => "Not signed in".to_string(),
+            (Ok(_), None) => i18n::pick("Not signed in", "Giriş yapılmadı").to_string(),
         };
         b.set_cloud_status(status.into());
         let account = if session.is_some() { self.cfg.borrow().cloud.account.clone() } else { String::new() };
@@ -2189,7 +2330,10 @@ impl App {
             return;
         }
         if !user.contains('@') {
-            self.login_error("Enter the email address of your TP-Link ID.");
+            self.login_error(i18n::pick(
+                "Enter the email address of your TP-Link ID.",
+                "TP-Link Kimliğinizin e-posta adresini girin.",
+            ));
             return;
         }
         self.start_login(user, pass, b.get_login_remember());
@@ -2199,7 +2343,10 @@ impl App {
         let client = match &self.cloud {
             Ok(client) => client.clone(),
             Err(e) => {
-                self.login_error(format!("Tapo cloud unavailable: {e}"));
+                self.login_error(format!(
+                    "{}: {e}",
+                    i18n::pick("Tapo cloud unavailable", "Tapo bulutuna ulaşılamıyor")
+                ));
                 return;
             }
         };
@@ -2276,16 +2423,24 @@ impl App {
                 b.set_mfa_resend_seconds(60);
                 b.set_mfa_sent_to(
                     match method {
-                        MfaMethod::App => {
-                            "A verification code has been sent via Tapo push notification to your trusted devices."
-                                .to_string()
-                        }
-                        MfaMethod::Email => format!("A verification code has been sent to {user}."),
+                        MfaMethod::App => i18n::pick(
+                            "A verification code has been sent via Tapo push notification to your trusted devices.",
+                            "Güvenilir cihazlarınıza Tapo bildirimiyle bir doğrulama kodu gönderildi.",
+                        )
+                        .to_string(),
+                        MfaMethod::Email => if i18n::is_tr() {
+                            format!("{user} adresine bir doğrulama kodu gönderildi.")
+                        } else {
+                            format!("A verification code has been sent to {user}.")
+                        },
                     }
                     .into(),
                 );
             }
-            Err(e) => self.login_error(format!("Could not send the code: {e}")),
+            Err(e) => self.login_error(format!(
+                "{}: {e}",
+                i18n::pick("Could not send the code", "Kod gönderilemedi")
+            )),
         }
         // Offer the other way of getting a code, if the account has one.
         let other = match method {
@@ -2295,8 +2450,8 @@ impl App {
         if methods.contains(&other) {
             b.set_mfa_switch_label(
                 match other {
-                    MfaMethod::Email => "Receive Code via Email",
-                    MfaMethod::App => "Receive Code via Tapo App",
+                    MfaMethod::Email => i18n::pick("Receive Code via Email", "Kodu E-posta ile Al"),
+                    MfaMethod::App => i18n::pick("Receive Code via Tapo App", "Kodu Tapo Uygulamasıyla Al"),
                 }
                 .into(),
             );
@@ -2440,6 +2595,7 @@ impl App {
         b.set_batch_mode(false);
         b.set_batch_selected_count(0);
         b.set_faces(ModelRc::default());
+        b.set_face_search(SharedString::new());
         b.set_face_tracks(ModelRc::default());
         b.set_selected_face_id(SharedString::new());
         b.set_selected_face_title(SharedString::new());
@@ -2464,11 +2620,14 @@ impl App {
 
     fn cloud_refresh(&self) {
         let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
-            self.cloud_message("Sign in first.");
+            self.cloud_message(i18n::pick("Sign in first.", "Önce giriş yapın."));
             return;
         };
         self.set_cloud_busy(true);
-        self.cloud_message("Loading the cameras on your Tapo account…");
+        self.cloud_message(i18n::pick(
+            "Loading the cameras on your Tapo account…",
+            "Tapo hesabınızdaki kameralar yükleniyor…",
+        ));
         // ⟳ on Home also takes new pictures of the cameras.
         if self.ui().global::<Bridge>().get_page() == Page::Home {
             for thumb in self.thumbnails.borrow_mut().values_mut() {
@@ -2553,7 +2712,13 @@ impl App {
                 return;
             }
             Err(e) => {
-                self.cloud_message(format!("Could not load the cameras on your Tapo account: {e}"));
+                self.cloud_message(format!(
+                    "{}: {e}",
+                    i18n::pick(
+                        "Could not load the cameras on your Tapo account",
+                        "Tapo hesabınızdaki kameralar yüklenemedi",
+                    )
+                ));
                 return;
             }
         };
@@ -2569,16 +2734,30 @@ impl App {
         self.refresh_camera_lists();
         self.sync_streams();
 
-        let mut msg = format!("{} camera(s) on your Tapo account.", list.len());
+        let mut msg = if i18n::is_tr() {
+            format!("Tapo hesabınızda {} kamera bulundu.", list.len())
+        } else {
+            format!("{} camera(s) on your Tapo account.", list.len())
+        };
         if !linked.is_empty() {
-            msg += &format!(" Linked {} camera(s) you already had, matched by name.", linked.len());
+            if i18n::is_tr() {
+                msg += &format!(" Ad eşleşmesiyle {} mevcut kamera bağlandı.", linked.len());
+            } else {
+                msg += &format!(" Linked {} camera(s) you already had, matched by name.", linked.len());
+            }
         }
         if added > 0 {
-            msg += &format!(" Added {added} camera(s).");
+            if i18n::is_tr() {
+                msg += &format!(" {added} kamera eklendi.");
+            } else {
+                msg += &format!(" Added {added} camera(s).");
+            }
             let unlinked = self.cfg.borrow().cameras.iter().any(|c| c.cloud.is_none());
             if unlinked {
-                msg += " If one of them duplicates a camera you already have, remove it and pick its \
-                        Tapo camera in that camera's settings instead.";
+                msg += i18n::pick(
+                    " If one of them duplicates a camera you already have, remove it and pick its Tapo camera in that camera's settings instead.",
+                    " Bunlardan biri mevcut bir kameranın kopyasıysa, onu kaldırıp diğer kameranın ayarlarından Tapo kamerasını seçin.",
+                );
             }
         }
         self.cloud_message(msg);
@@ -2613,7 +2792,10 @@ impl App {
             Ok(Login::Done(session)) => {
                 self.save_cloud_session(user, &session);
                 self.refresh_cloud_ui();
-                self.status("Signed in to the Tapo cloud again.");
+                self.status(i18n::pick(
+                    "Signed in to the Tapo cloud again.",
+                    "Tapo bulutuna tekrar giriş yapıldı.",
+                ));
                 // What failed with the old session: the hubs, homes and rooms.
                 if !self.hub_info_tried.get()
                     && let Some(client) = self.cloud_client()
@@ -2640,7 +2822,13 @@ impl App {
         if let Some((_, pass)) = self.cloud_creds() {
             b.set_login_password(pass.into());
         }
-        self.show_sign_in(1, "Your Tapo session has expired. Log in again.");
+        self.show_sign_in(
+            1,
+            i18n::pick(
+                "Your Tapo session has expired. Log in again.",
+                "Tapo oturumunuzun süresi doldu. Tekrar giriş yapın.",
+            ),
+        );
     }
 
     // ------------------------------------------------------------ recordings
@@ -2668,19 +2856,30 @@ impl App {
         self.update_calendar();
         self.refresh_timeline();
         let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
-            b.set_hub_message("Sign in to your Tapo account first.".into());
+            b.set_hub_message(
+                i18n::pick("Sign in to your Tapo account first.", "Önce Tapo hesabınızla giriş yapın.").into(),
+            );
             return;
         };
         let Some(hub) = self.selected_hub() else {
             b.set_hub_message(
-                "There's no H500 or H200 hub on your Tapo account. If you've just added one in the Tapo app, \
-                 press ⟳ to look again."
-                    .into(),
+                i18n::pick(
+                    "There's no H500 or H200 hub on your Tapo account. If you've just added one in the Tapo app, press ⟳ to look again.",
+                    "Tapo hesabınızda H500 veya H200 hub bulunamadı. Tapo uygulamasına yeni eklediyseniz tekrar bakmak için ⟳ tuşuna basın.",
+                )
+                .into(),
             );
             return;
         };
         b.set_hub_busy(true);
-        b.set_hub_message(format!("Asking {} for its cameras…", hub.name).into());
+        b.set_hub_message(
+            if i18n::is_tr() {
+                format!("{} kameraları isteniyor…", hub.name)
+            } else {
+                format!("Asking {} for its cameras…", hub.name)
+            }
+            .into(),
+        );
         self.rt.spawn(async move {
             let result = client.hub_cameras(&hub).await;
             on_ui(move |app| app.hub_connected(generation, hub, result));
@@ -2700,14 +2899,25 @@ impl App {
                 if e.is_auth() {
                     self.cloud_auth_failed();
                 }
-                b.set_hub_message(format!("Could not reach {}: {e}", hub.name).into());
+                b.set_hub_message(
+                    if i18n::is_tr() {
+                        format!("{} cihazına ulaşılamadı: {e}", hub.name)
+                    } else {
+                        format!("Could not reach {}: {e}", hub.name)
+                    }
+                    .into(),
+                );
                 return;
             }
         };
         b.set_hub_message(match cameras.len() {
-            0 => "No cameras are paired with this hub yet (pair them in the Tapo app).".into(),
-            1 => "1 camera".into(),
-            n => format!("{n} cameras").into(),
+            0 => i18n::pick(
+                "No cameras are paired with this hub yet (pair them in the Tapo app).",
+                "Bu hub ile eşleştirilmiş kamera yok (Tapo uygulamasından eşleştirin).",
+            )
+            .into(),
+            1 => i18n::pick("1 camera", "1 kamera").into(),
+            n => if i18n::is_tr() { format!("{n} kamera") } else { format!("{n} cameras") }.into(),
         });
         let mut names = Vec::with_capacity(cameras.len() + 1);
         if cameras.len() > 1 {
@@ -2766,7 +2976,10 @@ impl App {
         });
         self.navigate(Page::Recordings);
         if self.cfg.borrow().hubs.is_empty() {
-            self.status("Recordings are played from the H500 hub, and there's none on your Tapo account.");
+            self.status(i18n::pick(
+                "Recordings are played from the H500 hub, and there's none on your Tapo account.",
+                "Kayıtlar H500 hub üzerinden oynatılır, ancak Tapo hesabınızda hub bulunamadı.",
+            ));
             return;
         }
         *self.pending_rec_camera.borrow_mut() = wanted;
@@ -2797,7 +3010,11 @@ impl App {
         let Some((device_id, name, play_at)) = self.pending_rec_camera.borrow_mut().take() else { return };
         match self.rec_camera_combo_index(&device_id, &name) {
             Some(i) => self.ui().global::<Bridge>().set_rec_camera(i),
-            None => self.status(format!("{name} isn't paired with this hub; pick a camera.")),
+            None => self.status(if i18n::is_tr() {
+                format!("{name} bu hub ile eşleştirilmemiş; bir kamera seçin.")
+            } else {
+                format!("{name} isn't paired with this hub; pick a camera.")
+            }),
         }
         self.player_stop();
         {
@@ -3031,10 +3248,17 @@ impl App {
         }
         b.set_rec_message(
             if total == 0 {
-                "No detected events across your cameras on this day.".into()
+                i18n::pick(
+                    "No detected events across your cameras on this day.",
+                    "Bu gün kameralarınızda algılanan olay yok.",
+                )
             } else {
-                "Click any event to jump straight to that camera's recording.".into()
-            },
+                i18n::pick(
+                    "Click any event to jump straight to that camera's recording.",
+                    "O kameranın kaydına geçmek için herhangi bir olaya tıklayın.",
+                )
+            }
+            .into(),
         );
         self.rebuild_rec_rows();
         self.refresh_rec_rows();
@@ -3053,7 +3277,12 @@ impl App {
                 let total: i64 = clips.iter().map(Clip::seconds).sum();
                 b.set_rec_message(match clips.len() {
                     0 => SharedString::new(),
-                    _ => format!("{} recorded this day", fmt_duration(total as u64)).into(),
+                    _ => if i18n::is_tr() {
+                        format!("Bu gün {} kayıt var", fmt_duration(total as u64))
+                    } else {
+                        format!("{} recorded this day", fmt_duration(total as u64))
+                    }
+                    .into(),
                 });
                 // Days with recordings: today's are known now even if the
                 // month's search came back empty.
@@ -3072,7 +3301,9 @@ impl App {
                 }
                 self.hub.borrow_mut().pending_play_at = None;
                 b.set_rec_list_title(SharedString::new());
-                b.set_rec_message(format!("Could not list the recordings: {e}").into());
+                b.set_rec_message(
+                    format!("{}: {e}", i18n::pick("Could not list the recordings", "Kayıtlar listelenemedi")).into(),
+                );
             }
         }
         self.rebuild_rec_rows();
@@ -3745,6 +3976,19 @@ impl App {
                 {
                     self.selected_face.set(None);
                 }
+                // After midnight when today has no sightings yet, start on the most recent
+                // day any person was actually seen so the timeline isn't blank on arrival.
+                let today = Local::now().date_naive();
+                if self.selected_face.get().is_none() && self.face_track_date.get() == today {
+                    let latest_ts = self.faces.borrow().iter().map(FaceInfo::last_seen).max().unwrap_or(0);
+                    if latest_ts > 0 {
+                        let seen_day = local_time(latest_ts).date_naive();
+                        if seen_day < today {
+                            self.face_track_date.set(seen_day);
+                            self.update_face_track_date_label();
+                        }
+                    }
+                }
                 self.refresh_faces_ui();
                 self.load_face_tracks();
                 self.fetch_face_photos();
@@ -3785,13 +4029,14 @@ impl App {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
         let filter = FaceFilter::from_index(b.get_face_filter());
+        let query = b.get_face_search();
         let selected_id = self.selected_face.get();
         let hub_id = self.faces_loaded_hub.borrow().clone().unwrap_or_default();
         let photos = self.face_photos.borrow();
         let faces = self.faces.borrow();
         let rows: Vec<FaceRow> = faces
             .iter()
-            .filter(|f| filter.matches(f))
+            .filter(|f| filter.matches(f) && face_matches_query(&Self::face_display_name(f), f.face_id, query.as_str()))
             .map(|f| {
                 let name = Self::face_display_name(f);
                 let initial = name
@@ -3822,13 +4067,21 @@ impl App {
         let empty = rows.is_empty();
         b.set_faces(ModelRc::new(VecModel::from(rows)));
         if empty {
+            let trimmed = query.trim();
             let msg = if faces.is_empty() {
                 i18n::pick(
                     "No recognized faces yet. Enable Facial Recognition on your H500 HomeBase in the Tapo app.",
                     "Henüz tanınan yüz yok. Tapo uygulamasından H500 HomeBase için Yüz Tanıma'yı etkinleştirin.",
                 )
+                .to_string()
+            } else if !trimmed.is_empty() {
+                if i18n::is_tr() {
+                    format!("“{trimmed}” ile eşleşen kişi yok.")
+                } else {
+                    format!("No people match “{trimmed}”.")
+                }
             } else {
-                i18n::pick("No people match this filter.", "Bu filtreye uyan kişi yok.")
+                i18n::pick("No people match this filter.", "Bu filtreye uyan kişi yok.").to_string()
             };
             b.set_faces_message(msg.into());
         } else {
@@ -3858,14 +4111,26 @@ impl App {
         // Clicking the already-selected person clears selection back to "All people".
         let next = if parsed.is_some() && parsed == self.selected_face.get() { None } else { parsed };
         self.selected_face.set(next);
+        let mut jump_day = None;
         if let Some(id) = next
             && let Some(face) = self.faces.borrow().iter().find(|f| f.face_id == id)
         {
             b.set_face_edit_name(face.name.as_str().into());
             b.set_face_edit_familiar(face.tag.is_familiar());
+            let ts = face.last_seen();
+            if ts > 0 {
+                let seen_day = local_time(ts).date_naive().min(Local::now().date_naive());
+                if seen_day != self.face_track_date.get() {
+                    jump_day = Some(seen_day);
+                }
+            }
         } else {
             b.set_face_edit_name(SharedString::new());
             b.set_face_edit_familiar(false);
+        }
+        if let Some(day) = jump_day {
+            self.face_track_date.set(day);
+            self.update_face_track_date_label();
         }
         self.refresh_faces_ui();
         self.load_face_tracks();
@@ -4240,11 +4505,17 @@ impl App {
             return;
         }
         let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
-            self.status("ffmpeg not found: playing recordings needs it (see Settings › Video & display).");
+            self.status(i18n::pick(
+                "FFmpeg is missing; cannot play recordings.",
+                "FFmpeg bulunamadı; kayıtlar oynatılamıyor.",
+            ));
             return;
         };
         let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else {
-            self.status("Sign in to your Tapo account first.");
+            self.status(i18n::pick(
+                "Sign in to your Tapo account first.",
+                "Önce Tapo hesabınızla giriş yapın.",
+            ));
             return;
         };
         let (Some(hub), clips) = ({
@@ -4254,7 +4525,7 @@ impl App {
             return;
         };
         if clips.is_empty() {
-            self.status("There are no recordings on this day.");
+            self.status(i18n::pick("There are no recordings on this day.", "Bu güne ait kayıt yok."));
             return;
         }
         let source = Source {
@@ -4280,7 +4551,9 @@ impl App {
         b.set_player_open(true);
         b.set_player_has_frame(false);
         b.set_player_frame(Image::default());
-        b.set_player_title(format!("{} · {}", camera.name, date.format("%a %d %b %Y")).into());
+        b.set_player_title(
+            format!("{} · {:02} {} {}", camera.name, date.day(), i18n::short_month(date.month()), date.year()).into(),
+        );
         b.set_player_paused(false);
         self.timeline.borrow_mut().touched = None;
         self.sync_timer();
@@ -4356,7 +4629,10 @@ impl App {
         b.set_tl_playhead(-1.0);
         if self.recording_from.take().is_some() {
             b.set_player_recording(false);
-            self.status("Recording stopped without saving: the player was closed.");
+            self.status(i18n::pick(
+                "Recording stopped without saving: the player was closed.",
+                "Kayıt kaydedilmeden durduruldu: oynatıcı kapatıldı.",
+            ));
         }
         if b.get_fullscreen() {
             self.set_fullscreen(false);
@@ -4428,7 +4704,7 @@ impl App {
             (w.playback.latest_frame(), w.playback.state.lock().unwrap().position_ms)
         };
         let Some(frame) = frame else {
-            self.status("No picture yet.");
+            self.status(i18n::pick("No picture yet.", "Henüz görüntü yok."));
             return;
         };
         let name = self.selected_rec_camera().map(|c| c.name).unwrap_or_default();
@@ -4571,7 +4847,10 @@ impl App {
         b.set_player_recording(false);
         let (start, end) = (from.min(position), from.max(position));
         if end - start < 1000 {
-            self.status("Nothing recorded: play on, or jump ahead, before pressing Record again.");
+            self.status(i18n::pick(
+                "Nothing recorded: play on, or jump ahead, before pressing Record again.",
+                "Hiçbir şey kaydedilmedi: Kaydet'e tekrar basmadan önce oynatın veya ileri atlayın.",
+            ));
             return;
         }
         self.save_range(start, end);
@@ -4594,11 +4873,14 @@ impl App {
             c
         };
         if clips.is_empty() {
-            self.status("There's no recording in that stretch.");
+            self.status(i18n::pick("There's no recording in that stretch.", "Bu aralıkta kayıt yok."));
             return;
         }
         let Some(ffmpeg) = self.ffmpeg.borrow().clone() else {
-            self.status("FFmpeg is missing; cannot export MP4.");
+            self.status(i18n::pick(
+                "FFmpeg is missing; cannot export MP4.",
+                "FFmpeg bulunamadı; MP4 dışa aktarılamıyor.",
+            ));
             return;
         };
         let first = local_time(start_ms / 1000);
@@ -4617,7 +4899,7 @@ impl App {
                 on_ui(move |app| app.set_download_status(row, msg, false));
             })
             .await;
-            let (text, done) = match &result {
+            let (text, done, toast) = match &result {
                 Ok(from_memory) => {
                     let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
                     let how = if *from_memory {
@@ -4625,11 +4907,21 @@ impl App {
                     } else {
                         ""
                     };
-                    (format!("{} · {mb:.1} MB{how}", i18n::pick("Saved", "Kaydedildi")), true)
+                    let toast = if i18n::is_tr() {
+                        format!("MP4 kaydedildi · {mb:.1} MB (Videolar\\Tapas)")
+                    } else {
+                        format!("Saved MP4 clip · {mb:.1} MB (Videos\\Tapas)")
+                    };
+                    (format!("{} · {mb:.1} MB{how}", i18n::pick("Saved", "Kaydedildi")), true, Some(toast))
                 }
-                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false),
+                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false, None),
             };
-            on_ui(move |app| app.set_download_status(row, text, done));
+            on_ui(move |app| {
+                app.set_download_status(row, text, done);
+                if let Some(toast) = toast {
+                    app.status_with_path(toast, &path);
+                }
+            });
         });
     }
 
@@ -4822,16 +5114,24 @@ impl App {
                 on_ui(move |app| app.set_download_status(row, msg, false));
             })
             .await;
-            let (text, done) = match &result {
+            let (text, done, toast) = match &result {
                 Ok(()) => {
                     let mb = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
-                    (format!("{} · {mb:.1} MB", i18n::pick("Saved", "Kaydedildi")), true)
+                    let toast = if i18n::is_tr() {
+                        format!("MP4 kaydedildi · {mb:.1} MB (Videolar\\Tapas)")
+                    } else {
+                        format!("Saved MP4 clip · {mb:.1} MB (Videos\\Tapas)")
+                    };
+                    (format!("{} · {mb:.1} MB", i18n::pick("Saved", "Kaydedildi")), true, Some(toast))
                 }
-                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false),
+                Err(e) => (format!("{}: {e:#}", i18n::pick("Failed", "Başarısız")), false, None),
             };
             let auth = result.as_ref().err().and_then(|e| e.downcast_ref::<cloud::CloudError>()).is_some_and(|e| e.is_auth());
             on_ui(move |app| {
                 app.set_download_status(row, text, done);
+                if let Some(toast) = toast {
+                    app.status_with_path(toast, &path);
+                }
                 if auth {
                     app.cloud_auth_failed();
                 }
@@ -5306,6 +5606,28 @@ mod tests {
         assert_eq!(skip_target_ms(10_000, 10, 5_000, 50_000), 20_000);
         assert_eq!(skip_target_ms(45_000, 30, 5_000, 50_000), 50_000);
     }
+
+    #[test]
+    fn step_camera_id_wraps_and_handles_single_camera() {
+        assert_eq!(step_camera_id(&[], 1, 1), None);
+        assert_eq!(step_camera_id(&[10], 10, 1), None);
+        assert_eq!(step_camera_id(&[10, 20, 30], 10, 1), Some(20));
+        assert_eq!(step_camera_id(&[10, 20, 30], 30, 1), Some(10));
+        assert_eq!(step_camera_id(&[10, 20, 30], 10, -1), Some(30));
+        assert_eq!(step_camera_id(&[10, 20, 30], 20, -1), Some(10));
+        assert_eq!(step_camera_id(&[10, 20, 30], 99, 1), None);
+    }
+
+    #[test]
+    fn face_matches_query_checks_name_and_id() {
+        assert!(face_matches_query("Yabancı #25", 25, ""));
+        assert!(face_matches_query("Yabancı #25", 25, "   "));
+        assert!(face_matches_query("Ömer Yılmaz", 7, "ömer"));
+        assert!(face_matches_query("Ömer Yılmaz", 7, "YILMAZ"));
+        assert!(face_matches_query("İbrahim", 8, "ibrahim"));
+        assert!(face_matches_query("Stranger #25", 25, "25"));
+        assert!(!face_matches_query("Stranger #25", 25, "ali"));
+    }
 }
 
 fn step_speed_index(current: i32, delta: i32, len: usize) -> i32 {
@@ -5317,4 +5639,37 @@ fn step_speed_index(current: i32, delta: i32, len: usize) -> i32 {
 
 fn skip_target_ms(position_ms: i64, delta_secs: i32, day_start_ms: i64, day_end_ms: i64) -> i64 {
     position_ms.saturating_add(delta_secs as i64 * 1000).clamp(day_start_ms, day_end_ms)
+}
+
+/// Cycles to the previous (`-1`) or next (`+1`) camera ID, wrapping around.
+fn step_camera_id(ids: &[u32], current: u32, delta: i32) -> Option<u32> {
+    if ids.len() < 2 {
+        return None;
+    }
+    let pos = ids.iter().position(|&id| id == current)?;
+    let next = (pos as isize + delta as isize).rem_euclid(ids.len() as isize) as usize;
+    Some(ids[next])
+}
+
+/// Normalizes text for case-insensitive People search, folding Turkish `I`/`İ`/`ı` -> `i`.
+fn fold_search(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.to_lowercase().chars() {
+        match c {
+            'ı' => out.push('i'),
+            '\u{0307}' => {} // combining dot above from `İ`.to_lowercase()
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Case-insensitive People search matching either the display name or face ID.
+fn face_matches_query(display_name: &str, face_id: i64, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    let q_folded = fold_search(q);
+    fold_search(display_name).contains(&q_folded) || face_id.to_string().contains(&q_folded)
 }

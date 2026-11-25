@@ -156,7 +156,11 @@ async fn run(source: Source, mut sink: FrameSink, state: Arc<Mutex<PlayState>>, 
                 let mut s = state.lock().unwrap();
                 s.ended = true;
                 s.buffering = false;
-                s.message = "No more recordings on this day".into();
+                s.message = crate::i18n::pick(
+                    "No more recordings on this day",
+                    "Bu gün için başka kayıt yok",
+                )
+                .into();
             }
             match wait_for_seek(&mut cmds, &state).await {
                 Some(t) => {

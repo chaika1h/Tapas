@@ -166,6 +166,12 @@ pub struct AppConfig {
     /// The GitHub repository ("owner/name") whose releases are the updates;
     /// empty for the default.
     pub update_repo: String,
+    /// Last saved logical window width (0 = default).
+    pub window_width: u32,
+    /// Last saved logical window height (0 = default).
+    pub window_height: u32,
+    /// Whether the window was maximized when closed.
+    pub window_maximized: bool,
 }
 
 impl AppConfig {
@@ -175,6 +181,15 @@ impl AppConfig {
 
     pub fn camera(&self, id: u32) -> Option<&CameraConfig> {
         self.cameras.iter().find(|c| c.id == id)
+    }
+
+    /// Validated saved logical window dimensions, or `None` to use the default size.
+    pub fn saved_window_size(&self) -> Option<(u32, u32)> {
+        if (760..=7680).contains(&self.window_width) && (480..=4320).contains(&self.window_height) {
+            Some((self.window_width, self.window_height))
+        } else {
+            None
+        }
     }
 }
 
@@ -292,5 +307,17 @@ mod tests {
         assert_eq!(d3d.renderer, Renderer::OpenGL);
         assert_eq!(vk.renderer, Renderer::OpenGL);
         assert_eq!(sw.renderer, Renderer::Software);
+    }
+
+    #[test]
+    fn saved_window_size_validates_bounds() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.saved_window_size(), None);
+        cfg.window_width = 400;
+        cfg.window_height = 300;
+        assert_eq!(cfg.saved_window_size(), None);
+        cfg.window_width = 1440;
+        cfg.window_height = 900;
+        assert_eq!(cfg.saved_window_size(), Some((1440, 900)));
     }
 }

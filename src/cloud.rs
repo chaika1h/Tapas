@@ -282,11 +282,11 @@ impl NightVisionMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Auto",
-            Self::Day => "Day",
-            Self::Infrared => "Infrared",
-            Self::Color => "Color",
-            Self::Smart => "Smart",
+            Self::Auto => crate::i18n::pick("Auto", "Otomatik"),
+            Self::Day => crate::i18n::pick("Day", "Gündüz"),
+            Self::Infrared => crate::i18n::pick("Infrared", "Kızılötesi"),
+            Self::Color => crate::i18n::pick("Color", "Renkli"),
+            Self::Smart => crate::i18n::pick("Smart", "Akıllı"),
         }
     }
 }
