@@ -47,11 +47,11 @@ impl Slot {
 
     pub fn status_text(&self) -> String {
         match &self.status {
-            Status::Connecting => "Connecting…".into(),
+            Status::Connecting => crate::i18n::pick("Connecting…", "Bağlanıyor…").into(),
             Status::Retrying(msg) => msg.clone(),
             Status::Live => match &self.frame {
                 Some(f) => format!("{}×{} · {:.0} fps", f.width(), f.height(), self.fps),
-                None => "Live".into(),
+                None => crate::i18n::pick("Live", "Canlı").into(),
             },
         }
     }
@@ -187,7 +187,7 @@ async fn run(spec: StreamSpec, mut sink: FrameSink) {
         sink.set_status(Status::Connecting);
         let frames_before = sink.frames;
         let reason = match ffmpeg::run(&spec, &mut sink).await {
-            Ok(()) => "Stream ended".to_string(),
+            Ok(()) => crate::i18n::pick("Stream ended", "Yayın sona erdi").to_string(),
             Err(e) => {
                 if e.downcast_ref::<CloudError>().is_some_and(CloudError::is_auth) {
                     crate::app::on_ui(|app| app.cloud_auth_failed());
@@ -199,7 +199,12 @@ async fn run(spec: StreamSpec, mut sink: FrameSink) {
             backoff = MIN_BACKOFF; // it was working; reconnect quickly
         }
         log::warn!("{} ({:?}): {reason}; retrying in {backoff:?}", spec.camera.name, spec.quality);
-        sink.set_status(Status::Retrying(format!("{reason} — retrying in {}s", backoff.as_secs())));
+        let retry_msg = if crate::i18n::is_tr() {
+            format!("{reason} — {} sn içinde yeniden deneniyor", backoff.as_secs())
+        } else {
+            format!("{reason} — retrying in {}s", backoff.as_secs())
+        };
+        sink.set_status(Status::Retrying(retry_msg));
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }

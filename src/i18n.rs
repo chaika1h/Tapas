@@ -274,6 +274,14 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "Tapo hesabınızdaki kameralar listelendiğinde burada görünür: tekrar bakmak için Ana sayfadaki ⟳ tuşuna basın.",
     ));
     tr.set_back(t("Back", "Geri"));
+    tr.set_prev_camera(t("Previous camera (PgUp)", "Önceki kamera (PgUp)"));
+    tr.set_next_camera(t("Next camera (PgDn)", "Sonraki kamera (PgDn)"));
+    tr.set_recordings_of_prefix(t("Recordings · ", "Kayıtlar · "));
+    tr.set_watch_prefix(t("Watch · ", "İzle · "));
+    tr.set_skip_back(t("Back 10s (←)", "10 sn geri (←)"));
+    tr.set_skip_forward(t("Forward 10s (→)", "10 sn ileri (→)"));
+    tr.set_people_search_placeholder(t("Search people…", "Kişi ara…"));
+    tr.set_sc_cycle_cam(t("Switch camera in Single view", "Tek kamera görünümünde kamera değiştir"));
     tr.set_mute_audio(t("Mute audio (M)", "Sesi kapat (M)"));
     tr.set_listen_in(t("Listen in (M)", "Sesi aç (M)"));
     tr.set_sound_on(t("Sound On", "Ses Açık"));

@@ -148,45 +148,65 @@ async fn run(
                     // The relay stops sending while the lens is covered;
                     // reconnect so the picture comes back when it's uncovered.
                     crate::app::on_ui(move |app| app.privacy_changed(camera_id));
-                    Ok(if now { "Privacy mode is on." } else { "Privacy mode is off." }.to_string())
+                    Ok(if now {
+                        crate::i18n::pick("Privacy mode is on.", "Gizlilik modu açık.")
+                    } else {
+                        crate::i18n::pick("Privacy mode is off.", "Gizlilik modu kapalı.")
+                    }
+                    .to_string())
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::Spotlight(on) => match client.set_spotlight(&camera, on).await {
                 Ok(now) => {
                     state.lock().unwrap().spotlight = Some(now);
-                    Ok(if now { "Spotlight turned on." } else { "Spotlight turned off." }.to_string())
+                    Ok(if now {
+                        crate::i18n::pick("Spotlight turned on.", "Spot ışığı açıldı.")
+                    } else {
+                        crate::i18n::pick("Spotlight turned off.", "Spot ışığı kapatıldı.")
+                    }
+                    .to_string())
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::NightVision(mode) => match client.set_night_vision(&camera, mode).await {
                 Ok(now) => {
                     state.lock().unwrap().night_vision = Some(now);
-                    Ok(format!("Night vision: {}.", now.label()))
+                    Ok(format!("{}: {}.", crate::i18n::pick("Night vision", "Gece görüşü"), now.label()))
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::AutoTrack(on) => match client.set_auto_track(&camera, on).await {
                 Ok(now) => {
                     state.lock().unwrap().auto_track = Some(now);
-                    Ok(if now { "Auto-tracking is on." } else { "Auto-tracking is off." }.to_string())
+                    Ok(if now {
+                        crate::i18n::pick("Auto-tracking is on.", "Otomatik takip açık.")
+                    } else {
+                        crate::i18n::pick("Auto-tracking is off.", "Otomatik takip kapalı.")
+                    }
+                    .to_string())
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::Siren(on) => match client.set_camera_alarm(&camera, on).await {
                 Ok(now) => {
                     state.lock().unwrap().siren_on = Some(now);
-                    Ok(if now { "Siren triggered." } else { "Siren stopped." }.to_string())
+                    Ok(if now {
+                        crate::i18n::pick("Siren triggered.", "Siren çalıyor.")
+                    } else {
+                        crate::i18n::pick("Siren stopped.", "Siren durduruldu.")
+                    }
+                    .to_string())
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::Reboot => match client.reboot_device(&camera).await {
-                Ok(()) => Ok("Rebooting camera…".to_string()),
+                Ok(()) => Ok(crate::i18n::pick("Rebooting camera…", "Kamera yeniden başlatılıyor…").to_string()),
                 Err(e) => Err(e),
             },
             PtzCmd::Refresh if supported => load_presets(&client, &camera, &state).await.map(|_| String::new()),
             PtzCmd::Refresh => Ok(String::new()),
-            _ if !supported => Ok("This camera has no pan/tilt.".to_string()),
+            _ if !supported => Ok(crate::i18n::pick("This camera has no pan/tilt.", "Bu kamerada yönlendirme yok.").to_string()),
             PtzCmd::Move(x, y) => {
                 state.lock().unwrap().patrolling = false;
                 client.move_motor(&camera, x, y).await.map(|_| String::new())
@@ -195,8 +215,8 @@ async fn run(
                 Ok(()) => {
                     state.lock().unwrap().patrolling = true;
                     Ok(match axis {
-                        PatrolAxis::Horizontal => "Horizontal patrol started.",
-                        PatrolAxis::Vertical => "Vertical patrol started.",
+                        PatrolAxis::Horizontal => crate::i18n::pick("Horizontal patrol started.", "Yatay tarama başlatıldı."),
+                        PatrolAxis::Vertical => crate::i18n::pick("Vertical patrol started.", "Dikey tarama başlatıldı."),
                     }
                     .to_string())
                 }
@@ -205,20 +225,31 @@ async fn run(
             PtzCmd::PatrolStop => match client.stop_patrol(&camera).await {
                 Ok(()) => {
                     state.lock().unwrap().patrolling = false;
-                    Ok("Patrol stopped.".to_string())
+                    Ok(crate::i18n::pick("Patrol stopped.", "Tarama durduruldu.").to_string())
                 }
                 Err(e) => Err(e),
             },
             PtzCmd::Goto(id) => {
                 state.lock().unwrap().patrolling = false;
-                client.goto_preset(&camera, &id).await.map(|_| "Moving to preset…".into())
+                client
+                    .goto_preset(&camera, &id)
+                    .await
+                    .map(|_| crate::i18n::pick("Moving to preset…", "Konuma gidiliyor…").into())
             }
             PtzCmd::Save(name) => match client.save_preset(&camera, &name).await {
-                Ok(()) => load_presets(&client, &camera, &state).await.map(|_| format!("Saved preset “{name}”.")),
+                Ok(()) => load_presets(&client, &camera, &state).await.map(|_| {
+                    if crate::i18n::is_tr() {
+                        format!("“{name}” konumu kaydedildi.")
+                    } else {
+                        format!("Saved preset “{name}”.")
+                    }
+                }),
                 Err(e) => Err(e),
             },
             PtzCmd::DeletePreset(id) => match client.delete_preset(&camera, &id).await {
-                Ok(()) => load_presets(&client, &camera, &state).await.map(|_| "Preset deleted.".into()),
+                Ok(()) => load_presets(&client, &camera, &state)
+                    .await
+                    .map(|_| crate::i18n::pick("Preset deleted.", "Konum silindi.").into()),
                 Err(e) => Err(e),
             },
         };

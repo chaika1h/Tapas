@@ -93,6 +93,12 @@ export global Bridge {
     in-out property <bool> max-btn-hovered: false;
     in-out property <bool> max-btn-pressed: false;
     in property <string> status-text;
+    in property <string> status-action-path;
+    callback clear-status();
+    // hover tooltip rendered above all clipped containers
+    in-out property <string> tip-text;
+    in-out property <length> tip-x;
+    in-out property <length> tip-y;
     callback navigate(Page);
     callback toggle-fullscreen();
     callback escape();
@@ -120,6 +126,8 @@ export global Bridge {
 
     // single camera
     in property <string> single-name;
+    in property <bool> single-can-switch;
+    callback single-step-camera(int);
     in property <image> single-frame;
     in property <bool> single-has-frame;
     // The picture is the grid's or the last one, until the HD video comes.
@@ -314,6 +322,7 @@ export global Bridge {
     callback batch-cancel();
     // people / H500 facial recognition & cross-camera tracking
     in property <[FaceRow]> faces;
+    in-out property <string> face-search;
     in-out property <int> face-filter;
     in property <[string]> face-filter-labels: ["All", "Familiar", "Stranger"];
     in property <bool> faces-loading;
@@ -329,6 +338,7 @@ export global Bridge {
     in property <string> face-track-message;
     in property <[FaceTrackRow]> face-tracks;
     callback faces-refresh();
+    callback face-search-changed(string);
     callback face-filter-changed(int);
     callback face-select(string);
     callback face-save();
@@ -402,6 +412,14 @@ export global Tr {
     in-out property <string> no-cameras-title: "No cameras yet";
     in-out property <string> no-cameras-live: "The cameras on your Tapo account appear here once they've been listed: press ⟳ on Home to look again.";
     in-out property <string> back: "Back";
+    in-out property <string> prev-camera: "Previous camera (PgUp)";
+    in-out property <string> next-camera: "Next camera (PgDn)";
+    in-out property <string> recordings-of-prefix: "Recordings · ";
+    in-out property <string> watch-prefix: "Watch · ";
+    in-out property <string> skip-back: "Back 10s (←)";
+    in-out property <string> skip-forward: "Forward 10s (→)";
+    in-out property <string> people-search-placeholder: "Search people…";
+    in-out property <string> sc-cycle-cam: "Switch camera in Single view";
     in-out property <string> mute-audio: "Mute audio (M)";
     in-out property <string> listen-in: "Listen in (M)";
     in-out property <string> sound-on: "Sound On";
@@ -1166,7 +1184,19 @@ component RoundIconButton inherits Rectangle {
     ta := TouchArea {
         enabled: root.enabled;
         mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (self.has-hover && root.label != "") {
+                Bridge.tip-text = root.label;
+                Bridge.tip-x = root.absolute-position.x + root.width / 2;
+                Bridge.tip-y = root.absolute-position.y;
+            } else if (Bridge.tip-text == root.label) {
+                Bridge.tip-text = "";
+            }
+        }
+        clicked => {
+            Bridge.tip-text = "";
+            root.clicked();
+        }
     }
 }
 
@@ -1199,13 +1229,72 @@ component AccentChip inherits Rectangle {
     }
 }
 
-component StatusBar inherits Rectangle {
-    height: 26px;
-    background: Palette.alternate-background;
-    HorizontalLayout {
-        padding-left: 14px;
-        padding-right: 14px;
-        Muted { text: Bridge.status-text; vertical-alignment: center; wrap: no-wrap; overflow: elide; }
+// Floating notification pill shown over any page, including Single view & fullscreen.
+component FloatingToast inherits Rectangle {
+    in property <length> max-w: 580px;
+    width: min(self.max-w, row.preferred-width + 24px);
+    height: 40px;
+    border-radius: 20px;
+    background: #1b1b1fec;
+    border-width: 1px;
+    border-color: #ffffff28;
+    drop-shadow-blur: 16px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: #00000048;
+    row := HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 8px;
+        spacing: 10px;
+        alignment: center;
+        Text {
+            text: Bridge.status-text;
+            color: white;
+            font-size: 13px;
+            font-weight: 500;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if Bridge.status-action-path != "": VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 26px;
+                width: act-lbl.preferred-width + 18px;
+                border-radius: 13px;
+                background: act-ta.pressed ? Palette.accent-background.darker(0.15)
+                    : act-ta.has-hover ? Palette.accent-background.brighter(0.08)
+                    : Palette.accent-background;
+                act-lbl := Text {
+                    text: Tr.show-in-folder;
+                    color: Palette.accent-foreground;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                act-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        Bridge.show-in-folder(Bridge.status-action-path);
+                        Bridge.clear-status();
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 24px;
+                height: 24px;
+                border-radius: 12px;
+                background: cls-ta.has-hover ? #ffffff24 : transparent;
+                Icon { commands: Icons.close; width: 13px; height: 13px; color: #ffffffc0; }
+                cls-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { Bridge.clear-status(); }
+                }
+            }
+        }
     }
 }
 
@@ -1406,7 +1495,7 @@ component CameraCard inherits Rectangle {
             alignment: center;
             RoundIconButton {
                 icon: Icons.playback;
-                label: "Recordings of " + root.card.name;
+                label: Tr.recordings-of-prefix + root.card.name;
                 clicked => { root.playback(); }
             }
         }
@@ -1414,7 +1503,7 @@ component CameraCard inherits Rectangle {
             alignment: center;
             RoundIconButton {
                 icon: Icons.video;
-                label: "Watch " + root.card.name;
+                label: Tr.watch-prefix + root.card.name;
                 icon-color: Palette.accent-foreground;
                 base: Palette.accent-background;
                 clicked => { root.clicked(); }
@@ -2199,6 +2288,33 @@ component SinglePage inherits Rectangle {
                             icon-color: white;
                             base: #ffffff1a;
                             clicked => { Bridge.single-back(); }
+                        }
+                    }
+                    if Bridge.single-can-switch: HorizontalLayout {
+                        spacing: 4px;
+                        VerticalLayout {
+                            alignment: center;
+                            RoundIconButton {
+                                width: 32px;
+                                height: 32px;
+                                icon: Icons.chevron-left;
+                                label: Tr.prev-camera;
+                                icon-color: white;
+                                base: #ffffff1a;
+                                clicked => { Bridge.single-step-camera(-1); }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            RoundIconButton {
+                                width: 32px;
+                                height: 32px;
+                                icon: Icons.chevron-right;
+                                label: Tr.next-camera;
+                                icon-color: white;
+                                base: #ffffff1a;
+                                clicked => { Bridge.single-step-camera(1); }
+                            }
                         }
                     }
                     VerticalLayout {
@@ -3052,6 +3168,66 @@ component PlaybackPage inherits Rectangle {
                                     clicked => { Bridge.player-toggle-pause(); }
                                 }
                             }
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 36px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: sb-ta.pressed ? #ffffff40 : sb-ta.has-hover ? #ffffff2c : #ffffff18;
+                                    Text {
+                                        text: "-10s";
+                                        color: white;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    sb-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        changed has-hover => {
+                                            if (self.has-hover) {
+                                                Bridge.tip-text = Tr.skip-back;
+                                                Bridge.tip-x = parent.absolute-position.x + parent.width / 2;
+                                                Bridge.tip-y = parent.absolute-position.y;
+                                            } else if (Bridge.tip-text == Tr.skip-back) {
+                                                Bridge.tip-text = "";
+                                            }
+                                        }
+                                        clicked => { Bridge.tip-text = ""; Bridge.player-skip(-10); }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 36px;
+                                    height: 28px;
+                                    border-radius: 14px;
+                                    background: sf-ta.pressed ? #ffffff40 : sf-ta.has-hover ? #ffffff2c : #ffffff18;
+                                    Text {
+                                        text: "+10s";
+                                        color: white;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                    sf-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        changed has-hover => {
+                                            if (self.has-hover) {
+                                                Bridge.tip-text = Tr.skip-forward;
+                                                Bridge.tip-x = parent.absolute-position.x + parent.width / 2;
+                                                Bridge.tip-y = parent.absolute-position.y;
+                                            } else if (Bridge.tip-text == Tr.skip-forward) {
+                                                Bridge.tip-text = "";
+                                            }
+                                        }
+                                        clicked => { Bridge.tip-text = ""; Bridge.player-skip(10); }
+                                    }
+                                }
+                            }
                             Text {
                                 text: Bridge.player-time;
                                 color: white;
@@ -3587,6 +3763,11 @@ component PeoplePage inherits Rectangle {
                 VerticalLayout {
                     padding: 14px;
                     spacing: 10px;
+                    LineEdit {
+                        text <=> Bridge.face-search;
+                        placeholder-text: Tr.people-search-placeholder;
+                        edited(t) => { Bridge.face-search-changed(t); }
+                    }
                     HorizontalLayout {
                         spacing: 6px;
                         for f[i] in Bridge.face-filter-labels: Rectangle {
@@ -4077,6 +4258,7 @@ component SettingsPage inherits Rectangle {
                     for s[i] in [
                         { keys: "Ctrl + 1–5", desc: Tr.sc-nav },
                         { keys: "1–9", desc: Tr.sc-cam },
+                        { keys: "PgUp / PgDn", desc: Tr.sc-cycle-cam },
                         { keys: "Space", desc: Tr.sc-space },
                         { keys: "← / →", desc: Tr.sc-arrows },
                         { keys: "[ / ]", desc: Tr.sc-speed },
@@ -4412,6 +4594,16 @@ export component MainWindow inherits Window {
                     if (event.text == "8") { Bridge.open-camera-slot(7); return accept; }
                     if (event.text == "9") { Bridge.open-camera-slot(8); return accept; }
                 }
+                if (Bridge.page == Page.single) {
+                    if (event.text == Key.PageUp && Bridge.single-can-switch) {
+                        Bridge.single-step-camera(-1);
+                        return accept;
+                    }
+                    if (event.text == Key.PageDown && Bridge.single-can-switch) {
+                        Bridge.single-step-camera(1);
+                        return accept;
+                    }
+                }
                 if (Bridge.page == Page.single && Bridge.single-ptz) {
                     if (event.text == Key.LeftArrow) {
                         Bridge.ptz-move(-Bridge.ptz-step, 0);
@@ -4445,8 +4637,33 @@ export component MainWindow inherits Window {
                 if Bridge.page == Page.recordings: PlaybackPage { vertical-stretch: 1; }
                 if Bridge.page == Page.people: PeoplePage { vertical-stretch: 1; }
                 if Bridge.page == Page.settings: SettingsPage { vertical-stretch: 1; }
-                if !Bridge.fullscreen && Bridge.page != Page.single: StatusBar { }
             }
+        }
+    }
+
+    if Bridge.status-text != "": FloatingToast {
+        max-w: min(580px, parent.width - 32px);
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - (Bridge.page == Page.recordings && Bridge.player-open ? 72px : 22px);
+    }
+
+    if Bridge.tip-text != "": Rectangle {
+        property <length> w: tip-lbl.preferred-width + 18px;
+        x: max(8px, min(parent.width - self.w - 8px, Bridge.tip-x - self.w / 2));
+        y: Bridge.tip-y > 46px ? Bridge.tip-y - 34px : Bridge.tip-y + 46px;
+        width: self.w;
+        height: 28px;
+        border-radius: 7px;
+        background: #1b1b1fe8;
+        border-width: 1px;
+        border-color: #ffffff28;
+        tip-lbl := Text {
+            text: Bridge.tip-text;
+            color: white;
+            font-size: 12px;
+            font-weight: 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
 

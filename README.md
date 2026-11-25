@@ -4,21 +4,22 @@ Tapas is a Windows app for TP-Link **Tapo** cameras and the **H500 HomeBase** hu
 with your Tapo account and works through the Tapo cloud, like the Tapo app on your phone, so it
 works from anywhere with internet: no VPN, port forwarding or camera passwords.
 
-- **Live view** of every camera in a grid, or one camera at a time, with **live audio** (G.711 and AAC),
-  **digital zoom & pan (`1×–8×`)**, and **live lossless MP4 recording**.
+- **Live view** of every camera in a grid, or one camera at a time (with `‹` / `›` or `PgUp` / `PgDn` quick camera switching),
+  **live audio** (G.711 and AAC), **digital zoom & pan (`1×–8×`)**, and **live lossless MP4 recording**.
 - **Camera controls**: pan & tilt, pan/tilt patrol, saved presets (go to, save, delete), privacy mode,
   spotlight, night vision mode, auto-tracking, siren/alarm, reboot, SD/HD, and snapshots.
-- **Playback** of the H500's recordings on a day timeline: jump to any moment, 1× to 16× with 1× audio,
-  **digital zoom & pan (`1×–8×`)**, AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`),
+- **Playback** of the H500's recordings on a day timeline: jump to any moment, on-screen `−10s` / `+10s` skip buttons,
+  1× to 16× with 1× audio, **digital zoom & pan (`1×–8×`)**, AI event filters (`All`, `Person`, `Vehicle`, `Pet`, `Motion`, `Alerts`),
   a clickable **24-hour activity chart**, an **All cameras** cross-camera events feed with pictures,
   a calendar, recording clips, and single or **batch lossless MP4 exports**.
-- **People (H500 Facial Recognition)**: browse Familiar and Stranger faces with **face profile photos**
+- **People (H500 Facial Recognition)**: search and filter Familiar and Stranger faces with **face profile photos**
   recognized by your H500 HomeBase, name or mark people as Familiar, explore their **cross-camera tracking timeline**
-  by day, and jump straight into Playback.
-- **NVR keyboard shortcuts** and **full screen** for live view and playback.
+  by day (auto-jumping to their most recent active day), and jump straight into Playback.
+- **NVR keyboard shortcuts**, **full screen** for live view and playback, **hover tooltips**, and **floating toast notifications**
+  with one-click **Show in folder** for saved snapshots and MP4 recordings.
 - Your **homes and rooms** from the Tapo app, and the H500 hub's firmware, storage, HDD health
   (temperature & power-on hours), loop recording, and hub alarm/ring.
-- **Integrated Windows 11 Fluent window** (light or dark, OpenGL default with software fallback),
+- **Integrated Windows 11 Fluent window** (light or dark, OpenGL default with software fallback, remembered window size & maximized state),
   **English & Turkish (`Türkçe`)** interface with instant live switching, an **installer**, and **automatic updates**.
 
 Tapas is written in Rust with [Slint](https://slint.dev). It isn't made or supported by TP-Link.
@@ -148,6 +149,7 @@ When your account has an H500 HomeBase with Facial Recognition enabled, **People
 |---|---|
 | `Ctrl+1` – `Ctrl+5` | Switch pages (Home, Live view, Playback, People, Settings) |
 | `1` – `9` | Open camera 1–9 from Home or Live view |
+| `PgUp` / `PgDn` | Switch to previous / next camera in Single view |
 | `Space` | Play / pause in Playback |
 | `←` / `→` | Skip ±10s in Playback (`Shift+←`/`→` for ±30s), or pan in Single PTZ view |
 | `[` / `]` | Decrease / increase Playback speed |
