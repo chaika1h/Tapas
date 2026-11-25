@@ -21,6 +21,7 @@ pub enum PtzCmd {
     PatrolStart(PatrolAxis),
     PatrolStop,
     Siren(bool),
+    Microphone(bool),
     Reboot,
     /// Re-reads what the camera supports, its toggle states and presets.
     Refresh,
@@ -44,6 +45,8 @@ pub struct PtzState {
     pub auto_track: Option<bool>,
     /// Manual siren/alarm state; `None` if unsupported/unknown.
     pub siren_on: Option<bool>,
+    /// Hardware camera microphone state (`Some(false)` = muted/disabled on camera).
+    pub mic_enabled: Option<bool>,
     /// Whether the user started patrol from this session.
     pub patrolling: bool,
 }
@@ -131,6 +134,7 @@ async fn run(
                     s.night_vision = ctrl.night_vision;
                     s.auto_track = ctrl.auto_track;
                     s.siren_on = ctrl.siren_on;
+                    s.mic_enabled = ctrl.mic.is_enabled();
                 }
                 Err(e) => {
                     report(&e, &set);
@@ -195,6 +199,21 @@ async fn run(
                         crate::i18n::pick("Siren triggered.", "Siren çalıyor.")
                     } else {
                         crate::i18n::pick("Siren stopped.", "Siren durduruldu.")
+                    }
+                    .to_string())
+                }
+                Err(e) => Err(e),
+            },
+            PtzCmd::Microphone(on) => match client.set_mic_enabled(&camera, on).await {
+                Ok((now, record_audio_was_off)) => {
+                    state.lock().unwrap().mic_enabled = Some(now);
+                    if now && record_audio_was_off {
+                        crate::app::on_ui(move |app| app.reconnect_camera_stream(camera_id));
+                    }
+                    Ok(if now {
+                        crate::i18n::pick("Camera microphone turned on.", "Kamera mikrofonu açıldı.")
+                    } else {
+                        crate::i18n::pick("Camera microphone muted.", "Kamera mikrofonu kapatıldı.")
                     }
                     .to_string())
                 }

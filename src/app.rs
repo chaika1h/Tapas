@@ -435,6 +435,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     b.on_patrol_start(cb!(&app, |a, axis| a.patrol_start(axis)));
     b.on_patrol_stop(cb!(&app, |a| a.ptz_send(PtzCmd::PatrolStop)));
     b.on_siren_toggle(cb!(&app, |a| a.siren_toggle()));
+    b.on_mic_toggle(cb!(&app, |a| a.mic_toggle()));
     b.on_camera_reboot(cb!(&app, |a| a.ptz_send(PtzCmd::Reboot)));
     b.on_open_playback(cb!(&app, |a| a.open_playback()));
     b.on_open_camera_playback(cb!(&app, |a, id| a.open_camera_playback(id as u32)));
@@ -920,11 +921,60 @@ impl App {
         let next = if self.tile_audio_cam.get() == Some(camera_id) { None } else { Some(camera_id) };
         self.tile_audio_cam.set(next);
         self.sync_audio();
+        if let Some(id) = next {
+            self.ensure_camera_mic_enabled(id);
+        }
     }
 
     fn single_toggle_audio(&self) {
-        self.single_audio_on.set(!self.single_audio_on.get());
+        let next = !self.single_audio_on.get();
+        self.single_audio_on.set(next);
         self.sync_audio();
+        if next && let Some((id, _)) = *self.single.borrow() {
+            self.ensure_camera_mic_enabled(id);
+        }
+    }
+
+    /// Checks whether `camera_id`'s hardware microphone was muted/disabled in
+    /// the Tapo app and re-enables it so live audio actually plays.
+    fn ensure_camera_mic_enabled(&self, camera_id: u32) {
+        let Some(client) = self.cloud_client().filter(|c| c.session().is_some()) else { return };
+        let Some((name, cloud_cam)) = self
+            .cfg
+            .borrow()
+            .camera(camera_id)
+            .and_then(|c| Some((c.name.clone(), c.cloud.clone()?)))
+        else {
+            return;
+        };
+        self.rt.spawn(async move {
+            match client.ensure_mic_enabled(&cloud_cam).await {
+                Ok(outcome) if outcome.changed => {
+                    on_ui(move |app| {
+                        if let Some(p) = app.ptz.borrow().get(&camera_id) {
+                            p.state.lock().unwrap().mic_enabled = Some(true);
+                        }
+                        app.ptz_changed(camera_id);
+                        if outcome.record_audio_was_off {
+                            app.reconnect_camera_stream(camera_id);
+                        }
+                        let msg = if i18n::is_tr() {
+                            format!("{name}: kamera mikrofonu kapalıydı — açıldı.")
+                        } else {
+                            format!("{name}: camera microphone was muted — turned on.")
+                        };
+                        app.status(msg);
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::info!("could not check/unmute camera microphone for {name}: {e}");
+                    if e.is_auth() {
+                        on_ui(|app| app.cloud_auth_failed());
+                    }
+                }
+            }
+        });
     }
 
     fn player_toggle_audio(&self) {
@@ -1169,6 +1219,8 @@ impl App {
         b.set_single_track_known(false);
         b.set_single_patrolling(false);
         b.set_single_siren(false);
+        b.set_single_mic_known(false);
+        b.set_single_mic_on(false);
         b.set_reboot_confirm(false);
         b.set_presets(ModelRc::default());
         b.set_ptz_message(SharedString::new());
@@ -1176,6 +1228,9 @@ impl App {
         b.set_page(Page::Single);
         ui.invoke_focus_keys();
         self.sync_streams();
+        if self.single_audio_on.get() {
+            self.ensure_camera_mic_enabled(id);
+        }
 
         if self.ptz.borrow().contains_key(&id) {
             self.ptz_changed(id);
@@ -1613,6 +1668,16 @@ impl App {
         self.sync_streams();
     }
 
+    /// Reconnects a camera's active relay stream (keeps the last frame visible
+    /// while reconnecting) so newly enabled audio tracks appear immediately.
+    pub fn reconnect_camera_stream(&self, camera_id: u32) {
+        self.streams.borrow_mut().retain(|k, _| k.0 != camera_id);
+        if self.single.borrow().is_some_and(|k| k.0 == camera_id) {
+            *self.single_shown.borrow_mut() = (0, String::new());
+        }
+        self.sync_streams();
+    }
+
     // -------------------------------------------------------------- updates
 
     fn update_repo(&self) -> String {
@@ -1781,6 +1846,8 @@ impl App {
         b.set_single_track(state.auto_track == Some(true));
         b.set_single_patrolling(state.patrolling);
         b.set_single_siren(state.siren_on == Some(true));
+        b.set_single_mic_known(state.mic_enabled.is_some());
+        b.set_single_mic_on(state.mic_enabled == Some(true));
         b.set_ptz_busy(state.busy);
         b.set_ptz_message(state.message.as_str().into());
         let rows: Vec<PresetRow> = state
@@ -1813,6 +1880,11 @@ impl App {
     fn siren_toggle(&self) {
         let on = !self.ui().global::<Bridge>().get_single_siren();
         self.ptz_send(PtzCmd::Siren(on));
+    }
+
+    fn mic_toggle(&self) {
+        let on = !self.ui().global::<Bridge>().get_single_mic_on();
+        self.ptz_send(PtzCmd::Microphone(on));
     }
 
     // -------------------------------------------------------------- settings

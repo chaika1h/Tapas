@@ -307,6 +307,43 @@ impl PatrolAxis {
     }
 }
 
+/// Camera hardware microphone state from `getAudioConfig`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MicState {
+    /// Whether `audio_config.microphone.mute` is `"on"`.
+    pub muted: Option<bool>,
+    /// `audio_config.microphone.volume` (`0..=100`).
+    pub volume: Option<u32>,
+    /// Whether `audio_config.record_audio.enabled` is `"on"`.
+    pub record_audio: Option<bool>,
+}
+
+impl MicState {
+    /// True if at least one microphone field was returned by the camera.
+    pub fn is_known(self) -> bool {
+        self.muted.is_some() || self.volume.is_some() || self.record_audio.is_some()
+    }
+
+    /// True if any camera setting is currently blocking microphone audio.
+    pub fn is_disabled(self) -> bool {
+        self.muted == Some(true) || self.volume == Some(0) || self.record_audio == Some(false)
+    }
+
+    /// `Some(true)` if enabled, `Some(false)` if muted/0/disabled, `None` if unknown.
+    pub fn is_enabled(self) -> Option<bool> {
+        self.is_known().then(|| !self.is_disabled())
+    }
+}
+
+/// Result of checking and (if needed) re-enabling a camera's microphone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MicEnsureOutcome {
+    /// True if the camera's microphone was muted/disabled and we turned it on.
+    pub changed: bool,
+    /// True if `record_audio` had to be switched from `"off"` to `"on"`.
+    pub record_audio_was_off: bool,
+}
+
 /// Snapshot of a camera's live capabilities and toggle states, fetched in one
 /// batched request when opening the camera view.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -317,6 +354,7 @@ pub struct CameraControls {
     pub night_vision: Option<NightVisionMode>,
     pub auto_track: Option<bool>,
     pub siren_on: Option<bool>,
+    pub mic: MicState,
 }
 
 /// Category filter for the Playback / AI Events list.
@@ -1076,9 +1114,143 @@ impl CloudClient {
             json!({ "method": "getDayNightModeConfig", "params": { "image": { "name": ["common"] } } }),
             json!({ "method": "getTargetTrackConfig", "params": { "target_track": { "name": ["target_track_info"] } } }),
             json!({ "method": "getManualAlarmStatus", "params": { "msg_alarm": { "get_manual_status": {} } } }),
+            json!({
+                "method": "getAudioConfig",
+                "params": { "audio_config": { "name": ["microphone", "record_audio"] } },
+            }),
         ];
         let responses = self.camera_requests(camera, requests).await?;
         Ok(parse_camera_controls(&responses))
+    }
+
+    /// Reads the camera's hardware microphone mute, volume, and record-audio settings.
+    pub async fn mic_state(&self, camera: &CloudCamera) -> Result<MicState> {
+        let req = json!({
+            "method": "getAudioConfig",
+            "params": { "audio_config": { "name": ["microphone", "record_audio"] } },
+        });
+        match first_result(&self.camera_requests(camera, vec![req]).await?, "getAudioConfig") {
+            Ok(result) => Ok(parse_mic_state(&result)),
+            Err(e) if e.is_auth() => Err(e),
+            Err(_) => {
+                // Older firmware may not recognize "record_audio"; retry with "microphone" alone.
+                let fallback = json!({
+                    "method": "getAudioConfig",
+                    "params": { "audio_config": { "name": ["microphone"] } },
+                });
+                let result = first_result(&self.camera_requests(camera, vec![fallback]).await?, "getAudioConfig")?;
+                Ok(parse_mic_state(&result))
+            }
+        }
+    }
+
+    /// Enables or mutes the camera's hardware microphone.
+    /// Returns `(enabled_now, record_audio_was_off)`.
+    pub async fn set_mic_enabled(&self, camera: &CloudCamera, enabled: bool) -> Result<(bool, bool)> {
+        if enabled {
+            let current = self.mic_state(camera).await.unwrap_or_default();
+            self.enable_mic_from_state(camera, current).await?;
+            Ok((true, current.record_audio == Some(false)))
+        } else {
+            let mute_req = json!({
+                "method": "setMicrophoneVolume",
+                "params": { "audio_config": { "microphone": { "mute": "on" } } },
+            });
+            match first_result(&self.camera_requests(camera, vec![mute_req]).await?, "setMicrophoneVolume") {
+                Ok(_) => Ok((false, false)),
+                Err(e) if e.is_auth() => Err(e),
+                Err(_) => {
+                    // Firmware without a separate `mute` key uses volume "0".
+                    let vol_req = json!({
+                        "method": "setMicrophoneVolume",
+                        "params": { "audio_config": { "microphone": { "volume": "0" } } },
+                    });
+                    first_result(&self.camera_requests(camera, vec![vol_req]).await?, "setMicrophoneVolume")?;
+                    Ok((false, false))
+                }
+            }
+        }
+    }
+
+    /// Checks whether the camera's hardware microphone is muted, at 0 volume, or
+    /// has record-audio disabled, and re-enables it if so.
+    pub async fn ensure_mic_enabled(&self, camera: &CloudCamera) -> Result<MicEnsureOutcome> {
+        let state = self.mic_state(camera).await?;
+        if !state.is_disabled() {
+            return Ok(MicEnsureOutcome { changed: false, record_audio_was_off: false });
+        }
+        log::info!(
+            "camera {} microphone is disabled ({state:?}); re-enabling for live audio",
+            camera.name
+        );
+        self.enable_mic_from_state(camera, state).await?;
+        Ok(MicEnsureOutcome { changed: true, record_audio_was_off: state.record_audio == Some(false) })
+    }
+
+    async fn enable_mic_from_state(&self, camera: &CloudCamera, state: MicState) -> Result<()> {
+        let mut mic = serde_json::Map::new();
+        let need_unmute = state.muted == Some(true) || !state.is_known();
+        let need_volume = state.volume == Some(0) || state.volume.is_none();
+        if need_unmute {
+            mic.insert("mute".into(), "off".into());
+        }
+        if need_volume {
+            mic.insert("volume".into(), "100".into());
+        }
+        let mut any_ok = false;
+        let mut last_err = None;
+        if !mic.is_empty() {
+            let combined = json!({
+                "method": "setMicrophoneVolume",
+                "params": { "audio_config": { "microphone": Value::Object(mic.clone()) } },
+            });
+            match first_result(&self.camera_requests(camera, vec![combined]).await?, "setMicrophoneVolume") {
+                Ok(_) => any_ok = true,
+                Err(e) if e.is_auth() => return Err(e),
+                Err(e) => {
+                    last_err = Some(e);
+                    // Some firmware rejects combining `mute` and `volume` in one call; try separately.
+                    if need_volume {
+                        let req = json!({
+                            "method": "setMicrophoneVolume",
+                            "params": { "audio_config": { "microphone": { "volume": "100" } } },
+                        });
+                        match first_result(&self.camera_requests(camera, vec![req]).await?, "setMicrophoneVolume") {
+                            Ok(_) => any_ok = true,
+                            Err(e) if e.is_auth() => return Err(e),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    if need_unmute {
+                        let req = json!({
+                            "method": "setMicrophoneVolume",
+                            "params": { "audio_config": { "microphone": { "mute": "off" } } },
+                        });
+                        match first_result(&self.camera_requests(camera, vec![req]).await?, "setMicrophoneVolume") {
+                            Ok(_) => any_ok = true,
+                            Err(e) if e.is_auth() => return Err(e),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                }
+            }
+        }
+        if state.record_audio == Some(false) {
+            let rec_req = json!({
+                "method": "setRecordAudio",
+                "params": { "audio_config": { "record_audio": { "enabled": "on" } } },
+            });
+            match first_result(&self.camera_requests(camera, vec![rec_req]).await?, "setRecordAudio") {
+                Ok(_) => any_ok = true,
+                Err(e) if e.is_auth() => return Err(e),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if any_ok || (mic.is_empty() && state.record_audio != Some(false)) {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or_else(|| CloudError::new("Could not enable the camera microphone")))
+        }
     }
 
     pub async fn privacy_mode(&self, camera: &CloudCamera) -> Result<bool> {
@@ -2299,7 +2471,20 @@ fn parse_camera_controls(responses: &[Value]) -> CameraControls {
             on_off(r.pointer("/msg_alarm/get_manual_status/status"))
                 .or_else(|| on_off(r.pointer("/siren/status")))
         });
-    CameraControls { ptz, privacy, spotlight, night_vision, auto_track, siren_on }
+    let mic = result_for(responses, "getAudioConfig", 7).ok().map(|r| parse_mic_state(&r)).unwrap_or_default();
+    CameraControls { ptz, privacy, spotlight, night_vision, auto_track, siren_on, mic }
+}
+
+/// Parses `audio_config.microphone` (`mute`, `volume`) and `audio_config.record_audio.enabled`.
+fn parse_mic_state(result: &Value) -> MicState {
+    let muted = on_off(result.pointer("/audio_config/microphone/mute"));
+    let volume = result.pointer("/audio_config/microphone/volume").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .map(|n| n.min(100) as u32)
+    });
+    let record_audio = on_off(result.pointer("/audio_config/record_audio/enabled"));
+    MicState { muted, volume, record_audio }
 }
 
 /// "HDD", "SSD", "Internal", "SD card" from a disk's `type`, else its name.
@@ -2831,6 +3016,7 @@ mod tests {
             json!({"method": "getDayNightModeConfig", "error_code": 0, "result": {"image": {"common": {"inf_type": "auto"}}}}),
             json!({"method": "getTargetTrackConfig", "error_code": 0, "result": {"target_track": {"target_track_info": {"enabled": "on"}}}}),
             json!({"method": "getManualAlarmStatus", "error_code": 0, "result": {"msg_alarm": {"get_manual_status": {"status": 0}}}}),
+            json!({"method": "getAudioConfig", "error_code": 0, "result": {"audio_config": {"microphone": {"mute": "on", "volume": "0"}, "record_audio": {"enabled": "on"}}}}),
         ];
         assert_eq!(parse_camera_controls(&answers), CameraControls {
             ptz: true,
@@ -2839,7 +3025,13 @@ mod tests {
             night_vision: Some(NightVisionMode::Smart),
             auto_track: Some(true),
             siren_on: Some(false),
+            mic: MicState { muted: Some(true), volume: Some(0), record_audio: Some(true) },
         });
+        assert!(MicState { muted: Some(true), volume: Some(100), record_audio: Some(true) }.is_disabled());
+        assert!(MicState { muted: Some(false), volume: Some(0), record_audio: Some(true) }.is_disabled());
+        assert!(MicState { muted: Some(false), volume: Some(80), record_audio: Some(false) }.is_disabled());
+        assert_eq!(MicState { muted: Some(false), volume: Some(80), record_audio: Some(true) }.is_enabled(), Some(true));
+        assert_eq!(MicState::default().is_enabled(), None);
 
         let person_motion = Detection { start: 1, end: 2, kind: 6, kinds: vec![2, 6] };
         let vehicle = Detection { start: 3, end: 4, kind: 8, kinds: vec![8] };
