@@ -180,6 +180,9 @@ export global Bridge {
     callback patrol-stop();
     in property <bool> single-siren;
     callback siren-toggle();
+    in property <bool> single-mic-known;
+    in property <bool> single-mic-on;
+    callback mic-toggle();
     in-out property <bool> reboot-confirm;
     callback camera-reboot();
     callback open-playback();
@@ -440,6 +443,7 @@ export global Tr {
     in-out property <string> siren: "Siren";
     in-out property <string> stop-siren: "Stop Siren";
     in-out property <string> night-vision: "Night Vision";
+    in-out property <string> camera-mic: "Camera microphone";
     in-out property <string> playback-download: "Playback & Download";
     in-out property <string> reboot-camera: "Reboot camera";
     in-out property <string> reboot-confirm-prefix: "Reboot ";
@@ -995,6 +999,8 @@ global Icons {
     out property <string> photo: "M 3 8.5 H 7.5 L 9.5 5.5 H 14.5 L 16.5 8.5 H 21 V 19 H 3 Z M 12 10 A 3.5 3.5 0 1 0 12.01 10 Z";
     out property <string> move: "M 12 2.5 V 9 M 9 5.5 L 12 2.5 L 15 5.5 M 12 21.5 V 15 M 9 18.5 L 12 21.5 L 15 18.5 M 2.5 12 H 9 M 5.5 9 L 2.5 12 L 5.5 15 M 21.5 12 H 15 M 18.5 9 L 21.5 12 L 18.5 15";
     out property <string> privacy: "M 2 12 C 5 6.5 8.5 5 12 5 C 15.5 5 19 6.5 22 12 C 19 17.5 15.5 19 12 19 C 8.5 19 5 17.5 2 12 Z M 12 9 A 3 3 0 1 0 12.01 9 Z M 4 4 L 20 20";
+    out property <string> mic: "M 9 5 A 3 3 0 0 1 15 5 V 11 A 3 3 0 0 1 9 11 Z M 6 11 A 6 6 0 0 0 18 11 M 12 17 V 21 M 8.5 21 H 15.5";
+    out property <string> mic-off: "M 9 5 A 3 3 0 0 1 15 5 V 11 A 3 3 0 0 1 9 11 Z M 6 11 A 6 6 0 0 0 18 11 M 12 17 V 21 M 8.5 21 H 15.5 M 4 4 L 20 20";
     out property <string> fullscreen: "M 4 9 V 4 H 9 M 15 4 H 20 V 9 M 20 15 V 20 H 15 M 9 20 H 4 V 15";
     out property <string> exit-fullscreen: "M 9 4 V 9 H 4 M 20 9 H 15 V 4 M 15 20 V 15 H 20 M 4 15 H 9 V 20";
     out property <string> back: "M 15 4.5 L 7.5 12 L 15 19.5";
@@ -2499,6 +2505,40 @@ component SinglePage inherits Rectangle {
                                     current-index <=> Bridge.single-nv-index;
                                     enabled: !Bridge.single-privacy && !Bridge.ptz-busy;
                                     selected => { Bridge.night-vision-changed(Bridge.single-nv-index); }
+                                }
+                            }
+                        }
+                    }
+                    // Hardware camera microphone switch (mirrors Tapo app's Camera's Microphone).
+                    if Bridge.single-mic-known: Rectangle {
+                        height: 52px;
+                        border-radius: 12px;
+                        background: Palette.foreground.transparentize(0.93);
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 10px;
+                            spacing: 10px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon {
+                                    commands: Bridge.single-mic-on ? Icons.mic : Icons.mic-off;
+                                    width: 20px;
+                                    height: 20px;
+                                    color: Bridge.single-mic-on ? Palette.foreground : #e5484d;
+                                }
+                            }
+                            Text {
+                                text: Tr.camera-mic;
+                                font-size: 14px;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Switch {
+                                    checked: Bridge.single-mic-on;
+                                    enabled: !Bridge.single-privacy && !Bridge.ptz-busy;
+                                    toggled => { Bridge.mic-toggle(); }
                                 }
                             }
                         }

@@ -305,6 +305,7 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
     tr.set_siren(t("Siren", "Siren"));
     tr.set_stop_siren(t("Stop Siren", "Sireni Durdur"));
     tr.set_night_vision(t("Night Vision", "Gece Görüşü"));
+    tr.set_camera_mic(t("Camera microphone", "Kamera mikrofonu"));
     tr.set_playback_download(t("Playback & Download", "Kayıtlar ve İndirme"));
     tr.set_reboot_camera(t("Reboot camera", "Kamerayı yeniden başlat"));
     tr.set_reboot_confirm_prefix(t("Reboot ", ""));
