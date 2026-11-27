@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -84,16 +84,56 @@ pub async fn open(tls: Arc<rustls::ClientConfig>, info: &RelayInfo, model: &str)
 
 /// A TLS connection to the relay, before the request.
 pub async fn connect(tls: Arc<rustls::ClientConfig>, info: &RelayInfo) -> Result<TlsStream<TcpStream>> {
-    let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect((info.host.as_str(), info.port)))
-        .await
-        .map_err(|_| anyhow!("The video relay did not answer"))?
-        .context("Could not reach the video relay")?;
+    let tcp = connect_tcp(&info.host, info.port).await?;
     let _ = tcp.set_nodelay(true);
     let name = rustls::pki_types::ServerName::try_from(info.host.clone()).context("Invalid video relay address")?;
     timeout(CONNECT_TIMEOUT, TlsConnector::from(tls).connect(name, tcp))
         .await
         .map_err(|_| anyhow!("The video relay did not answer"))?
         .context("Secure connection to the video relay failed")
+}
+
+/// Resolves and connects TCP with a 5-minute DNS cache (IPv4 preferred first)
+/// so HD switches and reconnects to the same regional relay skip repeated DNS
+/// lookups and slow IPv6 fallbacks.
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    const DNS_TTL: Duration = Duration::from_secs(300);
+    static DNS_CACHE: OnceLock<Mutex<HashMap<(String, u16), (Instant, Vec<SocketAddr>)>>> = OnceLock::new();
+    let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (host.to_string(), port);
+
+    let cached = {
+        let guard = cache.lock().unwrap();
+        guard.get(&key).filter(|(at, _)| at.elapsed() < DNS_TTL).map(|(_, addrs)| addrs.clone())
+    };
+    if let Some(addrs) = cached {
+        if let Ok(Ok(stream)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(addrs.as_slice())).await {
+            return Ok(stream);
+        }
+        cache.lock().unwrap().remove(&key);
+    }
+
+    let mut addrs: Vec<SocketAddr> = timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| anyhow!("The video relay did not answer"))?
+        .context("Could not reach the video relay")?
+        .collect();
+    if addrs.is_empty() {
+        bail!("Could not reach the video relay");
+    }
+    // Prefer IPv4 addresses first so dual-stack relays don't stall on broken IPv6 routes.
+    addrs.sort_by_key(|a| a.is_ipv6());
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addrs.as_slice()))
+        .await
+        .map_err(|_| anyhow!("The video relay did not answer"))?
+        .context("Could not reach the video relay")?;
+    cache.lock().unwrap().insert(key, (Instant::now(), addrs));
+    Ok(stream)
 }
 
 /// One part of the relay's answer.
@@ -207,7 +247,7 @@ pub type LiveRecorder = Arc<std::sync::Mutex<Option<std::io::BufWriter<std::fs::
 pub async fn copy_video<R, W>(reader: &mut R, out: &mut W) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     copy_video_with_audio_and_recorder(reader, out, 0, None).await
 }
@@ -216,6 +256,7 @@ where
 /// `audio_id` is currently the active audio source, and optionally teeing the
 /// raw MPEG-TS stream into `recorder` for live MP4 recording (zero overhead
 /// while muted and not recording).
+#[cfg(test)]
 pub async fn copy_video_with_audio_and_recorder<R, W>(
     reader: &mut R,
     out: &mut W,
@@ -224,7 +265,7 @@ pub async fn copy_video_with_audio_and_recorder<R, W>(
 ) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
     use std::io::Write;
     let mut demux = crate::audio::TsAudioDemuxer::new();
@@ -303,6 +344,89 @@ where
                         crate::audio::push_pcm(audio_id, chunk.sample_rate, &chunk.samples);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Streams raw MPEG-TS chunks from the relay multipart body into `tx`, while
+/// demuxing live audio (when `audio_id` is active) and teeing bytes into
+/// `recorder` (when recording). Used by the in-process H.264 decoder path.
+pub async fn stream_video_chunks<R>(
+    reader: &mut R,
+    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    audio_id: u64,
+    recorder: Option<&LiveRecorder>,
+) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+{
+    use std::io::Write;
+    let mut demux = crate::audio::TsAudioDemuxer::new();
+    let mut pcm_chunks = Vec::new();
+    let mut was_audible = false;
+    let mut buf = vec![0u8; 16 * 1024];
+
+    loop {
+        if !read_line(reader).await?.contains(BOUNDARY) {
+            continue;
+        }
+        let mut length = 0u64;
+        let mut encrypted = false;
+        loop {
+            let header = read_line(reader).await?;
+            if header.is_empty() {
+                break;
+            }
+            let Some((name, value)) = header.split_once(':') else { continue };
+            match name.trim().to_ascii_lowercase().as_str() {
+                "content-length" => length = value.trim().parse().unwrap_or(0),
+                "x-if-encrypt" => encrypted = value.trim() == "1",
+                _ => {}
+            }
+        }
+        if encrypted {
+            bail!("This camera sends encrypted video through the cloud, which Tapas can't play yet");
+        }
+        if length == 0 {
+            continue;
+        }
+        let audible = crate::audio::is_active(audio_id);
+        if audible && !was_audible {
+            demux.reset();
+        }
+        was_audible = audible;
+
+        let mut part = (&mut *reader).take(length);
+        let mut copied = 0u64;
+        while copied < length {
+            let n = timeout(DATA_TIMEOUT, part.read(&mut buf))
+                .await
+                .map_err(|_| anyhow!("The camera stopped sending video"))?
+                .context("Lost the connection to the video relay")?;
+            if n == 0 {
+                bail!("The video relay closed the connection");
+            }
+            copied += n as u64;
+            let slice = &buf[..n];
+            if let Some(rec) = recorder {
+                let mut guard = rec.lock().unwrap();
+                if let Some(writer) = guard.as_mut()
+                    && let Err(e) = writer.write_all(slice)
+                {
+                    log::warn!("live recording write failed: {e}");
+                    *guard = None;
+                }
+            }
+            if crate::audio::is_active(audio_id) {
+                pcm_chunks.clear();
+                demux.feed(slice, &mut pcm_chunks);
+                for chunk in pcm_chunks.drain(..) {
+                    crate::audio::push_pcm(audio_id, chunk.sample_rate, &chunk.samples);
+                }
+            }
+            if tx.send(slice.to_vec()).await.is_err() {
+                bail!("Video decoder stopped");
             }
         }
     }

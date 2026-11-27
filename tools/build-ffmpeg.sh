@@ -63,6 +63,8 @@ if [ "$TARGET" = windows ]; then
   flags+=(
     --target-os=mingw32 --arch=x86_64 --cross-prefix=x86_64-w64-mingw32-
     --enable-w32threads --extra-ldflags="-static -static-libgcc"
+    --enable-d3d11va --enable-dxva2
+    --enable-hwaccel=h264_d3d11va,h264_d3d11va2,hevc_d3d11va,hevc_d3d11va2,h264_dxva2,hevc_dxva2
   )
 fi
 

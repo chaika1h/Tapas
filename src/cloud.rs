@@ -644,13 +644,17 @@ fn build_tls() -> anyhow::Result<rustls::ClientConfig> {
         roots.extend(CertificateDer::pem_slice_iter(&pem).collect::<std::result::Result<Vec<_>, _>>()?);
     }
     let verifier = rustls_platform_verifier::Verifier::new_with_extra_roots(roots, provider.clone())?;
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         // rustls calls any custom verifier "dangerous"; this one is the
         // standard platform check, with TP-Link's roots added.
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth())
+        .with_no_client_auth();
+    // Reuse TLS 1.3/1.2 session tickets across relay connections to the same
+    // regional host (saves 1 RTT when opening HD streams or reconnecting).
+    config.resumption = rustls::client::Resumption::in_memory_sessions(512);
+    Ok(config)
 }
 
 pub struct CloudClient {
@@ -673,6 +677,8 @@ impl CloudClient {
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured((*tls).clone())
             .http1_title_case_headers()
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(30))
             .build()

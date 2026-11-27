@@ -1,6 +1,6 @@
 [package]
 name = "tapas"
-version = "0.7.4"
+version = "0.8.0"
 edition = "2024"
 description = "Tapas: TP-Link Tapo cameras and the H500 HomeBase on Windows, through the Tapo cloud"
 license = "MIT"
@@ -15,6 +15,7 @@ hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 log = "0.4.35"
 md-5 = "0.11.0"
+openh264 = "0.9"
 # rustls with aws-lc-rs, shared with the relay connections (tokio-rustls).
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

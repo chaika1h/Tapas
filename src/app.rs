@@ -934,7 +934,7 @@ impl App {
         }
         let page = self.ui().global::<Bridge>().get_page();
         let cfg = self.cfg.borrow();
-        let wanted: Vec<StreamKey> = match page {
+        let mut wanted: Vec<StreamKey> = match page {
             // Home needs a picture per camera for its card: a short stream
             // for those without a recent one, a couple at a time.
             Page::Home => {
@@ -952,6 +952,16 @@ impl App {
             Page::Single => self.single.borrow().iter().copied().collect(),
             _ => Vec::new(),
         };
+        if cfg.keep_streams_warm {
+            for cam in &cfg.cameras {
+                if cam.cloud.is_some() {
+                    let key = (cam.id, cam.grid_quality);
+                    if !wanted.contains(&key) {
+                        wanted.push(key);
+                    }
+                }
+            }
+        }
         let mut streams = self.streams.borrow_mut();
         let now = Instant::now();
         for (key, live) in streams.iter_mut() {
@@ -2054,6 +2064,7 @@ impl App {
         b.set_theme_index(cfg.theme.index());
         b.set_language_index(cfg.language.index());
         b.set_start_on_live(cfg.start_on_live);
+        b.set_keep_streams_warm(cfg.keep_streams_warm);
         b.set_config_path(config::config_path().display().to_string().into());
     }
 
@@ -2062,7 +2073,7 @@ impl App {
     fn save_settings(&self) {
         let ui = self.ui();
         let b = ui.global::<Bridge>();
-        let lang_changed = {
+        let (lang_changed, warm_changed) = {
             let mut cfg = self.cfg.borrow_mut();
             let renderer = Renderer::from_index(b.get_renderer_index());
             if renderer != cfg.renderer {
@@ -2077,9 +2088,15 @@ impl App {
             let lang_changed = language != cfg.language;
             cfg.language = language;
             cfg.start_on_live = b.get_start_on_live();
-            lang_changed
+            let keep_warm = b.get_keep_streams_warm();
+            let warm_changed = keep_warm != cfg.keep_streams_warm;
+            cfg.keep_streams_warm = keep_warm;
+            (lang_changed, warm_changed)
         };
         self.persist();
+        if warm_changed {
+            self.sync_streams();
+        }
         let theme_index = self.cfg.borrow().theme.index();
         ui.invoke_set_theme(theme_index);
         crate::chrome::set_theme(theme_index);
