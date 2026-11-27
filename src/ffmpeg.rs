@@ -100,10 +100,15 @@ static CLOUD_VGA_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// Requests the camera's relay and decodes it until something stops.
 ///
-/// Uses the in-process OpenH264 decoder for H.264 streams (zero `ffmpeg.exe`
-/// spawn, zero `-probesize` delay, zero pipe IPC) and transparently falls back
-/// to `ffmpeg.exe` (with D3D11VA/DXVA2 hardware decode on Windows HD) if the
-/// camera sends HEVC/H.265 or an unsupported H.264 profile.
+/// - **SD (`640×360` Live Grid tiles):** uses the in-process OpenH264 decoder
+///   for instant zero-spawn startup across all cameras, transparently falling
+///   back to `ffmpeg.exe` if the camera sends HEVC/H.265, an unsupported H.264
+///   profile, or drops P-frames after the initial keyframe.
+/// - **HD (`2560×1440` Single View):** uses multi-threaded AVX2 `ffmpeg.exe`
+///   directly (Single View already hot-swaps seamlessly from the live SD
+///   stream, so ffmpeg's brief startup is invisible while 2K QHD gets full
+///   multi-threaded decoding, YUV→RGBA conversion, and full H.264/HEVC spec
+///   compliance).
 pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     let (mut resolution, w, h) = match spec.quality {
         Quality::Hd => (Resolution::Hd, 2560usize, 1440usize),
@@ -127,12 +132,18 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     let mut relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
     let name = format!("{} ({:?})", spec.camera.name, spec.quality);
     sink.time_first_frame(name.clone(), started, asked);
+    if w >= 1280
+        && let Some(ffmpeg_path) = spec.ffmpeg.as_deref()
+    {
+        log::info!("live: {name}: using ffmpeg ({w}×{h})");
+        return decode_relay(&mut relay, ffmpeg_path, w, h, sink).await;
+    }
     decode_relay_hybrid(&mut relay, spec.ffmpeg.as_deref(), &name, w, h, sink).await
 }
 
 /// Decodes a live relay stream using in-process OpenH264 first, seamlessly
-/// handing off buffered initial TS bytes to `ffmpeg.exe` if HEVC or an
-/// unsupported bitstream is encountered before the first frame.
+/// handing off to `ffmpeg.exe` if HEVC, an unsupported bitstream, or sustained
+/// frame drops / decode errors are encountered.
 async fn decode_relay_hybrid<R>(
     relay: &mut R,
     ffmpeg: Option<&Path>,
@@ -150,6 +161,7 @@ where
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let audio_id = sink.audio_id;
     let recorder = sink.recorder.clone();
+    let worker_name = name.to_string();
 
     // Start the blocking OpenH264 worker thread. On HD streams keep native
     // pixels up to 4K (zero downscaling, hits AVX2 SIMD direct path on 2K/4K).
@@ -169,6 +181,11 @@ where
         let mut init_bytes = 0usize;
         let mut init_aus = 0usize;
         let mut last_err = String::new();
+        let mut consec_errs = 0usize;
+        let mut total_errs = 0usize;
+        let mut win_start = std::time::Instant::now();
+        let mut win_aus = 0usize;
+        let mut win_frames = 0usize;
 
         while let Some(chunk) = worker_in_rx.blocking_recv() {
             if !got_frame {
@@ -185,17 +202,52 @@ where
                 }
                 if !got_frame {
                     init_aus += 1;
+                } else {
+                    win_aus += 1;
                 }
                 match decoder.decode_au(au) {
                     Ok(Some(frame)) => {
-                        got_frame = true;
+                        if !got_frame {
+                            got_frame = true;
+                            win_start = std::time::Instant::now();
+                            win_aus = 0;
+                            win_frames = 0;
+                        } else {
+                            win_frames += 1;
+                        }
+                        consec_errs = 0;
                         let _ = worker_out_tx.send(WorkerSignal::Frame(frame));
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        if !got_frame {
-                            last_err = e;
+                        consec_errs += 1;
+                        total_errs += 1;
+                        if total_errs == 1 || total_errs % 30 == 0 {
+                            log::warn!("live: {worker_name}: OpenH264 decode error #{total_errs}: {e}");
                         }
+                        last_err = e;
+                        if got_frame && consec_errs >= 8 {
+                            abort_to_ffmpeg = Some(format!(
+                                "OpenH264 hit {consec_errs} consecutive decode errors ({last_err})"
+                            ));
+                        }
+                    }
+                }
+                // Runtime health watchdog: if OpenH264 decodes only keyframes
+                // (e.g. dropping >75% of P-frames -> 1 fps), switch to ffmpeg.
+                if got_frame
+                    && abort_to_ffmpeg.is_none()
+                    && win_start.elapsed() >= Duration::from_millis(2500)
+                {
+                    if win_aus >= 12 && win_frames * 4 < win_aus {
+                        abort_to_ffmpeg = Some(format!(
+                            "OpenH264 decoded only {win_frames}/{win_aus} access units in {:.1}s",
+                            win_start.elapsed().as_secs_f32()
+                        ));
+                    } else {
+                        win_start = std::time::Instant::now();
+                        win_aus = 0;
+                        win_frames = 0;
                     }
                 }
             });
@@ -384,7 +436,6 @@ fn spawn_live_decoder(ffmpeg: &Path, w: usize, h: usize) -> Result<Decoder> {
 
 /// Decodes the relay's MPEG-TS (after its HTTP head) until either the relay
 /// or ffmpeg stops.
-#[cfg(test)]
 async fn decode_relay<R>(relay: &mut R, ffmpeg: &Path, w: usize, h: usize, sink: &mut FrameSink) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -393,7 +444,6 @@ where
     decode_relay_with_decoder(relay, decoder, sink).await
 }
 
-#[cfg(test)]
 async fn decode_relay_with_decoder<R>(relay: &mut R, mut decoder: Decoder, sink: &mut FrameSink) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -473,18 +523,16 @@ impl Decoder {
     }
 
     /// Pushes frames into `sink` until ffmpeg stops or goes quiet.
-    #[cfg(test)]
     async fn push_frames(&mut self, sink: &mut FrameSink) -> Stopped {
         self.push_frames_within(sink, FRAME_TIMEOUT).await
     }
 
     /// Like [`Decoder::push_frames`], waiting up to `quiet` for each frame.
-    #[cfg(test)]
     pub async fn push_frames_within(&mut self, sink: &mut FrameSink, quiet: Duration) -> Stopped {
         let (w, h) = (self.width as u32, self.height as u32);
         loop {
             // Read directly into the SharedPixelBuffer to avoid a redundant
-            // 8.3 MB/frame copy on HD streams.
+            // 14.7 MB/frame copy on 2K HD streams.
             let mut frame = SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
             match timeout(quiet, self.stdout.read_exact(frame.make_mut_bytes())).await {
                 Err(_) => return Stopped::NoVideo,
@@ -538,17 +586,13 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> to
     if timed {
         vf = format!("showinfo=checksum=0,{vf}");
     }
-    // Keep RAM bounded (avoid per-core thread explosion), while allowing
-    // 2 decode threads on HD streams for snappier 1080p/2K decoding.
-    let decode_threads = if w >= 1280 { "2" } else { "1" };
+    // Keep RAM bounded while giving HD/2K streams 2 decode + 2 filter threads:
+    // parallelizing 2560×1440 YUV→RGBA swscale gives 50+ fps on AVX2 CPU with
+    // zero D3D11 device-init latency or VRAM→CPU PCIe readback stalls.
+    let (decode_threads, filter_threads) = if w >= 1280 { ("2", "2") } else { ("1", "1") };
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-nostats", "-loglevel", if timed { "info" } else { "error" }])
-        .args(["-filter_threads", "1", "-threads", decode_threads]);
-    // Use D3D11VA/DXVA2 GPU decode on Windows HD streams (Playback and HEVC
-    // live fallback); `-hwaccel auto` transparently falls back to CPU if unavailable.
-    if cfg!(windows) && w >= 1280 {
-        cmd.args(["-hwaccel", "auto"]);
-    }
+        .args(["-filter_threads", filter_threads, "-threads", decode_threads]);
     cmd.args(input)
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
