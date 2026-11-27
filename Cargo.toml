@@ -70,3 +70,8 @@ opt-level = 1
 # Only for building and testing on Linux; the Windows build doesn't need it.
 [target.'cfg(target_os = "linux")'.dependencies]
 slint = { version = "=1.19.0", default-features = false, features = ["backend-winit-x11"] }
+
+# Slint's OpenGL (femtovg) renderer with one fix: text on whole device pixels
+# at fractional scale factors (see patches/README.md). Same version as slint.
+[patch.crates-io]
+i-slint-renderer-femtovg = { path = "patches/i-slint-renderer-femtovg" }
