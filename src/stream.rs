@@ -171,6 +171,8 @@ impl FrameSink {
         slot.frame = Some(frame);
         slot.version += 1;
         slot.status = Status::Live;
+        drop(slot);
+        crate::app::notify_frame();
     }
 
     fn set_status(&self, status: Status) {

@@ -431,6 +431,11 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "How the window is drawn, from the next start.",
         "Pencere çizim motoru (sonraki açılışta geçerli olur).",
     ));
+    tr.set_start_on_live_title(t("Start on Live view", "Canlı izleme ile başla"));
+    tr.set_start_on_live_desc(t(
+        "Open the camera grid straight away when Tapas starts.",
+        "Tapas açıldığında doğrudan çoklu kamera görünümüyle başla.",
+    ));
     tr.set_settings_file(t("Settings file", "Ayar dosyası"));
     tr.set_sec_shortcuts(t("Keyboard shortcuts", "Klavye kısayolları"));
     tr.set_sc_nav(t(
