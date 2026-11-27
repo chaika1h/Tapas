@@ -43,8 +43,11 @@ const CACHE_BYTES: usize = 48 << 20;
 /// while nothing is read: ~100 MB) and the hub's session; the picture stays,
 /// and playing on starts again from it, mostly from the cache.
 const PARK_AFTER: Duration = Duration::from_secs(10);
-const WIDTH: usize = 1280;
-const HEIGHT: usize = 720;
+/// Full 2K QHD (Tapo C520WS native resolution) so zooming and snapshots in
+/// Playback preserve every detail (license plates, faces). Uses D3D11VA/DXVA2
+/// GPU decoding on Windows.
+const WIDTH: usize = 2560;
+const HEIGHT: usize = 1440;
 
 /// What to play: a camera's recordings on a hub, for one day.
 #[derive(Clone)]
@@ -448,11 +451,13 @@ async fn read_frames(
     frames: mpsc::Sender<(Frame, f64)>,
 ) {
     let Some(mut times) = times else { return };
-    let (w, h) = (decoder.width, decoder.height);
-    let mut buf = vec![0u8; w * h * 4];
+    let (w, h) = (decoder.width as u32, decoder.height as u32);
     let mut last = 0.0;
     loop {
-        if decoder.stdout.read_exact(&mut buf).await.is_err() {
+        // Read directly into SharedPixelBuffer to avoid a redundant 14.7 MB
+        // copy per 2K frame.
+        let mut frame = SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+        if decoder.stdout.read_exact(frame.make_mut_bytes()).await.is_err() {
             let error = decoder.last_error.lock().unwrap().clone();
             if !error.is_empty() {
                 log::warn!("playback: ffmpeg: {error}");
@@ -465,7 +470,6 @@ async fn read_frames(
             _ => last + 1.0 / 15.0,
         };
         last = t;
-        let frame = SharedPixelBuffer::clone_from_slice(&buf, w as u32, h as u32);
         if frames.send((frame, t)).await.is_err() {
             return;
         }
