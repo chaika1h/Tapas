@@ -106,7 +106,7 @@ static CLOUD_VGA_REFUSED: AtomicBool = AtomicBool::new(false);
 /// camera sends HEVC/H.265 or an unsupported H.264 profile.
 pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
     let (mut resolution, w, h) = match spec.quality {
-        Quality::Hd => (Resolution::Hd, 1920usize, 1080usize),
+        Quality::Hd => (Resolution::Hd, 2560usize, 1440usize),
         _ => (Resolution::Vga, 640, 360),
     };
     if CLOUD_VGA_REFUSED.load(Ordering::Relaxed) {
@@ -151,12 +151,14 @@ where
     let audio_id = sink.audio_id;
     let recorder = sink.recorder.clone();
 
-    // Start the blocking OpenH264 worker thread.
+    // Start the blocking OpenH264 worker thread. On HD streams keep native
+    // pixels up to 4K (zero downscaling, hits AVX2 SIMD direct path on 2K/4K).
+    let (inproc_w, inproc_h) = if w >= 1280 { (3840, 2160) } else { (w, h) };
     let (worker_in_tx, mut worker_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     let (worker_out_tx, mut worker_out_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerSignal>();
     let _worker_handle = tokio::task::spawn_blocking(move || {
         let mut demux = TsVideoDemuxer::new();
-        let mut decoder = match H264Decoder::new(w, h) {
+        let mut decoder = match H264Decoder::new(inproc_w, inproc_h) {
             Ok(d) => d,
             Err(e) => {
                 let _ = worker_out_tx.send(WorkerSignal::Fallback(e.to_string()));
@@ -528,9 +530,10 @@ fn showinfo_time(line: &str) -> Option<f64> {
 
 fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> tokio::process::Command {
     // Letterbox into a fixed size so every frame has a known byte length.
-    // `fast_bilinear` cuts CPU scaling time by ~2-3x on live streams.
+    // 2K C520WS streams into 2560x1440 are a 1:1 no-op; use bilinear if scaling HD.
+    let scale_flags = if w >= 1280 { "bilinear" } else { "fast_bilinear" };
     let mut vf = format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:flags={scale_flags},pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
     );
     if timed {
         vf = format!("showinfo=checksum=0,{vf}");
