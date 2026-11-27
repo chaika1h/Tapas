@@ -904,7 +904,7 @@ impl App {
         let size = window.size().to_logical(window.scale_factor());
         let fullscreen = ui.global::<Bridge>().get_fullscreen();
         // Sidebar and page header around the grid (see app.slint).
-        let (chrome_w, chrome_h) = if fullscreen { (8.0, 8.0) } else { (236.0 + 20.0, 76.0 + 20.0) };
+        let (chrome_w, chrome_h) = if fullscreen { (8.0, 8.0) } else { (236.0 + 20.0, 84.0 + 20.0) };
         let (w, h) = (size.width - chrome_w, size.height - chrome_h);
         let key = (n, w as i32, h as i32);
         if *self.last_grid_size.borrow() == key || n == 0 {
