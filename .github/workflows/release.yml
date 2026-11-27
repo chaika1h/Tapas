@@ -21,7 +21,7 @@ jobs:
       - name: Install cross-compile, test & packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y mingw-w64 nsis ffmpeg pkg-config libfontconfig1-dev
+          sudo apt-get install -y mingw-w64 nsis ffmpeg nasm pkg-config libfontconfig1-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

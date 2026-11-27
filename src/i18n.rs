@@ -436,6 +436,11 @@ pub fn apply_to_ui(ui: &MainWindow, lang: Lang) {
         "Open the camera grid straight away when Tapas starts.",
         "Tapas açıldığında doğrudan çoklu kamera görünümüyle başla.",
     ));
+    tr.set_keep_streams_warm_title(t("Keep live streams warm", "Canlı yayınları arka planda sıcak tut"));
+    tr.set_keep_streams_warm_desc(t(
+        "Keep SD camera streams connected in the background so Live view and Single view open instantly.",
+        "Canlı izleme ve tek kamera görünümünün anında açılması için SD yayınları arka planda açık tutar.",
+    ));
     tr.set_settings_file(t("Settings file", "Ayar dosyası"));
     tr.set_sec_shortcuts(t("Keyboard shortcuts", "Klavye kısayolları"));
     tr.set_sc_nav(t(

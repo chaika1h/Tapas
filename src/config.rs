@@ -174,6 +174,9 @@ pub struct AppConfig {
     pub window_maximized: bool,
     /// Open straight onto Live view (all cameras) on launch.
     pub start_on_live: bool,
+    /// Keep SD camera grid streams connected in the background on all pages
+    /// so Live view and Single view open instantaneously.
+    pub keep_streams_warm: bool,
 }
 
 impl AppConfig {
@@ -327,10 +330,14 @@ mod tests {
     fn start_on_live_defaults_false_and_round_trips() {
         let legacy: AppConfig = serde_json::from_str("{}").unwrap();
         assert!(!legacy.start_on_live);
-        let enabled: AppConfig = serde_json::from_str(r#"{"start_on_live": true}"#).unwrap();
+        assert!(!legacy.keep_streams_warm);
+        let enabled: AppConfig =
+            serde_json::from_str(r#"{"start_on_live": true, "keep_streams_warm": true}"#).unwrap();
         assert!(enabled.start_on_live);
+        assert!(enabled.keep_streams_warm);
         let serialized = serde_json::to_string(&enabled).unwrap();
         let back: AppConfig = serde_json::from_str(&serialized).unwrap();
         assert!(back.start_on_live);
+        assert!(back.keep_streams_warm);
     }
 }

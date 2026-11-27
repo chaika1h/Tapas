@@ -9,6 +9,7 @@ mod cloud;
 mod config;
 mod ffmpeg;
 mod i18n;
+mod live_decode;
 mod pictures;
 mod playback;
 mod ptz;

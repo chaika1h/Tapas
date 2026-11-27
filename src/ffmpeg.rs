@@ -99,11 +99,12 @@ mod bundled {
 static CLOUD_VGA_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// Requests the camera's relay and decodes it until something stops.
+///
+/// Uses the in-process OpenH264 decoder for H.264 streams (zero `ffmpeg.exe`
+/// spawn, zero `-probesize` delay, zero pipe IPC) and transparently falls back
+/// to `ffmpeg.exe` (with D3D11VA/DXVA2 hardware decode on Windows HD) if the
+/// camera sends HEVC/H.265 or an unsupported H.264 profile.
 pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
-    let ffmpeg = spec
-        .ffmpeg
-        .as_deref()
-        .context("ffmpeg not found: live view needs it. Put ffmpeg.exe next to Tapas.exe or set its path in Settings")?;
     let (mut resolution, w, h) = match spec.quality {
         Quality::Hd => (Resolution::Hd, 1920usize, 1080usize),
         _ => (Resolution::Vga, 640, 360),
@@ -112,36 +113,243 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
         resolution = Resolution::Hd;
     }
 
-    // Spawn ffmpeg concurrently with the cloud relay handshake so Windows
-    // CreateProcessW / Defender inspection adds 0 ms to time-to-first-frame.
-    let ffmpeg_owned = ffmpeg.to_path_buf();
-    let rt_handle = tokio::runtime::Handle::current();
-    let decoder_task = tokio::task::spawn_blocking(move || {
-        let _guard = rt_handle.enter();
-        spawn_live_decoder(&ffmpeg_owned, w, h)
-    });
-
     let client = &spec.client;
     let started = std::time::Instant::now();
-    let relay_fut = async {
-        let info = match client.request_relay(&spec.camera, resolution).await {
-            Err(e) if resolution == Resolution::Vga && e.is_refused() => {
-                log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
-                CLOUD_VGA_REFUSED.store(true, Ordering::Relaxed);
-                client.request_relay(&spec.camera, Resolution::Hd).await?
+    let info = match client.request_relay(&spec.camera, resolution).await {
+        Err(e) if resolution == Resolution::Vga && e.is_refused() => {
+            log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
+            CLOUD_VGA_REFUSED.store(true, Ordering::Relaxed);
+            client.request_relay(&spec.camera, Resolution::Hd).await?
+        }
+        result => result?,
+    };
+    let asked = started.elapsed();
+    let mut relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
+    let name = format!("{} ({:?})", spec.camera.name, spec.quality);
+    sink.time_first_frame(name.clone(), started, asked);
+    decode_relay_hybrid(&mut relay, spec.ffmpeg.as_deref(), &name, w, h, sink).await
+}
+
+/// Decodes a live relay stream using in-process OpenH264 first, seamlessly
+/// handing off buffered initial TS bytes to `ffmpeg.exe` if HEVC or an
+/// unsupported bitstream is encountered before the first frame.
+async fn decode_relay_hybrid<R>(
+    relay: &mut R,
+    ffmpeg: Option<&Path>,
+    name: &str,
+    w: usize,
+    h: usize,
+    sink: &mut FrameSink,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use crate::live_decode::{H264Decoder, TsVideoDemuxer, VideoCodec, WorkerSignal};
+    use tokio::io::AsyncWriteExt;
+
+    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let audio_id = sink.audio_id;
+    let recorder = sink.recorder.clone();
+
+    // Start the blocking OpenH264 worker thread.
+    let (worker_in_tx, mut worker_in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+    let (worker_out_tx, mut worker_out_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerSignal>();
+    let _worker_handle = tokio::task::spawn_blocking(move || {
+        let mut demux = TsVideoDemuxer::new();
+        let mut decoder = match H264Decoder::new(w, h) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = worker_out_tx.send(WorkerSignal::Fallback(e.to_string()));
+                return;
             }
-            result => result?,
         };
-        let asked = started.elapsed();
-        let relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
-        anyhow::Ok((relay, asked))
+        let mut got_frame = false;
+        let mut init_bytes = 0usize;
+        let mut init_aus = 0usize;
+        let mut last_err = String::new();
+
+        while let Some(chunk) = worker_in_rx.blocking_recv() {
+            if !got_frame {
+                init_bytes += chunk.len();
+            }
+            let mut abort_to_ffmpeg: Option<String> = None;
+            demux.feed(&chunk, |au, codec| {
+                if abort_to_ffmpeg.is_some() {
+                    return;
+                }
+                if !got_frame && codec == Some(VideoCodec::Hevc) {
+                    abort_to_ffmpeg = Some("HEVC/H.265 stream".into());
+                    return;
+                }
+                if !got_frame {
+                    init_aus += 1;
+                }
+                match decoder.decode_au(au) {
+                    Ok(Some(frame)) => {
+                        got_frame = true;
+                        let _ = worker_out_tx.send(WorkerSignal::Frame(frame));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if !got_frame {
+                            last_err = e;
+                        }
+                    }
+                }
+            });
+            if !got_frame && demux.codec() == Some(VideoCodec::Hevc) && abort_to_ffmpeg.is_none() {
+                abort_to_ffmpeg = Some("HEVC/H.265 stream".into());
+            }
+            if !got_frame && abort_to_ffmpeg.is_none() && (init_bytes >= 256 * 1024 || init_aus >= 6) {
+                abort_to_ffmpeg = Some(if last_err.is_empty() {
+                    "in-process H.264 decoder produced no initial frame".into()
+                } else {
+                    format!("OpenH264 could not decode stream ({last_err})")
+                });
+            }
+            if let Some(reason) = abort_to_ffmpeg {
+                let _ = worker_out_tx.send(WorkerSignal::Fallback(reason));
+                return;
+            }
+        }
+    });
+
+    enum Mode {
+        InProcess {
+            tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+            init_buf: Vec<u8>,
+            got_first: bool,
+        },
+        Ffmpeg {
+            stdin: tokio::process::ChildStdin,
+            frames_rx: tokio::sync::mpsc::Receiver<Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, Stopped>>,
+        },
+    }
+
+    const MAX_INIT_BUF: usize = 512 * 1024;
+    let mut mode = Mode::InProcess {
+        tx: worker_in_tx,
+        init_buf: Vec::with_capacity(64 * 1024),
+        got_first: false,
     };
 
-    let (relay_res, decoder_res) = tokio::join!(relay_fut, decoder_task);
-    let (mut relay, asked) = relay_res?;
-    let decoder = decoder_res.context("decoder spawn task failed")??;
-    sink.time_first_frame(format!("{} ({:?})", spec.camera.name, spec.quality), started, asked);
-    decode_relay_with_decoder(&mut relay, decoder, sink).await
+    let relay_fut = relay::stream_video_chunks(relay, &chunk_tx, audio_id, Some(&recorder));
+    tokio::pin!(relay_fut);
+
+    let deadline = tokio::time::sleep(FRAME_TIMEOUT);
+    tokio::pin!(deadline);
+
+    let mut relay_done: Option<Result<()>> = None;
+
+    loop {
+        match &mut mode {
+            Mode::InProcess { tx, init_buf, got_first } => {
+                tokio::select! {
+                    res = &mut relay_fut, if relay_done.is_none() => {
+                        relay_done = Some(res);
+                        return relay_done.take().unwrap();
+                    }
+                    maybe_chunk = chunk_rx.recv() => {
+                        let Some(chunk) = maybe_chunk else {
+                            return relay_done.take().unwrap_or(Ok(()));
+                        };
+                        if !*got_first && init_buf.len() + chunk.len() <= MAX_INIT_BUF {
+                            init_buf.extend_from_slice(&chunk);
+                        }
+                        let _ = tx.send(chunk).await;
+                    }
+                    maybe_sig = worker_out_rx.recv() => {
+                        match maybe_sig {
+                            Some(WorkerSignal::Frame(frame)) => {
+                                if !*got_first {
+                                    *got_first = true;
+                                    *init_buf = Vec::new();
+                                    log::info!(
+                                        "live: {name}: using in-process H.264 decoder ({}×{})",
+                                        frame.width(),
+                                        frame.height()
+                                    );
+                                }
+                                sink.push(frame);
+                                deadline.as_mut().reset(tokio::time::Instant::now() + FRAME_TIMEOUT);
+                            }
+                            Some(WorkerSignal::Fallback(reason)) => {
+                                log::info!("live: {name}: switching to ffmpeg ({reason})");
+                                let ffmpeg_path = ffmpeg.context(
+                                    "ffmpeg not found: needed to decode this stream. Put ffmpeg.exe next to Tapas.exe or set its path in Settings",
+                                )?;
+                                let mut dec = spawn_live_decoder(ffmpeg_path, w, h)?;
+                                let mut stdin = dec.stdin.take().context("ffmpeg stdin")?;
+                                if !init_buf.is_empty() {
+                                    let replay = std::mem::take(init_buf);
+                                    stdin.write_all(&replay).await.context("Video decoder stopped")?;
+                                }
+                                let (ftx, frx) = tokio::sync::mpsc::channel(4);
+                                tokio::spawn(async move {
+                                    let (fw, fh) = (dec.width as u32, dec.height as u32);
+                                    loop {
+                                        let mut frame = SharedPixelBuffer::<slint::Rgba8Pixel>::new(fw, fh);
+                                        match timeout(FRAME_TIMEOUT, dec.stdout.read_exact(frame.make_mut_bytes())).await {
+                                            Err(_) => {
+                                                let _ = ftx.send(Err(Stopped::NoVideo)).await;
+                                                return;
+                                            }
+                                            Ok(Err(_)) => {
+                                                let _ = timeout(Duration::from_secs(2), dec.child.wait()).await;
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                                let line = dec.last_error.lock().unwrap().clone();
+                                                let _ = ftx.send(Err(Stopped::Exited(line))).await;
+                                                return;
+                                            }
+                                            Ok(Ok(_)) => {
+                                                if ftx.send(Ok(frame)).await.is_err() {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                                mode = Mode::Ffmpeg { stdin, frames_rx: frx };
+                                deadline.as_mut().reset(tokio::time::Instant::now() + FRAME_TIMEOUT);
+                            }
+                            None => bail!("in-process video decoder stopped"),
+                        }
+                    }
+                    () = &mut deadline => {
+                        bail!("No video for {}s", FRAME_TIMEOUT.as_secs());
+                    }
+                }
+            }
+            Mode::Ffmpeg { stdin, frames_rx } => {
+                tokio::select! {
+                    res = &mut relay_fut, if relay_done.is_none() => {
+                        return res;
+                    }
+                    maybe_chunk = chunk_rx.recv() => {
+                        let Some(chunk) = maybe_chunk else {
+                            return Ok(());
+                        };
+                        stdin.write_all(&chunk).await.context("Video decoder stopped")?;
+                    }
+                    maybe_frame = frames_rx.recv() => {
+                        match maybe_frame {
+                            Some(Ok(frame)) => {
+                                sink.push(frame);
+                                deadline.as_mut().reset(tokio::time::Instant::now() + FRAME_TIMEOUT);
+                            }
+                            Some(Err(Stopped::NoVideo)) => bail!("No video for {}s", FRAME_TIMEOUT.as_secs()),
+                            Some(Err(Stopped::Exited(line))) if line.is_empty() => bail!("ffmpeg stopped"),
+                            Some(Err(Stopped::Exited(line))) => bail!("ffmpeg: {line}"),
+                            None => bail!("ffmpeg stopped"),
+                        }
+                    }
+                    () = &mut deadline => {
+                        bail!("No video for {}s", FRAME_TIMEOUT.as_secs());
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn live_input_args(w: usize) -> [&'static str; 12] {
@@ -183,6 +391,7 @@ where
     decode_relay_with_decoder(relay, decoder, sink).await
 }
 
+#[cfg(test)]
 async fn decode_relay_with_decoder<R>(relay: &mut R, mut decoder: Decoder, sink: &mut FrameSink) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -262,11 +471,13 @@ impl Decoder {
     }
 
     /// Pushes frames into `sink` until ffmpeg stops or goes quiet.
+    #[cfg(test)]
     async fn push_frames(&mut self, sink: &mut FrameSink) -> Stopped {
         self.push_frames_within(sink, FRAME_TIMEOUT).await
     }
 
     /// Like [`Decoder::push_frames`], waiting up to `quiet` for each frame.
+    #[cfg(test)]
     pub async fn push_frames_within(&mut self, sink: &mut FrameSink, quiet: Duration) -> Stopped {
         let (w, h) = (self.width as u32, self.height as u32);
         loop {
@@ -329,8 +540,13 @@ fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> to
     let decode_threads = if w >= 1280 { "2" } else { "1" };
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-nostats", "-loglevel", if timed { "info" } else { "error" }])
-        .args(["-filter_threads", "1", "-threads", decode_threads])
-        .args(input)
+        .args(["-filter_threads", "1", "-threads", decode_threads]);
+    // Use D3D11VA/DXVA2 GPU decode on Windows HD streams (Playback and HEVC
+    // live fallback); `-hwaccel auto` transparently falls back to CPU if unavailable.
+    if cfg!(windows) && w >= 1280 {
+        cmd.args(["-hwaccel", "auto"]);
+    }
+    cmd.args(input)
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
         .args(["-an", "-sn", "-vf", &vf, "-fps_mode", "passthrough"])
@@ -661,5 +877,45 @@ mod tests {
         assert!(hd.windows(2).any(|w| w == ["-probesize", "32768"]));
         assert!(sd.windows(2).any(|w| w == ["-fpsprobesize", "0"]));
         assert!(sd.windows(2).any(|w| w == ["-fflags", "+discardcorrupt"]));
+    }
+
+    #[tokio::test]
+    async fn decodes_relay_video_in_process_without_ffmpeg() {
+        let ts = include_bytes!("../tests/fixtures/relay-sample.ts");
+        let mut body = Vec::new();
+        for chunk in ts.chunks(1316 * 3 + 7) {
+            body.extend(
+                format!("----device-stream-boundary--\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n", chunk.len())
+                    .as_bytes(),
+            );
+            body.extend(chunk);
+            body.extend(b"\r\n");
+        }
+        let (mut relay_tx, relay_rx) = tokio::io::duplex(1 << 20);
+        relay_tx.write_all(&body).await.unwrap();
+        let mut relay = BufReader::new(relay_rx);
+
+        let slot = Arc::new(Mutex::new(Slot { frame: None, version: 0, status: Status::Connecting, fps: 0.0 }));
+        let mut sink = FrameSink::new(slot.clone());
+        let enough_frames = async {
+            while slot.lock().unwrap().version < 25 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            _ = enough_frames => {}
+            result = decode_relay_hybrid(&mut relay, None, "test (Sd)", 640, 360, &mut sink) => {
+                panic!("in-process decoding stopped unexpectedly: {result:?}")
+            }
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("only {} frames decoded in-process", slot.lock().unwrap().version)
+            }
+        }
+
+        let frame = slot.lock().unwrap().frame.clone().unwrap();
+        assert_eq!((frame.width(), frame.height()), (320, 180));
+        let distinct: std::collections::HashSet<_> = frame.as_bytes().chunks(4).step_by(37).collect();
+        assert!(distinct.len() > 20, "in-process frame looks blank");
+        drop(relay_tx);
     }
 }
