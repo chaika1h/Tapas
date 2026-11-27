@@ -256,7 +256,6 @@ where
 /// `audio_id` is currently the active audio source, and optionally teeing the
 /// raw MPEG-TS stream into `recorder` for live MP4 recording (zero overhead
 /// while muted and not recording).
-#[cfg(test)]
 pub async fn copy_video_with_audio_and_recorder<R, W>(
     reader: &mut R,
     out: &mut W,

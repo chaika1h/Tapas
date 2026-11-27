@@ -50,7 +50,8 @@ impl Slot {
             Status::Connecting => crate::i18n::pick("Connecting…", "Bağlanıyor…").into(),
             Status::Retrying(msg) => msg.clone(),
             Status::Live => match &self.frame {
-                Some(f) => format!("{}×{} · {:.0} fps", f.width(), f.height(), self.fps),
+                Some(f) if self.fps >= 0.5 => format!("{}×{} · {:.0} fps", f.width(), f.height(), self.fps),
+                Some(f) => format!("{}×{}", f.width(), f.height()),
                 None => crate::i18n::pick("Live", "Canlı").into(),
             },
         }
@@ -151,16 +152,20 @@ impl FrameSink {
     }
 
     pub fn push(&mut self, frame: Frame) {
+        let now = Instant::now();
         if let Some((name, started, asked)) = self.first_frame.take() {
             log::info!(
                 "live: {name}: first picture after {} ms (the cloud answered in {} ms)",
                 started.elapsed().as_millis(),
                 asked.as_millis()
             );
+            // Start the FPS window at frame 1 so connection/probe latency does
+            // not falsely report "1 fps" during the first second of video.
+            self.window_start = now;
+            self.window_frames = 0;
         }
         self.frames += 1;
         self.window_frames += 1;
-        let now = Instant::now();
         let elapsed = now - self.window_start;
         let mut slot = self.slot.lock().unwrap();
         if elapsed >= Duration::from_secs(1) {
