@@ -112,33 +112,81 @@ pub async fn run(spec: &StreamSpec, sink: &mut FrameSink) -> Result<()> {
         resolution = Resolution::Hd;
     }
 
+    // Spawn ffmpeg concurrently with the cloud relay handshake so Windows
+    // CreateProcessW / Defender inspection adds 0 ms to time-to-first-frame.
+    let ffmpeg_owned = ffmpeg.to_path_buf();
+    let rt_handle = tokio::runtime::Handle::current();
+    let decoder_task = tokio::task::spawn_blocking(move || {
+        let _guard = rt_handle.enter();
+        spawn_live_decoder(&ffmpeg_owned, w, h)
+    });
+
     let client = &spec.client;
     let started = std::time::Instant::now();
-    let info = match client.request_relay(&spec.camera, resolution).await {
-        Err(e) if resolution == Resolution::Vga && e.is_refused() => {
-            log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
-            CLOUD_VGA_REFUSED.store(true, Ordering::Relaxed);
-            client.request_relay(&spec.camera, Resolution::Hd).await?
-        }
-        result => result?,
+    let relay_fut = async {
+        let info = match client.request_relay(&spec.camera, resolution).await {
+            Err(e) if resolution == Resolution::Vga && e.is_refused() => {
+                log::warn!("cloud refused the VGA stream ({e}); using HD from now on");
+                CLOUD_VGA_REFUSED.store(true, Ordering::Relaxed);
+                client.request_relay(&spec.camera, Resolution::Hd).await?
+            }
+            result => result?,
+        };
+        let asked = started.elapsed();
+        let relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
+        anyhow::Ok((relay, asked))
     };
-    let asked = started.elapsed();
-    let mut relay = relay::open(client.tls(), &info, &spec.camera.model).await?;
+
+    let (relay_res, decoder_res) = tokio::join!(relay_fut, decoder_task);
+    let (mut relay, asked) = relay_res?;
+    let decoder = decoder_res.context("decoder spawn task failed")??;
     sink.time_first_frame(format!("{} ({:?})", spec.camera.name, spec.quality), started, asked);
-    decode_relay(&mut relay, ffmpeg, w, h, sink).await
+    decode_relay_with_decoder(&mut relay, decoder, sink).await
+}
+
+fn live_input_args(w: usize) -> [&'static str; 12] {
+    // Bound probing so low-bitrate SD streams (~35 KB/s) emit frame 1 quickly
+    // instead of buffering ~1 s of probe data. No `-fflags nobuffer`: it drops
+    // probed packets and forces waiting for the next keyframe.
+    let probesize = if w <= 640 { "12288" } else { "32768" };
+    [
+        "-flags",
+        "low_delay",
+        "-fflags",
+        "+discardcorrupt",
+        "-analyzeduration",
+        "0",
+        "-fpsprobesize",
+        "0",
+        "-probesize",
+        probesize,
+        "-f",
+        "mpegts",
+    ]
+}
+
+fn spawn_live_decoder(ffmpeg: &Path, w: usize, h: usize) -> Result<Decoder> {
+    let mut args = Vec::with_capacity(14);
+    args.extend_from_slice(&live_input_args(w));
+    args.extend_from_slice(&["-i", "pipe:0"]);
+    Decoder::spawn(ffmpeg, &args, w, h)
 }
 
 /// Decodes the relay's MPEG-TS (after its HTTP head) until either the relay
 /// or ffmpeg stops.
+#[cfg(test)]
 async fn decode_relay<R>(relay: &mut R, ffmpeg: &Path, w: usize, h: usize, sink: &mut FrameSink) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    // A live pipe: bound the probing, or ffmpeg waits for more input before
-    // its first frame. No `-fflags nobuffer`: it throws away the probed
-    // packets, so the picture would only start at the next keyframe.
-    let input = ["-flags", "low_delay", "-analyzeduration", "0", "-probesize", "32768", "-f", "mpegts", "-i", "pipe:0"];
-    let mut decoder = Decoder::spawn(ffmpeg, &input, w, h)?;
+    let decoder = spawn_live_decoder(ffmpeg, w, h)?;
+    decode_relay_with_decoder(relay, decoder, sink).await
+}
+
+async fn decode_relay_with_decoder<R>(relay: &mut R, mut decoder: Decoder, sink: &mut FrameSink) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
     let audio_id = sink.audio_id;
     let recorder = sink.recorder.clone();
@@ -220,17 +268,19 @@ impl Decoder {
 
     /// Like [`Decoder::push_frames`], waiting up to `quiet` for each frame.
     pub async fn push_frames_within(&mut self, sink: &mut FrameSink, quiet: Duration) -> Stopped {
-        let (w, h) = (self.width, self.height);
-        let mut buf = vec![0u8; w * h * 4];
+        let (w, h) = (self.width as u32, self.height as u32);
         loop {
-            match timeout(quiet, self.stdout.read_exact(&mut buf)).await {
+            // Read directly into the SharedPixelBuffer to avoid a redundant
+            // 8.3 MB/frame copy on HD streams.
+            let mut frame = SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+            match timeout(quiet, self.stdout.read_exact(frame.make_mut_bytes())).await {
                 Err(_) => return Stopped::NoVideo,
                 Ok(Err(_)) => {
                     let _ = timeout(Duration::from_secs(2), self.child.wait()).await;
                     tokio::time::sleep(Duration::from_millis(100)).await; // let stderr drain
                     return Stopped::Exited(self.last_error.lock().unwrap().clone());
                 }
-                Ok(Ok(_)) => sink.push(SharedPixelBuffer::clone_from_slice(&buf, w as u32, h as u32)),
+                Ok(Ok(_)) => sink.push(frame),
             }
         }
     }
@@ -245,9 +295,9 @@ pub async fn decode_picture(ffmpeg: &Path, data: &[u8], content_type: &str, widt
     let mut stdin = decoder.stdin.take().context("ffmpeg stdin")?;
     stdin.write_all(data).await.context("Could not pass the picture to ffmpeg")?;
     drop(stdin);
-    let mut buf = vec![0u8; width * height * 4];
-    match timeout(Duration::from_secs(10), decoder.stdout.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Ok(SharedPixelBuffer::clone_from_slice(&buf, width as u32, height as u32)),
+    let mut frame = SharedPixelBuffer::<slint::Rgba8Pixel>::new(width as u32, height as u32);
+    match timeout(Duration::from_secs(10), decoder.stdout.read_exact(frame.make_mut_bytes())).await {
+        Ok(Ok(_)) => Ok(frame),
         _ => {
             tokio::time::sleep(Duration::from_millis(100)).await;
             let error = decoder.last_error.lock().unwrap().clone();
@@ -267,19 +317,19 @@ fn showinfo_time(line: &str) -> Option<f64> {
 
 fn command(ffmpeg: &Path, input: &[&str], w: usize, h: usize, timed: bool) -> tokio::process::Command {
     // Letterbox into a fixed size so every frame has a known byte length.
+    // `fast_bilinear` cuts CPU scaling time by ~2-3x on live streams.
     let mut vf = format!(
-        "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        "scale={w}:{h}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
     );
     if timed {
         vf = format!("showinfo=checksum=0,{vf}");
     }
+    // Keep RAM bounded (avoid per-core thread explosion), while allowing
+    // 2 decode threads on HD streams for snappier 1080p/2K decoding.
+    let decode_threads = if w >= 1280 { "2" } else { "1" };
     let mut cmd = tokio::process::Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-nostats", "-loglevel", if timed { "info" } else { "error" }])
-        // One thread each: by default ffmpeg starts a decoding and a scaling
-        // thread per CPU core, each with its own frame buffers, which costs
-        // 2-5x the memory (over 150 MB for HD on a 16-thread CPU) for no
-        // gain at these sizes and rates.
-        .args(["-filter_threads", "1", "-threads", "1"])
+        .args(["-filter_threads", "1", "-threads", decode_threads])
         .args(input)
         // rawvideo has no timestamps, so ffmpeg would otherwise pad to a
         // guessed constant rate, duplicating frames (e.g. 15 fps → 30).
@@ -601,5 +651,15 @@ mod tests {
         assert!(bytes.windows(4).any(|w| w == b"mp4a"), "expected encoded AAC audio track");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_input_args_uses_smaller_probe_for_sd() {
+        let sd = live_input_args(640);
+        let hd = live_input_args(1280);
+        assert!(sd.windows(2).any(|w| w == ["-probesize", "12288"]));
+        assert!(hd.windows(2).any(|w| w == ["-probesize", "32768"]));
+        assert!(sd.windows(2).any(|w| w == ["-fpsprobesize", "0"]));
+        assert!(sd.windows(2).any(|w| w == ["-fflags", "+discardcorrupt"]));
     }
 }

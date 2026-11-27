@@ -904,6 +904,15 @@ impl CloudClient {
         Ok(url)
     }
 
+    /// Pre-warms and caches the regional CIPC relay service URL in the background
+    /// so the first Live view connection doesn't wait on `getAppServiceUrl`.
+    pub async fn warm_cipc(&self) {
+        let Some(session) = self.session() else { return };
+        if let Err(e) = self.service_url(&session, CIPC_SERVICE).await {
+            log::debug!("CIPC service pre-warm skipped: {e}");
+        }
+    }
+
     /// Looks the service up again next time, e.g. after a network error.
     async fn forget_service(&self, session: &Session, service: &str) {
         self.services.lock().await.remove(&(session.base_url.clone(), service.to_string()));

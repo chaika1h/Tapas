@@ -172,6 +172,8 @@ pub struct AppConfig {
     pub window_height: u32,
     /// Whether the window was maximized when closed.
     pub window_maximized: bool,
+    /// Open straight onto Live view (all cameras) on launch.
+    pub start_on_live: bool,
 }
 
 impl AppConfig {
@@ -319,5 +321,16 @@ mod tests {
         cfg.window_width = 1440;
         cfg.window_height = 900;
         assert_eq!(cfg.saved_window_size(), Some((1440, 900)));
+    }
+
+    #[test]
+    fn start_on_live_defaults_false_and_round_trips() {
+        let legacy: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.start_on_live);
+        let enabled: AppConfig = serde_json::from_str(r#"{"start_on_live": true}"#).unwrap();
+        assert!(enabled.start_on_live);
+        let serialized = serde_json::to_string(&enabled).unwrap();
+        let back: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(back.start_on_live);
     }
 }

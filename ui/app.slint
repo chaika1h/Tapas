@@ -214,6 +214,7 @@ export global Bridge {
     in-out property <int> renderer-index;
     in-out property <int> theme-index; // 0 system, 1 light, 2 dark
     in-out property <int> language-index; // 0 system, 1 English, 2 Turkish
+    in-out property <bool> start-on-live;
     in property <string> config-path;
     callback save-settings();
 
@@ -532,6 +533,8 @@ export global Tr {
     in-out property <string> language-desc: "Display language; applies immediately.";
     in-out property <string> renderer-title: "Graphics renderer";
     in-out property <string> renderer-desc: "How the window is drawn, from the next start.";
+    in-out property <string> start-on-live-title: "Start on Live view";
+    in-out property <string> start-on-live-desc: "Open the camera grid straight away when Tapas starts.";
     in-out property <string> settings-file: "Settings file";
     in-out property <string> sec-shortcuts: "Keyboard shortcuts";
     in-out property <string> sc-nav: "Switch pages (Home, Live view, Playback, People, Settings)";
@@ -4278,6 +4281,18 @@ component SettingsPage inherits Rectangle {
                                 model: Tr.renderer-labels;
                                 current-index <=> Bridge.renderer-index;
                                 selected => { Bridge.save-settings(); }
+                            }
+                        }
+                    }
+                    SettingRow {
+                        icon: Icons.video;
+                        title: Tr.start-on-live-title;
+                        description: Tr.start-on-live-desc;
+                        VerticalLayout {
+                            alignment: center;
+                            Switch {
+                                checked <=> Bridge.start-on-live;
+                                toggled => { Bridge.save-settings(); }
                             }
                         }
                     }

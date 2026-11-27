@@ -33,6 +33,8 @@ thread_local! {
     static APP: RefCell<Option<Rc<App>>> = const { RefCell::new(None) };
 }
 
+static FRAME_WAKE_QUEUED: AtomicBool = AtomicBool::new(false);
+
 /// Runs `f` on the UI thread with the app state. Callable from any thread.
 pub fn on_ui(f: impl FnOnce(&Rc<App>) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
@@ -42,8 +44,20 @@ pub fn on_ui(f: impl FnOnce(&Rc<App>) + Send + 'static) {
     });
 }
 
+/// Wakes the UI thread immediately when a decoder pushes a new video frame,
+/// coalescing bursts so at most one wakeup is queued at a time.
+pub fn notify_frame() {
+    if !FRAME_WAKE_QUEUED.swap(true, Ordering::AcqRel) {
+        on_ui(|app| {
+            FRAME_WAKE_QUEUED.store(false, Ordering::Release);
+            app.pump_frames_now();
+        });
+    }
+}
+
 /// Stops all streams and background work. Call after the event loop exits.
 pub fn shutdown() {
+    FRAME_WAKE_QUEUED.store(false, Ordering::Relaxed);
     crate::audio::shutdown();
     if let Some(app) = APP.with(|a| a.borrow_mut().take()) {
         app.timer.stop();
@@ -78,8 +92,9 @@ struct Live {
     unused_since: Option<Instant>,
 }
 
-/// How long a stream no page needs keeps running.
-const STREAM_LINGER: Duration = Duration::from_secs(20);
+/// How long a stream no page needs keeps running (keeps the SD grid warm
+/// while inspecting cameras in Single view or checking Playback/Settings).
+const STREAM_LINGER: Duration = Duration::from_secs(60);
 /// How long playback state and cached video stay warm after leaving Playback.
 const PLAYBACK_LINGER: Duration = Duration::from_secs(30);
 /// Maximum decoded event thumbnails kept in RAM at once (disk cache holds the rest).
@@ -191,6 +206,8 @@ pub struct App {
     tiles: Rc<VecModel<Tile>>,
     single: RefCell<Option<StreamKey>>,
     single_shown: RefCell<(u64, String)>,
+    /// Last SD fallback frame version pushed to Single view while HD connects.
+    single_fallback_shown: Cell<u64>,
     ptz: RefCell<HashMap<u32, Ptz>>,
     hub: RefCell<HubSession>,
     /// Identifies this PC's player to the hubs: clip searches and downloads
@@ -322,6 +339,7 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
         tiles: Rc::new(VecModel::default()),
         single: RefCell::default(),
         single_shown: RefCell::default(),
+        single_fallback_shown: Cell::new(0),
         ptz: RefCell::default(),
         hub: RefCell::default(),
         player_id: uuid::Uuid::new_v4().to_string(),
@@ -524,13 +542,22 @@ pub fn install(ui: &MainWindow, mut cfg: AppConfig, rt: tokio::runtime::Handle) 
     app.update_calendar();
     app.update_face_track_date_label();
     if app.signed_in_now() {
-        // The hubs as the account has them now (names, new hubs), then their
-        // details, homes and rooms.
+        // Pre-warm the CIPC relay service URL and refresh hubs in parallel
+        // so the first Live view stream doesn't pay the service-lookup RTT.
         if let Some(client) = app.cloud_client() {
+            let warm = client.clone();
+            app.rt.spawn(async move {
+                warm.warm_cipc().await;
+            });
             app.rt.spawn(async move {
                 let hubs = client.list_hubs().await;
                 on_ui(move |app| app.cloud_hubs_loaded(hubs));
             });
+        }
+        if app.cfg.borrow().start_on_live && !app.cfg.borrow().cameras.is_empty() {
+            app.tiles_from_pictures();
+            b.set_page(Page::Live);
+            app.update_columns(ui);
         }
     }
     app.reset_timeline();
@@ -665,6 +692,20 @@ impl App {
 
     // ---------------------------------------------------------------- frames
 
+    /// Fast path triggered by [`notify_frame`] as soon as a decoder delivers a
+    /// new frame, bypassing the 30 ms polling delay.
+    fn pump_frames_now(&self) {
+        let Some(ui) = self.ui.upgrade() else { return };
+        let b = ui.global::<Bridge>();
+        match b.get_page() {
+            Page::Home => self.pump_home(),
+            Page::Live => self.pump_tiles(),
+            Page::Single => self.pump_single(&b),
+            Page::Recordings => self.pump_player(&b),
+            _ => {}
+        }
+    }
+
     /// Runs every ~30 ms while active (500 ms while idle): moves new frames
     /// and status into the UI, and sweeps unused streams and caches.
     fn pump(&self) {
@@ -765,28 +806,88 @@ impl App {
 
     fn pump_single(&self, b: &Bridge) {
         let Some(key) = *self.single.borrow() else { return };
-        let streams = self.streams.borrow();
-        let Some(live) = streams.get(&key) else { return };
-        let mut shown = self.single_shown.borrow_mut();
-        let slot = live.handle.slot.lock().unwrap();
-        if slot.version != shown.0 {
-            if let Some(frame) = slot.frame.clone() {
-                b.set_single_frame(Image::from_rgba8_premultiplied(frame));
-                b.set_single_has_frame(true);
+        let mut need_audio_sync = false;
+        {
+            let streams = self.streams.borrow();
+            let Some(live) = streams.get(&key) else { return };
+            let mut shown = self.single_shown.borrow_mut();
+            let (primary_version, primary_live, primary_status, primary_frame) = {
+                let slot = live.handle.slot.lock().unwrap();
+                let frame = (slot.version != shown.0).then(|| slot.frame.clone()).flatten();
+                (slot.version, slot.is_live(), slot.status_text(), frame)
+            };
+
+            if primary_live && (primary_frame.is_some() || shown.0 != 0) {
+                if let Some(frame) = primary_frame {
+                    b.set_single_frame(Image::from_rgba8_premultiplied(frame));
+                    b.set_single_has_frame(true);
+                    let was_first_primary = shown.0 == 0;
+                    shown.0 = primary_version;
+                    if self.single_fallback_shown.replace(0) != 0 || was_first_primary {
+                        need_audio_sync = true;
+                    }
+                } else {
+                    shown.0 = primary_version;
+                }
+                if b.get_single_stale() {
+                    b.set_single_stale(false);
+                }
+                if primary_status != shown.1 {
+                    b.set_single_status(primary_status.as_str().into());
+                    shown.1 = primary_status;
+                }
+            } else {
+                // While HD is connecting, keep showing live frames from the
+                // lingering SD stream so Single view is instant instead of
+                // freezing on a dimmed thumbnail.
+                let sd_fallback = (key.1 == Quality::Hd)
+                    .then(|| streams.get(&(key.0, Quality::Sd)))
+                    .flatten()
+                    .and_then(|sd| {
+                        let slot = sd.handle.slot.lock().unwrap();
+                        if !slot.is_live() || slot.frame.is_none() {
+                            return None;
+                        }
+                        let ver = slot.version;
+                        let frame = (ver != self.single_fallback_shown.get())
+                            .then(|| slot.frame.clone())
+                            .flatten();
+                        Some((ver, frame))
+                    });
+
+                if let Some((ver, frame)) = sd_fallback {
+                    if let Some(frame) = frame {
+                        b.set_single_frame(Image::from_rgba8_premultiplied(frame));
+                        b.set_single_has_frame(true);
+                        self.single_fallback_shown.set(ver);
+                    }
+                    if b.get_single_stale() {
+                        b.set_single_stale(false);
+                    }
+                    let status = i18n::pick("SD · Switching to HD…", "SD · HD'ye geçiliyor…").to_string();
+                    if status != shown.1 {
+                        b.set_single_status(status.as_str().into());
+                        shown.1 = status;
+                    }
+                } else {
+                    if let Some(frame) = primary_frame {
+                        b.set_single_frame(Image::from_rgba8_premultiplied(frame));
+                        b.set_single_has_frame(true);
+                    }
+                    shown.0 = primary_version;
+                    if b.get_single_stale() == primary_live {
+                        b.set_single_stale(!primary_live);
+                    }
+                    if primary_status != shown.1 {
+                        b.set_single_status(primary_status.as_str().into());
+                        shown.1 = primary_status;
+                    }
+                }
             }
-            shown.0 = slot.version;
         }
-        if b.get_single_stale() == slot.is_live() {
-            b.set_single_stale(!slot.is_live());
+        if need_audio_sync {
+            self.sync_audio();
         }
-        let status = slot.status_text();
-        if status != shown.1 {
-            b.set_single_status(status.as_str().into());
-            shown.1 = status;
-        }
-        drop(slot);
-        drop(shown);
-        drop(streams);
         if let Some(rec) = self.live_recording.borrow_mut().as_mut() {
             let secs = rec.started.elapsed().as_secs();
             if secs != rec.shown_secs {
@@ -889,7 +990,20 @@ impl App {
             }),
             Page::Single if self.single_audio_on.get() => {
                 let key = *self.single.borrow();
-                key.and_then(|k| self.streams.borrow().get(&k).map(|l| l.handle.audio_id))
+                key.and_then(|k| {
+                    let streams = self.streams.borrow();
+                    let primary = streams.get(&k);
+                    if primary.is_some_and(|l| l.handle.slot.lock().unwrap().is_live()) {
+                        return primary.map(|l| l.handle.audio_id);
+                    }
+                    if k.1 == Quality::Hd
+                        && let Some(sd) = streams.get(&(k.0, Quality::Sd))
+                        && sd.handle.slot.lock().unwrap().is_live()
+                    {
+                        return Some(sd.handle.audio_id);
+                    }
+                    primary.map(|l| l.handle.audio_id)
+                })
             }
             Page::Recordings if self.player_audio_on.get() => {
                 self.watching.borrow().as_ref().map(|w| w.playback.audio_id)
@@ -1196,16 +1310,36 @@ impl App {
         }
         *self.single.borrow_mut() = Some((id, quality));
         *self.single_shown.borrow_mut() = (0, String::new());
+        self.single_fallback_shown.set(0);
+
+        let (hd_live, sd_live) = {
+            let streams = self.streams.borrow();
+            let is_ready = |q| {
+                streams.get(&(id, q)).is_some_and(|l| {
+                    let s = l.handle.slot.lock().unwrap();
+                    s.is_live() && s.frame.is_some()
+                })
+            };
+            (is_ready(quality), quality == Quality::Hd && is_ready(Quality::Sd))
+        };
 
         b.set_single_name(cam.name.as_str().into());
         b.set_single_can_switch(can_switch);
         b.set_single_quality(quality.index());
-        // Until the HD video comes: the grid's picture, or the last one.
+        // Until the HD video comes: the grid's live SD stream, or the last picture.
         let placeholder = self.picture_of(id);
         b.set_single_has_frame(placeholder.is_some());
-        b.set_single_stale(true);
+        b.set_single_stale(!(hd_live || sd_live));
         b.set_single_frame(placeholder.map(Image::from_rgba8_premultiplied).unwrap_or_default());
-        b.set_single_status(self.tile_status(&cam).into());
+        let initial_status = if hd_live {
+            String::new()
+        } else if sd_live {
+            i18n::pick("SD · Switching to HD…", "SD · HD'ye geçiliyor…").to_string()
+        } else {
+            self.tile_status(&cam)
+        };
+        b.set_single_status(initial_status.as_str().into());
+        self.single_shown.borrow_mut().1 = initial_status;
         // The pan/tilt and control tiles update once the camera has answered.
         b.set_single_ptz(false);
         b.set_ptz_open(false);
@@ -1246,8 +1380,19 @@ impl App {
         let quality = Quality::from_index(index);
         *self.single.borrow_mut() = Some((id, quality));
         *self.single_shown.borrow_mut() = (0, String::new());
-        // The current picture stays, dimmed, until the other stream's comes.
-        self.ui().global::<Bridge>().set_single_stale(true);
+        self.single_fallback_shown.set(0);
+        let live_now = {
+            let streams = self.streams.borrow();
+            let is_ready = |q| {
+                streams.get(&(id, q)).is_some_and(|l| {
+                    let s = l.handle.slot.lock().unwrap();
+                    s.is_live() && s.frame.is_some()
+                })
+            };
+            is_ready(quality) || (quality == Quality::Hd && is_ready(Quality::Sd))
+        };
+        // Keep video crisp if target quality or live SD fallback is already running.
+        self.ui().global::<Bridge>().set_single_stale(!live_now);
         self.sync_streams();
     }
 
@@ -1383,7 +1528,14 @@ impl App {
 
     fn snapshot(&self) {
         let Some(key) = *self.single.borrow() else { return };
-        let frame = self.streams.borrow().get(&key).and_then(|l| l.handle.latest_frame());
+        let frame = {
+            let streams = self.streams.borrow();
+            streams.get(&key).and_then(|l| l.handle.latest_frame()).or_else(|| {
+                (key.1 == Quality::Hd)
+                    .then(|| streams.get(&(key.0, Quality::Sd)).and_then(|l| l.handle.latest_frame()))
+                    .flatten()
+            })
+        };
         let Some(frame) = frame else {
             self.status(i18n::pick("No picture yet.", "Henüz görüntü yok."));
             return;
@@ -1548,11 +1700,14 @@ impl App {
         }
     }
 
-    /// What to show for a camera until its video comes: a stream's picture
-    /// (e.g. the grid's), else its last one.
+    /// What to show for a camera until its video comes: a running stream's
+    /// picture (preferring HD over SD), else its last saved one.
     fn picture_of(&self, id: u32) -> Option<Frame> {
         let streams = self.streams.borrow();
-        let streamed = streams.iter().filter(|(k, _)| k.0 == id).find_map(|(_, l)| l.handle.latest_frame());
+        let streamed = streams
+            .get(&(id, Quality::Hd))
+            .and_then(|l| l.handle.latest_frame())
+            .or_else(|| streams.get(&(id, Quality::Sd)).and_then(|l| l.handle.latest_frame()));
         streamed.or_else(|| self.thumbnails.borrow().get(&id).map(|t| t.frame.clone()))
     }
 
@@ -1660,6 +1815,7 @@ impl App {
         self.streams.borrow_mut().retain(|k, _| k.0 != camera_id);
         if self.single.borrow().is_some_and(|k| k.0 == camera_id) {
             *self.single_shown.borrow_mut() = (0, String::new());
+            self.single_fallback_shown.set(0);
             let ui = self.ui();
             let b = ui.global::<Bridge>();
             b.set_single_has_frame(false);
@@ -1674,6 +1830,7 @@ impl App {
         self.streams.borrow_mut().retain(|k, _| k.0 != camera_id);
         if self.single.borrow().is_some_and(|k| k.0 == camera_id) {
             *self.single_shown.borrow_mut() = (0, String::new());
+            self.single_fallback_shown.set(0);
         }
         self.sync_streams();
     }
@@ -1896,6 +2053,7 @@ impl App {
         b.set_renderer_index(cfg.renderer.index());
         b.set_theme_index(cfg.theme.index());
         b.set_language_index(cfg.language.index());
+        b.set_start_on_live(cfg.start_on_live);
         b.set_config_path(config::config_path().display().to_string().into());
     }
 
@@ -1918,6 +2076,7 @@ impl App {
             let language = Language::from_index(b.get_language_index());
             let lang_changed = language != cfg.language;
             cfg.language = language;
+            cfg.start_on_live = b.get_start_on_live();
             lang_changed
         };
         self.persist();
@@ -2630,9 +2789,19 @@ impl App {
         b.set_hub_connected(false);
         b.set_hub_message(SharedString::new());
         self.ptz.borrow_mut().clear();
+        if let Some(client) = self.cloud_client() {
+            self.rt.spawn(async move {
+                client.warm_cipc().await;
+            });
+        }
         self.refresh_cloud_ui();
         self.refresh_camera_lists();
-        self.navigate(Page::Home);
+        let start_page = if self.cfg.borrow().start_on_live && !self.cfg.borrow().cameras.is_empty() {
+            Page::Live
+        } else {
+            Page::Home
+        };
+        self.navigate(start_page);
         self.restart_streams();
         self.cloud_refresh();
     }
