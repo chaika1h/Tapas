@@ -406,16 +406,21 @@ where
     }
 }
 
-fn live_input_args(w: usize) -> [&'static str; 12] {
+fn live_input_args(w: usize) -> [&'static str; 10] {
     // Bound probing so low-bitrate SD streams (~35 KB/s) emit frame 1 quickly
     // instead of buffering ~1 s of probe data. No `-fflags nobuffer`: it drops
     // probed packets and forces waiting for the next keyframe.
+    //
+    // No `-fflags +discardcorrupt` either: some cameras pack a whole second of
+    // video (keyframe and all) into one PES packet, so losing one 188-byte TS
+    // packet on the way marks that whole second corrupt and ffmpeg drops it.
+    // Over a weak uplink a 2K stream then shows ~1 fps (or none). Decoding it
+    // anyway costs a brief smudge where the bytes went missing, as in the
+    // Tapo app.
     let probesize = if w <= 640 { "12288" } else { "32768" };
     [
         "-flags",
         "low_delay",
-        "-fflags",
-        "+discardcorrupt",
         "-analyzeduration",
         "0",
         "-fpsprobesize",
@@ -923,7 +928,9 @@ mod tests {
         assert!(sd.windows(2).any(|w| w == ["-probesize", "12288"]));
         assert!(hd.windows(2).any(|w| w == ["-probesize", "32768"]));
         assert!(sd.windows(2).any(|w| w == ["-fpsprobesize", "0"]));
-        assert!(sd.windows(2).any(|w| w == ["-fflags", "+discardcorrupt"]));
+        // Dropping "corrupt" packets throws away whole seconds of a camera
+        // that sends a second per PES packet (see live_input_args).
+        assert!(!sd.contains(&"+discardcorrupt") && !hd.contains(&"+discardcorrupt"));
     }
 
     #[tokio::test]
